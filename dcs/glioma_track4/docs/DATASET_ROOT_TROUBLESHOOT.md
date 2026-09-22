@@ -122,6 +122,63 @@ for c in dict.fromkeys(cands):
     print(f"  {c:<56} -> {len(cs)} 例  {[x['accession'] for x in cs[:3]]}")
 ```
 
+## 病例数正常、却报「无任何可用序列」
+
+```text
+数据根: /2026aicompetition/datasets/training/annotation
+[data] 未找到可用折划分，按 val_ratio=0.2 自行划分（train=2604 val=651）
+ValueError: Caught ValueError in DataLoader worker process
+  ... build_volume ... ValueError: study '3255123456' 无任何可用序列
+```
+
+**病例数扫得出来（示例里 3255 例），但每个病例都挑不出模态** —— 这是训练侧
+"模态识别"的问题，不是数据损坏、也不是路径错。
+
+原因：序列的模态原本**只能从目录名猜**（`shared/data.py: _AsSeries.modality = s["uid"]`）。
+本地模拟集的目录名是 `flair_0000` / `t1c_0000`，所以一直没暴露；官方数据的
+序列目录名是 **DICOM UID**（`1.2.826.0.1.3680043.2.1125.1.1001`），任何关键词
+都命中不了，于是 `pick_series` 返回空 → 报错。
+
+正确来源是官方数据根下的 **`SeriesType.xlsx`**（`AccessionNumber + SeriesUid →
+SeriesType`），提交工程一直用它的 `data/metadata.py`，训练侧此前没实现。
+现已补齐两条训练路径，取值优先级为：
+
+```text
+SeriesType.xlsx  →  同名 .json sidecar  →  目录名（模拟集仍照旧）
+```
+
+对应的代码：
+
+| 工程 | 位置 | 作用 |
+|---|---|---|
+| `glioma_goals` | `shared/data.py: discover_cases / read_series_types` | 训练取数（`train.py` 走这条） |
+| `glioma_track4` | `src/data/probe.py: scan_real / _collect_nifti`、`src/data/labels.py: read_series_types` | 探针、缓存、独立推理 |
+
+### 怎么确认它生效
+
+```bash
+python -m src.data.probe --root <数据根> --out /tmp/probe.json | grep series_type
+# 期望：[probe] 已读取 SeriesType.xlsx：N 条序列类型映射
+#       报告里 "series_type_rows": N（不是 0）
+```
+
+`series_type_rows: 0` 且模态全是 `other` → 类型表**不在数据根那一层**。
+它在哪一层，数据根就该填哪一层（`SeriesType.xlsx` 与 `<检查号>/` 目录同级）：
+
+```bash
+find /2026aicompetition/datasets -maxdepth 4 -name "SeriesType.xlsx"
+```
+
+找不到任何 `SeriesType.xlsx` 时，请把**一个病例目录的完整结构**贴出来：
+
+```bash
+ls -la /2026aicompetition/datasets/training/annotation/<某个检查号>/
+ls -la /2026aicompetition/datasets/training/annotation/<某个检查号>/<某个序列目录>/
+```
+
+有了这两条，就能确定模态还能从哪里取（目录名约定 / sidecar 字段名 / 其它映射表），
+不必再靠猜。
+
 ## 定根之后
 
 ```bash

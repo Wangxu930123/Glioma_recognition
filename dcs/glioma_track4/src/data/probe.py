@@ -20,8 +20,9 @@ import os
 from collections import Counter
 
 from ..utils.config import data_source_tag, load_paths, resolve
-from .labels import (find_structured_tables, guess_modality, mask_role_for,
-                     read_structured_table, structured_from_row)
+from .labels import (find_structured_tables, guess_modality, has_strict_mask_hint,
+                     mask_role_for, norm_key, read_series_types,
+                     read_structured_table, sidecar_desc, structured_from_row)
 
 IMG_EXT = (".nii.gz", ".nii")
 SKIP_NAME_KW = ("dicomdir", "license", "readme", "vht", ".mhd")
@@ -146,11 +147,18 @@ def scan_special(root: str) -> dict:
 # --------------------------------------------------------------------------- #
 # 真实影像
 # --------------------------------------------------------------------------- #
-def _collect_nifti(cdir: str) -> tuple[dict, dict]:
+def _collect_nifti(cdir: str, accession: str = "",
+                   series_types: dict | None = None) -> tuple[dict, dict]:
     """扫描一个检查目录下的 NIfTI：返回 (images, mask_entries)。
 
     - images: ``{modality: {"path","series_uid","file"}}``
     - mask_entries: ``[(role, modality, path, series_uid), ...]``（同一角色可多条 → 取并集）
+
+    ``series_types`` 是官方 ``SeriesType.xlsx`` 解析出的
+    ``{(检查号, 序列号): 序列类型}``。**官方数据必须靠它**：序列目录名是
+    DICOM UID、文件名也是 UID，任何"按名字猜模态/掩膜"的关键词都命中不了——
+    探针会表现为"病例数正常、模态全是 other、掩膜一个没有"，
+    而训练侧更直接：``无任何可用序列``。
     """
     images: dict[str, dict] = {}
     masks: list[tuple[str, str | None, str, str]] = []
@@ -161,13 +169,24 @@ def _collect_nifti(cdir: str) -> tuple[dict, dict]:
                 continue
             full = os.path.join(dirpath, fn)
             stem = _stem(fn)
-            # 序列模态：优先"所在目录名"，其次文件名自身
-            mod = guess_modality(stem)
-            if mod is None:
-                mod = guess_modality(sdir)
             series_uid = sdir if sdir and sdir != os.path.basename(cdir) else stem
+            # 序列类型：类型表（官方主力）→ sidecar → 目录名/文件名（模拟集）
+            desc = ""
+            if series_types:
+                for uid_key in (series_uid, stem):
+                    desc = str(series_types.get(
+                        (norm_key(accession), norm_key(uid_key))) or "")
+                    if desc:
+                        break
+            desc = desc or (sidecar_desc(full) or "")
+            mod = guess_modality(desc) or guess_modality(stem) or guess_modality(sdir)
             is_pure = stem.strip() in PURE_MODALITY_STEMS
             role = None if is_pure else mask_role_for(fn, mod)
+            # 类型表给出的掩膜：文件名是 UID，只能靠"类型 + 严格线索"识别。
+            # 严格线索必不可少——"T1增强"这类**影像**名里也含"增强"，
+            # 直接送进 mask_role_for 会被判成 core 掩膜。
+            if role is None and desc and has_strict_mask_hint(desc):
+                role = mask_role_for(f"{desc} {fn}", mod)
             if role:
                 masks.append((role, mod, full, series_uid))
             else:
@@ -200,17 +219,27 @@ def _collect_dicom(cdir: str, log: list | None = None) -> dict:
 
 def scan_real(root: str, limit_cases: int | None = None,
               struct_tables: dict[str, dict] | None = None,
-              log: list | None = None) -> list[dict]:
-    """扫描真实影像：一级目录 = 检查号；其下收集影像（NIfTI/DICOM）与掩码。"""
+              log: list | None = None,
+              series_types: dict | None = None) -> list[dict]:
+    """扫描真实影像：一级目录 = 检查号；其下收集影像（NIfTI/DICOM）与掩码。
+
+    ``SeriesType.xlsx``（若存在于数据根）会一次性读入并用于识别**模态与掩膜**：
+    官方数据的序列目录名与文件名都是 UID，只靠关键词会得到"整批 other、
+    掩膜全无"，而目录结构看起来完全正常。
+    """
     cases: list[dict] = []
     if not os.path.isdir(root):
         return cases
     assert_case_root(root)
+    if series_types is None:
+        series_types = read_series_types(root)
+    if series_types:
+        print(f"[probe] 已读取 SeriesType.xlsx：{len(series_types)} 条序列类型映射", flush=True)
     entries = sorted(e for e in os.listdir(root)
                      if os.path.isdir(os.path.join(root, e)) and e.lower() != "annotation")
     for acc in entries:
         cdir = os.path.join(root, acc)
-        images, mask_entries = _collect_nifti(cdir)
+        images, mask_entries = _collect_nifti(cdir, acc, series_types)
         if not images:                                            # 纯 DICOM 检查
             images = _collect_dicom(cdir, log)
         if not images and not mask_entries:
@@ -236,7 +265,8 @@ def scan_real(root: str, limit_cases: int | None = None,
     return cases
 
 
-def merge_special_cases(cases: list[dict], special: dict, log: list | None = None) -> list[dict]:
+def merge_special_cases(cases: list[dict], special: dict, log: list | None = None,
+                        series_types: dict | None = None) -> list[dict]:
     """把 ``annotation/{fake,Composition}`` 中**未出现在真实影像目录**的病例补进清单。
 
     否则目标一/二的正样本可能一例都匹配不上（``SpecialImageDataset`` 找不到影像），
@@ -254,7 +284,7 @@ def merge_special_cases(cases: list[dict], special: dict, log: list | None = Non
             d = os.path.join(base, str(ident))
             if not os.path.isdir(d):
                 continue
-            imgs, masks = _collect_nifti(d)
+            imgs, masks = _collect_nifti(d, str(ident), series_types)
             if not imgs:
                 imgs = _collect_dicom(d, log)
             if not imgs:
@@ -275,9 +305,12 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
             struct.update(read_structured_table(t))
         except Exception:                                         # noqa: BLE001
             pass
+    # 序列类型表只读一次，影像与特殊影像两条分支共用（避免"一处读了、一处没读"
+    # 导致两边口径不一致）
+    series_types = read_series_types(root)
     special = scan_special(root)
-    cases = scan_real(root, limit_cases, struct, log)
-    cases = merge_special_cases(cases, special, log)
+    cases = scan_real(root, limit_cases, struct, log, series_types)
+    cases = merge_special_cases(cases, special, log, series_types)
 
     mod_counter, mask_counter, label_counter = Counter(), Counter(), Counter()
     geom_samples = []
@@ -295,6 +328,9 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
         "n_cases": len(cases),
         "structured_tables": tables,
         "n_structured_rows": len(struct),
+        # 序列类型表命中数：0 且在官方数据上 → 模态/掩膜必然认不出，
+        # 先解决这个再谈训练（"病例数正常但全 other"就是这个原因）
+        "series_type_rows": len(series_types),
         "modality_counts": dict(mod_counter),
         "mask_role_counts": dict(mask_counter),
         "label_field_counts": dict(label_counter),

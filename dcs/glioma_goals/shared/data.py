@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -72,32 +73,193 @@ def assert_case_root(root: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 序列类型解析（官方数据的模态**只能**从这里来）
+# --------------------------------------------------------------------------- #
+#: sidecar JSON 里可能承载序列类型的键（按优先级）
+_SIDECAR_DESC_KEYS = ("SeriesType", "series_type", "SeriesDescription",
+                      "ProtocolName", "SequenceName", "modality", "Modality")
+
+#: 掩膜的"核心区"关键词（角色判定与 ``find_masks`` 同一套语义）
+_ROLE_CORE_KW = ("core", "核心", "瘤体", "增强", "et", "肿瘤", "tumor")
+#: 掩膜的"周围总异常区"关键词
+_ROLE_PERI_KW = ("peri", "perimeter", "水肿", "异常", "whole", "总")
+
+#: 已就"缺 openpyxl"告警过（避免每条病例刷一次屏）
+_WARNED_NO_OPENPYXL = False
+
+
+def _norm_key(value) -> str:
+    """归一化用于查表的键（去空白 + 大小写无关），与提交工程同一规则。"""
+    return re.sub(r"\s+", "", str(value if value is not None else "")).casefold()
+
+
+def read_series_types(root: Path) -> dict[tuple[str, str], str]:
+    """读官方 ``SeriesType.xlsx``：``(检查号, 序列号) → 序列类型``。
+
+    ⚠️ **官方数据下这是模态的唯一来源**。序列目录名是 DICOM UID
+    （``1.2.826.0.1...``），任何"按名字猜模态"的关键词都命中不了，
+    于是出现"扫出几千例、却一例都没有可用序列"——但病例计数看起来完全正常，
+    很容易被误判成数据损坏或路径写错。
+
+    与提交工程 ``data/metadata.py: read_series_types`` 保持同一语义：
+    表头别名容错、缺文件返回空表（不是错误）、同一键冲突取值**直接失败**。
+
+    找不到 openpyxl 时给出**一次性显式告警**：静默返回空表会让人去改
+    真正没错的地方（数据布局），而问题其实只是缺个依赖。
+    """
+    global _WARNED_NO_OPENPYXL
+
+    path = Path(root) / "SeriesType.xlsx"
+    if not path.is_file():
+        return {}
+    try:
+        from openpyxl import load_workbook
+    except ImportError:                                           # pragma: no cover
+        if not _WARNED_NO_OPENPYXL:
+            _WARNED_NO_OPENPYXL = True
+            print(f"[data][告警] 发现 {path} 但未安装 openpyxl，序列类型读不到 → "
+                  f"UID 命名的序列会全部认不出模态。请先 pip install openpyxl",
+                  flush=True)
+        return {}
+
+    aliases = {
+        "acc": ("accessionnumber", "accession", "检查号", "检查编号", "病例号"),
+        "uid": ("seriesinstanceuid", "seriesuid", "序列号", "序列uid"),
+        "typ": ("seriestype", "type", "序列类型", "模态", "序列描述"),
+    }
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    out: dict[tuple[str, str], str] = {}
+    try:
+        for sheet in workbook.worksheets:
+            rows = list(sheet.iter_rows(values_only=True))
+            if not rows:
+                continue
+            header = [_norm_key(c) for c in rows[0]]
+            idx: dict[str, int] = {}
+            for want, keys in aliases.items():
+                for i, h in enumerate(header):
+                    if any(k in h for k in keys):
+                        idx[want] = i
+                        break
+            if set(idx) != {"acc", "uid", "typ"}:
+                continue                                          # 该 sheet 不是映射表
+            for row in rows[1:]:
+                try:
+                    acc, uid, typ = row[idx["acc"]], row[idx["uid"]], row[idx["typ"]]
+                except IndexError:
+                    continue
+                if acc is None or uid is None or typ is None:
+                    continue
+                key = (_norm_key(acc), _norm_key(uid))
+                value = str(typ).strip()
+                if not value:
+                    continue
+                if key in out and out[key] != value:
+                    raise ValueError(
+                        f"SeriesType.xlsx 冲突：检查号={acc!r} 序列={uid!r} "
+                        f"同时映射到 {out[key]!r} 与 {value!r}（{path}）")
+                out[key] = value
+    finally:
+        workbook.close()
+    return out
+
+
+def _sidecar_desc(path: Path) -> str | None:
+    """读同名 JSON sidecar 的序列描述（不存在或解析失败返回 None）。"""
+    stem = path.name[:-7] if path.name.lower().endswith(".nii.gz") else path.stem
+    sidecar = path.with_name(stem + ".json")
+    if not sidecar.is_file():
+        return None
+    try:
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+    except Exception:                                             # noqa: BLE001
+        return None
+    if not isinstance(data, dict):
+        return None
+    for key in _SIDECAR_DESC_KEYS:
+        value = data.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _series_desc(path: Path, accession: str, uid: str, series_types: dict) -> str:
+    """序列类型的**取用优先级**：类型表 → sidecar → 目录名。
+
+    返回的文本会作为 ``Series`` 的 ``modality`` 交给模态关键词匹配，
+    因此它可以是 ``T1CE`` / ``FLAIR`` / ``T1增强`` 这类**任意自然描述**。
+    """
+    value = series_types.get((_norm_key(accession), _norm_key(uid)))
+    if value:
+        return str(value)
+    value = _sidecar_desc(path)
+    if value:
+        return value
+    return uid
+
+
+def _mask_role(filename: str, desc: str) -> str | None:
+    """由**文件名 + 序列类型**判定掩膜角色；``None`` 表示这是影像。
+
+    角色判定必须结合所在序列的模态：FLAIR/T2 上的"瘤体"属于**总异常区**，
+    而不是核心区——只看文件名会把两者的空间搞混。
+    """
+    text = f"{filename} {desc}".casefold()
+    if not any(h in text for h in MASK_HINTS):
+        return None
+    is_flair_like = any(k in desc.casefold() for k in ("flair", "t2"))
+    core_like = any(k in text for k in _ROLE_CORE_KW)
+    peri_like = any(k in text for k in _ROLE_PERI_KW)
+    if peri_like and not core_like:
+        return "peri"
+    if core_like:
+        return "peri" if is_flair_like else "core"
+    if peri_like:
+        return "peri"
+    return "core"                                                 # 仅命中"标注/掩码"等泛化词
+
+
+# --------------------------------------------------------------------------- #
 # 病例发现
 # --------------------------------------------------------------------------- #
 def discover_cases(dataset_root: Path, limit: int | None = None) -> list[dict]:
     """扫描 ``<root>/<AccessionNumber>/<SeriesUid>/*.nii[.gz]``。
 
-    返回 ``[{"accession", "dir", "series": [{"path","uid"}]}, ...]``。
+    返回 ``[{"accession", "dir", "series": [{"path","uid","desc"}], "masks"}, ...]``。
     只做轻量发现（不读体素），真正的读取延迟到 ``load_case``。
+
+    ``desc`` 是该序列的**类型描述**（类型表 → sidecar → 目录名），
+    ``masks`` 是从类型表/sidecar 解析出的掩膜（按角色分组）。
+    官方数据的序列目录名是 UID，**没有这两项就完全无法区分模态与掩膜**。
     """
     root = Path(dataset_root)
     assert_case_root(root)
+    series_types = read_series_types(root)
     cases: list[dict] = []
     for acc_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         if acc_dir.name.lower() in ("annotation", "cache", "runs"):
             continue
         series: list[dict] = []
+        masks: dict[str, list[str]] = {}
         for f in sorted(acc_dir.rglob("*")):
             if not f.is_file():
                 continue
-            name = f.name.lower()
-            if not name.endswith(NIFTI_SUFFIXES):
+            if not f.name.lower().endswith(NIFTI_SUFFIXES):
                 continue
-            if any(h in name for h in MASK_HINTS):
+            uid = f.parent.name
+            desc = _series_desc(f, acc_dir.name, uid, series_types)
+            role = _mask_role(f.name, desc)
+            if role:
+                masks.setdefault(role, []).append(str(f))
                 continue
-            series.append({"path": str(f), "uid": f.parent.name})
+            if any(h in f.name.lower() for h in MASK_HINTS):
+                continue                                          # 名称启发式：仍按掩膜排除
+            series.append({"path": str(f), "uid": uid, "desc": desc})
         if series:
-            cases.append({"accession": acc_dir.name, "dir": str(acc_dir), "series": series})
+            case = {"accession": acc_dir.name, "dir": str(acc_dir), "series": series}
+            if masks:
+                case["masks"] = masks
+            cases.append(case)
         if limit and len(cases) >= limit:
             break
     return cases
@@ -196,8 +358,14 @@ def find_masks(case: dict) -> dict[str, list[str]]:
 
     角色判定结合**文件名**与**所在序列的模态**：FLAIR 序列上的"瘤体"属于
     "总异常区"而不是"核心区"——只看文件名会把两者的空间搞混。
+
+    两路结果**取并集**：``case["masks"]`` 来自类型表/sidecar（官方数据的主力，
+    文件名是 UID 时只有它认得出来），文件名启发式则覆盖模拟集与零散命名。
+    任一单路都可能有遗漏，并集最稳。
     """
-    out: dict[str, list[str]] = {}
+    out: dict[str, list[str]] = {
+        role: list(paths) for role, paths in (case.get("masks") or {}).items()
+    }
     for f in sorted(Path(case["dir"]).rglob("*")):
         if not f.is_file() or not f.name.lower().endswith(NIFTI_SUFFIXES):
             continue
@@ -208,16 +376,16 @@ def find_masks(case: dict) -> dict[str, list[str]]:
         # 掩码的**任务角色**要结合它所在序列的模态判断：
         # FLAIR/T2 上的"瘤体"属于"总异常区(peri)"，而不是"核心区(core)"——
         # 只看文件名会把两者的空间搞混（掩码写到错误的序列空间上）。
-        is_flair_like = any(k in parent for k in ("flair", "t2"))
-        core_like = any(k in name for k in ("core", "核心", "瘤体", "增强", "et", "肿瘤"))
-        peri_like = any(k in name for k in ("flair", "peri", "水肿", "异常", "whole", "总"))
-        if peri_like and not core_like:
-            out.setdefault("peri", []).append(str(f))
-        elif core_like:
-            out.setdefault("peri" if is_flair_like else "core", []).append(str(f))
-        elif peri_like:
-            out.setdefault("peri", []).append(str(f))
-    return out
+        # 目录名是 UID 时这里判不出模态，改用类型表给出的 ``desc``。
+        desc = ""
+        for s in case.get("series") or []:
+            if s.get("uid") == f.parent.name:
+                desc = str(s.get("desc") or "")
+                break
+        role = _mask_role(f.name, f"{parent} {desc}")
+        if role:
+            out.setdefault(role, []).append(str(f))
+    return {role: sorted(set(paths)) for role, paths in out.items()}
 
 
 # --------------------------------------------------------------------------- #
@@ -301,10 +469,16 @@ class _AsStudy:
 class _AsSeries:
     def __init__(self, s: dict) -> None:
         self.series_uid = s["uid"]
-        self.modality = s["uid"]
+        # 模态取自 ``discover_cases`` 解析出的**类型描述**（类型表 → sidecar → 目录名）。
+        # 直接用目录名会让官方的 UID 命名序列全部认不出模态：病例数正常、
+        # 但 ``pick_series`` 一个都挑不出来 → "无任何可用序列"。
+        self.modality = str(s.get("desc") or s["uid"])
         self.image = s["image"]
         self.affine = s["affine"]
         self.source_path = Path(s["path"])
+        # 刻意留空：``selector._key_of`` 把 ``metadata["modality"]`` 当作**权威值**，
+        # 若把 sidecar 里的 DICOM 取值（如 "MR"）塞进来，它会把序列判成未知模态
+        # 而直接跳过——模态匹配统一走上面的 ``desc``，避免两处口径打架。
         self.metadata = {}
 
 

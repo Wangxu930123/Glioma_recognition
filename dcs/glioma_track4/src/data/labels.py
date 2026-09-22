@@ -230,6 +230,145 @@ def structured_from_row(row: dict) -> dict:
     return out
 
 
+def _norm_key(value: Any) -> str:
+    """归一化查表键（去空白 + 大小写无关）。"""
+    return re.sub(r"\s+", "", str(value if value is not None else "")).casefold()
+
+
+#: 公开别名：序列类型表与其它模块共用同一套键归一化规则，
+#: 各写一份迟早会出现"一处去空白、一处不去"的静默错配。
+norm_key = _norm_key
+
+
+#: sidecar JSON 里可能承载序列类型的键（按优先级）
+SIDECAR_DESC_KEYS = ("SeriesType", "series_type", "SeriesDescription",
+                     "ProtocolName", "SequenceName", "modality", "Modality")
+
+#: **明确的**掩膜线索。判断"这条序列是掩膜"时必须命中其中之一：
+#: 类型表里的普通影像名可能带 ``增强``/``et`` 这类词（如 "T1增强"），
+#: 而它们同时也是 ``mask_role_for`` 的 core 关键词——不先卡一道，
+#: 会把**增强影像**误判成掩膜，于是输入通道里少一个模态、多一个标签。
+STRICT_MASK_KW = ("mask", "seg", "label", "roi", "掩码", "标注",
+                  "瘤体", "水肿", "异常", "核心", "病灶", "肿瘤区")
+
+
+def has_strict_mask_hint(text: str) -> bool:
+    """该文本是否含**明确**的掩膜线索（大小写无关；中文不受影响）。"""
+    low = (text or "").lower()
+    return any(k in low for k in STRICT_MASK_KW)
+
+#: 已告警过"发现类型表但缺依赖"（避免每例刷屏）
+_WARNED_SERIES_TYPE_DEP = False
+
+
+def read_series_types(root: str | os.PathLike) -> dict[tuple[str, str], str]:
+    """读官方 ``SeriesType.xlsx``：``(检查号, 序列号) → 序列类型``。
+
+    ⚠️ **官方数据下这是模态的唯一来源**。序列目录名是 DICOM UID
+    （``1.2.826.0.1...``），靠"按名字猜关键词"一个都命中不了：探针会把整批
+    序列归到 ``other``，训练侧则直接报 ``无任何可用序列``——而病例数、目录结构
+    看起来完全正常，极易被误判成数据损坏或路径写错。
+
+    与提交工程 ``data/metadata.py`` 同一语义：表头别名容错、缺文件返回空表
+    （不是错误）、同一键冲突取值**直接失败**。解析器优先 openpyxl，退化到 pandas。
+    """
+    global _WARNED_SERIES_TYPE_DEP
+
+    path = os.path.join(str(root), "SeriesType.xlsx")
+    if not os.path.isfile(path):
+        return {}
+
+    rows: list[list] = []
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            for sheet in wb.worksheets:
+                rows.extend(list(sheet.iter_rows(values_only=True)))
+        finally:
+            wb.close()
+    except ImportError:
+        try:
+            import pandas as pd
+            df = pd.read_excel(path, dtype=str, header=None)
+            rows = df.fillna("").values.tolist()
+        except Exception as exc:                                  # noqa: BLE001
+            if not _WARNED_SERIES_TYPE_DEP:
+                _WARNED_SERIES_TYPE_DEP = True
+                print(f"[probe][告警] 发现 {path} 但既没有 openpyxl 也没有 pandas，"
+                      f"序列类型读不到 → UID 命名的序列会全部归到 other。"
+                      f"请 pip install openpyxl（{exc}）", flush=True)
+            return {}
+
+    aliases = {
+        "acc": ("accessionnumber", "accession", "检查号", "检查编号", "病例号"),
+        "uid": ("seriesinstanceuid", "seriesuid", "序列号", "序列uid"),
+        "typ": ("seriestype", "type", "序列类型", "模态", "序列描述"),
+    }
+    out: dict[tuple[str, str], str] = {}
+    idx: dict[str, int] = {}
+    for row in rows:
+        header = [_norm_key(c) for c in row]
+        if not idx:
+            for want, keys in aliases.items():
+                for i, h in enumerate(header):
+                    if any(k in h for k in keys):
+                        idx[want] = i
+                        break
+            if set(idx) == {"acc", "uid", "typ"}:
+                continue                                          # 表头行本身不入表
+            idx = {}
+            continue
+        try:
+            acc, uid, typ = row[idx["acc"]], row[idx["uid"]], row[idx["typ"]]
+        except IndexError:
+            continue
+        if acc in (None, "") or uid in (None, "") or typ in (None, ""):
+            continue
+        key = (_norm_key(acc), _norm_key(uid))
+        value = str(typ).strip()
+        if not value:
+            continue
+        if key in out and out[key] != value:
+            raise ValueError(
+                f"SeriesType.xlsx 冲突：检查号={acc!r} 序列={uid!r} "
+                f"同时映射到 {out[key]!r} 与 {value!r}（{path}）")
+        out[key] = value
+    return out
+
+
+def nifti_stem(filename: str) -> str:
+    """``x.nii.gz`` / ``x.nii`` → ``x``。"""
+    low = filename.lower()
+    for ext in (".nii.gz", ".nii"):
+        if low.endswith(ext):
+            return filename[: -len(ext)]
+    return filename
+
+
+def sidecar_desc(path: str | os.PathLike) -> str | None:
+    """读同名 JSON sidecar 的序列描述（不存在或解析失败返回 None）。"""
+    import json
+
+    p = os.path.abspath(str(path))
+    stem = nifti_stem(os.path.basename(p))
+    sidecar = os.path.join(os.path.dirname(p), stem + ".json")
+    if not os.path.isfile(sidecar):
+        return None
+    try:
+        with open(sidecar, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:                                             # noqa: BLE001
+        return None
+    if not isinstance(data, dict):
+        return None
+    for key in SIDECAR_DESC_KEYS:
+        value = data.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
 def find_structured_tables(root: str) -> list[str]:
     """在数据根下找结构化金标准表（csv/xlsx）。"""
     hits = []

@@ -367,6 +367,55 @@ def main() -> int:
     check("Mock Competition 可指向真实数据目录", '"--dataset"' in _mock_src)
 
     # ---------------------------------------------------------------- #
+    _section("⑭ 官方数据的模态来源：SeriesType.xlsx（UID 命名序列）")
+    # 训练侧的模态原本只能从**目录名**猜。本地模拟集目录名是 flair_0000，所以
+    # 一直正常；官方数据目录名是 DICOM UID，关键词全不命中 →
+    # "病例数正常、却报 无任何可用序列"。这条必须用**行为**验证，
+    # 因为两边代码都能"导入成功、结构正确"，只在真数据上才炸。
+    _goals_src = (_GOALS / "shared/data.py").read_text(encoding="utf-8")
+    _probe_src2 = (_TRACK4 / "src/data/probe.py").read_text(encoding="utf-8")
+    _labels_src = (_TRACK4 / "src/data/labels.py").read_text(encoding="utf-8")
+    check("研发侧实现 read_series_types", "def read_series_types" in _goals_src)
+    check("算法工程实现 read_series_types",
+          "def read_series_types" in _labels_src and "read_series_types" in _probe_src2)
+    check("研发侧模态取自 desc（不再是裸目录名）",
+          's.get("desc")' in _goals_src)
+    check("掩膜识别有严格线索把关（'T1增强' 不会被当成掩膜）",
+          "has_strict_mask_hint" in _probe_src2 and "STRICT_MASK_KW" in _labels_src)
+
+    with tempfile.TemporaryDirectory() as _tmp2:
+        from openpyxl import Workbook                                # noqa: PLC0415 本段专用
+        from shared.data import find_masks, load_case                 # noqa: PLC0415
+        _root = Path(_tmp2) / "annotation"
+        _acc = "3255123456"
+        _uids = {"f": "1.2.826.0.1.3680043.2.1125.1.1001",
+                 "t": "1.2.826.0.1.3680043.2.1125.1.1002",
+                 "m": "1.2.826.0.1.3680043.2.1125.1.1003"}
+        for _u in _uids.values():
+            _tiny_nii(_root / _acc / _u / f"{_u}.nii.gz")
+        _wb = Workbook()
+        _ws = _wb.active
+        _ws.append(["AccessionNumber", "SeriesUid", "SeriesType"])
+        for _k, _v in (("f", "FLAIR"), ("t", "T1增强"), ("m", "瘤体")):
+            _ws.append([_acc, _uids[_k], _v])
+        _wb.save(_root / "SeriesType.xlsx")
+
+        check("研发侧：UID 序列用类型表解析出模态",
+              sorted(s["desc"] for s in discover_cases(_root)[0]["series"]) == ["FLAIR", "T1增强"])
+        check("研发侧：'瘤体' 归为掩膜",
+              list(find_masks(discover_cases(_root)[0])) == ["core"])
+        check("研发侧：load_case 能建出体积（原报错点）",
+              load_case(discover_cases(_root)[0], common_spacing=(1.0, 1.0, 1.0))[0].ndim == 4)
+
+        if str(_TRACK4) not in sys.path:
+            sys.path.insert(0, str(_TRACK4))
+        from src.data.probe import scan_real                          # noqa: PLC0415
+        _c = scan_real(str(_root))[0]
+        check("算法工程：类型表给出模态（'T1增强' 仍算影像）",
+              sorted(_c["images"]) == ["flair", "t1c"], f"images={sorted(_c['images'])}")
+        check("算法工程：'瘤体' 归为掩膜", list(_c["masks"]) == ["core"])
+
+    # ---------------------------------------------------------------- #
     print("\n" + "=" * 66)
     total = len(_PASSED) + len(_FAILED)
     print(f"通过 {len(_PASSED)}/{total}")

@@ -38,6 +38,38 @@ NIFTI_SUFFIXES = (".nii", ".nii.gz")
 MASK_HINTS = ("mask", "seg", "label", "roi", "掩码", "标注",
               "瘤体", "水肿", "异常", "核心", "病灶", "肿瘤区")
 
+#: 平台 ``/2026aicompetition/datasets`` 下的阶段目录名。
+#: 数据根必须精确到其中一个（训练用 ``training``），不能停在父目录。
+_PLATFORM_PHASES = frozenset({
+    "training", "evaluation_first", "evaluation_second",
+    "evaluation_finals", "verification",
+})
+
+
+def assert_case_root(root: Path) -> None:
+    """拦截"数据根误指向 ``datasets/`` 父目录"。
+
+    平台上 ``/2026aicompetition/datasets`` 下是 5 个阶段目录，数据根要精确到
+    ``.../datasets/training``。误传父目录时旧实现会把阶段名当成病例号：
+
+    * 训练照常启动、损失照常下降，但输入是 5 个"检查"混合的像素；
+    * 金标准一张也对不上（``no_labels`` 全空），分类/分割都学不到东西；
+    * 由于不报错，往往要等到提交或人工核对时才暴露 —— 白烧几小时 GPU。
+
+    因此这里直接失败，并把"应该填哪个路径"写进报错信息。
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return
+    children = sorted(p.name for p in root.iterdir() if p.is_dir())
+    if len(children) < 2 or not {c.casefold() for c in children} <= _PLATFORM_PHASES:
+        return
+    raise ValueError(
+        f"数据根 {root} 指向数据集父目录，其下是平台阶段目录 {children}。"
+        f"请把数据根设为具体阶段（训练应为 {root / 'training'}）；"
+        f"否则这些目录名会被当作病例号，训练数据完全错误却不报错。"
+    )
+
 
 # --------------------------------------------------------------------------- #
 # 病例发现
@@ -49,6 +81,7 @@ def discover_cases(dataset_root: Path, limit: int | None = None) -> list[dict]:
     只做轻量发现（不读体素），真正的读取延迟到 ``load_case``。
     """
     root = Path(dataset_root)
+    assert_case_root(root)
     cases: list[dict] = []
     for acc_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         if acc_dir.name.lower() in ("annotation", "cache", "runs"):

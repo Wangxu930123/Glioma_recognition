@@ -23,12 +23,56 @@ _TOLERANT = os.environ.get("GLIOMA_LOADER_TOLERANT", "").strip().lower() in {"1"
 
 
 _NIFTI_SUFFIXES = (".nii", ".nii.gz")
-_MASK_HINTS = ("mask", "seg", "label", "roi")
+
+#: 掩膜文件名关键词（**与训练侧 ``shared/data.py`` 的 ``MASK_HINTS`` 同一语义**）。
+#:
+#: 掩膜常与影像放在**同一个序列目录**里（本地模拟集即 ``flair_0000/flair.nii.gz``
+#: 与 ``flair_0000/瘤体.nii.gz`` 并存）。早期这里只列英文词，于是中文掩膜被当成
+#: 第二个序列文件：
+#:
+#: * 非容错模式 → :func:`_select_original_nifti_files` 抛错，**整批评测失败**；
+#: * 容错模式   → 跳过整个序列目录，该模态**整体丢失**并降级推理。
+#:
+#: 两种后果都与"只是多了个标签文件"不相称，因此这里补齐中文词：
+#: 漏检代价是全盘失败/静默降级，误检代价只是少读一个本就该忽略的文件。
+_MASK_HINTS = ("mask", "seg", "label", "roi", "掩码", "标注",
+               "瘤体", "水肿", "异常", "核心", "病灶", "肿瘤区")
+
 _SERIES_TYPE_HEADERS = ("accessionnumber", "seriesuid", "seriestype")
+
+#: 顶层**非病例**目录（与训练侧 ``discover_cases`` 的跳过列表保持同一语义）。
+#:
+#: 官方数据根除病例号目录外还有标注目录 ``annotation/{fake,Composition,duplicate}``。
+#: 不跳过时 ``annotation`` 会被当成一个 accession，后果依次加重：
+#:
+#: 1. 其子目录里的 NIfTI 会被逐体素读入（白耗算力）；
+#: 2. 产出 ``answer/<evaluation_id>/annotation/prediction.json`` 这类垃圾结果，
+#:    而平台按检查号评分，多余目录可能被判格式错误；
+#: 3. 更致命的是若 ``annotation/fake/<uid>/`` 下的文件名不等于目录名，
+#:    :func:`_select_original_nifti_files` 会**直接抛错**——一次评测机会全盘报废。
+#:    （赛事评测不可重跑，1 个标注目录不该让整批归零。）
+_NON_CASE_DIRS = frozenset({"annotation", "cache", "runs", "folds", "labels"})
+
+#: 平台 ``/2026aicompetition/datasets`` 下的阶段目录名。
+#: ``dataset_path`` 若误指**父目录**，这些名字会被当成病例号，静默产出 5 份垃圾答案；
+#: 因此显式拦截（或唯一时自动下钻），把"静默全错"变成"当场可见"。
+_PLATFORM_PHASES = frozenset({
+    "training",
+    "evaluation_first",
+    "evaluation_second",
+    "evaluation_finals",
+    "verification",
+})
 
 
 def _nifti_stem(path: Path) -> str:
     return path.name[:-7] if path.name.lower().endswith(".nii.gz") else path.stem
+
+
+def _is_non_case_path(root: Path, path: Path) -> bool:
+    """该 NIfTI 是否位于顶层**非病例**目录之下（如 ``annotation/``）。"""
+    relative = path.relative_to(root)
+    return len(relative.parts) > 1 and relative.parts[0].casefold() in _NON_CASE_DIRS
 
 
 def _select_original_nifti_files(root: Path, files: Iterable[Path]) -> list[Path]:
@@ -173,7 +217,7 @@ class DatasetLoader:
 
     def iter_studies(self, dataset_path: str | Path) -> Iterator[Study]:
         """Discover file paths, then load one study at a time."""
-        root = Path(dataset_path).expanduser().resolve()
+        root = self._resolve_dataset_root(dataset_path)
         if not root.is_dir():
             raise InvalidInputError(f"dataset_path is not a directory: {root}")
 
@@ -185,11 +229,45 @@ class DatasetLoader:
                 if path.is_file()
                 and path.name.lower().endswith(_NIFTI_SUFFIXES)
                 and not any(hint in path.name.lower() for hint in _MASK_HINTS)
+                and not _is_non_case_path(root, path)
             ),
         )
         if not nifti_files:
             raise InvalidInputError(f"no readable NIfTI images under {root}")
         yield from self._iter_nifti(root, nifti_files, _read_series_types(root))
+
+    @staticmethod
+    def _resolve_dataset_root(dataset_path: str | Path) -> Path:
+        """确认 ``dataset_path`` 落在**含病例号目录的那一层**。
+
+        平台的 ``/2026aicompetition/datasets`` 下有 5 个阶段目录
+        （``training`` / ``evaluation_first`` / ``evaluation_second`` /
+        ``evaluation_finals`` / ``verification``），而 ``dataset_path`` 必须精确到
+        其中**一个**。若误传父目录，旧实现会把阶段名当成病例号：
+
+        * 产出 5 个以阶段命名的"检查"，与真实检查集完全对不上；
+        * 平台按检查号评分 → 全部缺失，却不报任何错。
+
+        这里唯一能安全补救的情形是"父目录下只有一个阶段目录"（自动下钻并告警）；
+        真正有多个候选时**必须报错**——猜错阶段会把答案写到错误的评测轮次上，
+        比直接失败更糟。
+        """
+        root = Path(dataset_path).expanduser().resolve()
+        if not root.is_dir():
+            return root
+
+        children = sorted(p.name for p in root.iterdir() if p.is_dir())
+        if not children or not {name.casefold() for name in children} <= _PLATFORM_PHASES:
+            return root
+        if len(children) == 1:
+            print(f"[loader][告警] dataset_path={root} 是数据集父目录，"
+                  f"已自动下钻到唯一阶段目录 {children[0]}", flush=True)
+            return root / children[0]
+        raise InvalidInputError(
+            f"dataset_path 指向数据集父目录 {root}，其下是平台阶段目录 {children}。"
+            f"请指向**具体阶段**，例如 {root / 'evaluation_first'}；"
+            f"否则阶段名会被当作病例号，答案目录将整体错位。"
+        )
 
     def _iter_nifti(
         self,

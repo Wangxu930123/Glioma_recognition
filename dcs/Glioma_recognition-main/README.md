@@ -228,6 +228,55 @@ export COMPETITION_PIPELINE_FACTORY='tasks.real_pipeline:build_pipeline'
 
 示例见 `configs/competition.env.example`。
 
+## 平台数据目录（`/2026aicompetition/datasets`）
+
+容器内该挂载点下是**五个平行阶段目录**，各自的用途不同：
+
+```text
+/2026aicompetition/datasets/
+├── training/            ← 官方训练集（含 annotation/ 与各检查号目录）
+├── evaluation_first/    ← 第一轮评测输入
+├── evaluation_second/   ← 第二轮评测输入
+├── evaluation_finals/   ← 决赛评测输入
+└── verification/        ← 验证集
+```
+
+**数据根必须精确到其中一个阶段目录**，不能停在 `datasets/`：
+
+```bash
+# 训练（算法工程 / 训练工程）
+export DATASET_ROOT=/2026aicompetition/datasets/training
+
+# 推理：--dataset / dataset_path 指向具体评测阶段
+python scripts/local_eval.py \
+  --dataset /2026aicompetition/datasets/evaluation_first \
+  --output /2026aicompetition/workspace/answer/local-001 \
+  --evaluation-id local-001
+```
+
+误传父目录会被**当场拦截**（父目录下只有一个阶段目录时自动下钻并打印告警），
+不会把 `evaluation_first` 这类阶段名当成检查号后静默跑出一份对不上的答案。
+
+Loader 对官方数据形态的容错规则：
+
+- 顶层 `annotation/`（`fake` / `Composition` / `duplicate`）等**非病例目录一律跳过**；
+- 与影像同目录的掩膜按**中英文关键词**识别并过滤（`mask/seg/label/roi` 与
+  `掩码/标注/瘤体/水肿/异常/核心/病灶/肿瘤区`），与训练侧 `MASK_HINTS` 同一语义；
+- 缺文件或匹配不上时沿用原有元数据，`SeriesType.xlsx` 见下方说明。
+
+本地复现整条平台协议（`/health` → `/call` → 后台推理 → 回调 → 校验）：
+
+```bash
+COMPETITION_PIPELINE_FACTORY=tasks.real_pipeline:build_pipeline \
+COMPETITION_CHECKPOINT_ROOT=/path/to/checkpoint \
+python scripts/mock_competition.py \
+  --dataset /2026aicompetition/datasets/evaluation_first \
+  --workspace /2026aicompetition/workspace --timeout 3600
+```
+
+`--dataset` 省略时会现场生成一个 2 例的最小数据集；指向真实评测目录时请同时
+放大 `--timeout`，否则回调等待会先于推理结束而超时。
+
 ## 当前规范解释
 
 - 官方输入仅支持 NIfTI（.nii/.nii.gz）；

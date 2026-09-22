@@ -135,6 +135,38 @@ export COMPETITION_PIPELINE_FACTORY=tasks.glioma.pipeline:build_pipeline
 | **回调闭环** | 通过 `CALLBACK_URL`（或 `{workspace}/callback_url.txt`）传入平台回调地址。缺失时 `/health` 返回 `callback_ready:false`、启动打印醒目告警、回调处**显式报错**——不会静默不回调 |
 | **数据源卫生** | 正式权重只能来自大赛数据：切到官方数据前执行 `bash scripts/17_reset_for_official.sh` 归档本地验证产物并重建清单；`assert_data_source` 闸门会拒绝"清单数据源与本机不同类"的训练 |
 
+### 4.0 平台数据目录与数据根选择
+
+容器内 `/2026aicompetition/datasets` 下是**五个平行阶段目录**：
+
+```text
+/2026aicompetition/datasets/
+├── training/            ← 官方训练集（数据根取这一层）
+├── evaluation_first/    ← 第一轮评测输入（推理用）
+├── evaluation_second/   ← 第二轮评测输入（推理用）
+├── evaluation_finals/   ← 决赛评测输入（推理用）
+└── verification/        ← 验证集
+```
+
+**数据根必须精确到阶段目录**：`DATASET_ROOT=/2026aicompetition/datasets/training`。
+停在上层是很容易犯的错，而且后果不会当场显现——阶段名会被当成检查号，
+清单里出现 5 个假病例、金标准一张也对不上，训练却照常跑完。
+现在两条训练路径都会**在扫描前直接失败**并给出应填的路径：
+
+```text
+ValueError: 数据根 /2026aicompetition/datasets 指向数据集父目录，
+其下是平台阶段目录 ['evaluation_finals', 'evaluation_first', ...]。
+请把数据根设为具体阶段（训练应为 /2026aicompetition/datasets/training）；…
+```
+
+护栏位置：`shared/data.py: assert_case_root()`（研发侧各 Goal 的 `discover_cases`）
+与 `src/data/probe.py: assert_case_root()`（算法工程的探针/缓存/推理入口）。
+
+> 顺带一提：`training/` 与 `verification/` 内都可能有 `annotation/`
+> （`fake` / `Composition` / `duplicate`），它**不是**检查号目录；
+> 扫描时会被跳过，只有 `annotation/{fake,Composition}` 中的病例会作为
+> 特殊影像正样本补进清单。
+
 ### 4.1 从本地验证切到官方数据（必须执行的顺序）
 
 ```bash

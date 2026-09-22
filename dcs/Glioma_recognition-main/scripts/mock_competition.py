@@ -42,12 +42,25 @@ def main() -> None:
              "checkpoint/<goal>/…；否则服务端只在临时 workspace 里找权重，"
              "必然 FileNotFoundError。",
     )
+    parser.add_argument(
+        "--dataset", default=None,
+        help="改用**指定的真实数据目录**（如 "
+             "/2026aicompetition/datasets/evaluation_first）。默认生成一个最小合成"
+             "数据集。演练真实评测数据时必须同时放大 --timeout，否则"
+             "回调等待会先于推理结束超时。",
+    )
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
-        dataset = root / "dataset"
-        _make_dataset(dataset)
+        if args.dataset:
+            dataset = Path(args.dataset).expanduser().resolve()
+            if not dataset.is_dir():
+                raise SystemExit(f"--dataset 不是目录: {dataset}")
+            print(f"[mock] 使用真实数据目录 {dataset}")
+        else:
+            dataset = root / "dataset"
+            _make_dataset(dataset)
         callback_server = ThreadingHTTPServer(("127.0.0.1", 0), CallbackHandler)
         callback_thread = threading.Thread(
             target=callback_server.serve_forever,
@@ -105,9 +118,18 @@ def main() -> None:
             output = Path(str(payload["predPath"]))
             assert output.is_dir()
             assert (output / "duplicate_pairs.jsonl").is_file()
-            assert len(list(output.glob("*/prediction.json"))) == 2
-            assert len(list(output.glob("*/*/*.nii.gz"))) == 4
-            print("PASS Background execution")
+            # 期望病例数**从数据目录推导**，不能写死为 2：
+            # 用 --dataset 指向真实评测目录时，写死的数字会把合格产物判成失败。
+            expected = sum(1 for p in dataset.iterdir()
+                           if p.is_dir() and not p.name.startswith(".")
+                           and p.name.casefold() != "annotation")
+            predictions = list(output.glob("*/prediction.json"))
+            masks = list(output.glob("*/*/*.nii.gz"))
+            assert len(predictions) == expected, f"{len(predictions)} != {expected}"
+            # 每例写出 core/flair 两个掩膜；若两者指向同一序列则去重为 1 个，
+            # 因此下界是"每例至少 1 个"，而非固定 2 倍。
+            assert len(masks) >= expected, f"{len(masks)} < {expected}"
+            print(f"PASS Background execution（{len(predictions)} 例 / {len(masks)} 掩膜）")
             print("PASS Output and NIfTI validation")
             print("PASS Callback")
         finally:

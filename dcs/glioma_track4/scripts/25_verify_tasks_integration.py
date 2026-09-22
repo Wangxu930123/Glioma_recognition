@@ -296,6 +296,77 @@ def main() -> int:
           f"来源={sorted(_srcs)}")
 
     # ---------------------------------------------------------------- #
+    _section("⑬ 平台五目录布局：解析正确、误用当场可见")
+    # 平台挂载 /2026aicompetition/datasets/{training, evaluation_first,
+    # evaluation_second, evaluation_finals, verification}。数据根必须精确到
+    # **其中一个阶段目录**；停在上一层、或把 annotation/ 当病例，都不会报错，
+    # 只会安静地跑出与检查集完全对不上的结果 —— 所以这里做**行为级**验证，
+    # 而不只是扫源码。
+    import tempfile
+
+    import nibabel as _nib
+    import numpy as _np
+
+    if str(_MAIN) not in sys.path:
+        sys.path.insert(0, str(_MAIN))
+    from core.exceptions import InvalidInputError                 # noqa: E402
+    from data.loader import DatasetLoader                         # noqa: E402
+
+    def _tiny_nii(path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _nib.save(_nib.Nifti1Image(_np.zeros((2, 3, 4), _np.float32), _np.eye(4)),
+                  str(path))
+
+    _loader = DatasetLoader()
+    with tempfile.TemporaryDirectory() as _tmp:
+        _root = Path(_tmp) / "datasets"
+        # 真实形态：病例目录 + 同目录中文掩膜 + 顶层 annotation/ 标注目录
+        _tiny_nii(_root / "evaluation_first" / "ACC001" / "S1" / "S1.nii.gz")
+        _tiny_nii(_root / "evaluation_first" / "ACC001" / "S1" / "瘤体.nii.gz")
+        _tiny_nii(_root / "evaluation_first" / "annotation" / "fake"
+                  / "FAKE_1" / "S2" / "S2.nii.gz")
+        _tiny_nii(_root / "training" / "ACC002" / "S1" / "S1.nii.gz")
+
+        _studies = list(_loader.iter_studies(_root / "evaluation_first"))
+        _accs = [s.accession_number for s in _studies]
+        check("推理加载器跳过 annotation（不产出假检查）", _accs == ["ACC001"],
+              f"实际={_accs}")
+        check("推理加载器过滤中文掩膜（不把掩膜当影像）",
+              len(_studies[0].series) == 1,
+              f"序列={[s.modality for s in _studies[0].series]}")
+
+        try:
+            list(_loader.iter_studies(_root))
+            check("误传父目录被当场拦截", False, "未报错 → 会把阶段名当病例号")
+        except InvalidInputError:
+            check("误传父目录被当场拦截", True)
+
+        _single = Path(_tmp) / "one" / "datasets"
+        _tiny_nii(_single / "evaluation_first" / "ACC001" / "S1" / "S1.nii.gz")
+        check("父目录下只有一个阶段 → 自动下钻",
+              [s.accession_number for s in _loader.iter_studies(_single)] == ["ACC001"])
+
+    # 训练侧同一误用的护栏（误传父目录会白烧 GPU，且金标准全对不上）
+    _gg_src = (_GOALS / "shared/data.py").read_text(encoding="utf-8")
+    _probe_src = (_TRACK4 / "src/data/probe.py").read_text(encoding="utf-8")
+    check("研发侧 discover_cases 有数据根护栏",
+          "assert_case_root(root)" in _gg_src)
+    check("算法工程 scan_real 有数据根护栏",
+          "assert_case_root(root)" in _probe_src)
+    check("两处护栏使用同一份阶段目录清单",
+          all(f'"{p}"' in _gg_src and f'"{p}"' in _probe_src for p in
+              ("evaluation_first", "evaluation_finals")))
+
+    # 入口脚本：本地预演必须与容器共享同一套环境变量解析
+    _local_src = (_MAIN / "scripts/local_eval.py").read_text(encoding="utf-8")
+    check("local_eval 不走裸构造（否则 Factory/权重根被静默忽略）",
+          "Settings.from_env()" in _local_src and "replace(" in _local_src)
+    check("local_eval 补了仓根 sys.path（否则 CLI 直接 ModuleNotFoundError）",
+          "sys.path.insert" in _local_src)
+    _mock_src = (_MAIN / "scripts/mock_competition.py").read_text(encoding="utf-8")
+    check("Mock Competition 可指向真实数据目录", '"--dataset"' in _mock_src)
+
+    # ---------------------------------------------------------------- #
     print("\n" + "=" * 66)
     total = len(_PASSED) + len(_FAILED)
     print(f"通过 {len(_PASSED)}/{total}")

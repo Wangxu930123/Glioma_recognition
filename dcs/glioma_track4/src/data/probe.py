@@ -25,6 +25,40 @@ from .labels import (find_structured_tables, guess_modality, mask_role_for,
 
 IMG_EXT = (".nii.gz", ".nii")
 SKIP_NAME_KW = ("dicomdir", "license", "readme", "vht", ".mhd")
+
+#: 平台 ``/2026aicompetition/datasets`` 下的阶段目录名。
+#: 数据根必须精确到其中一个（训练用 ``training``），不能停在父目录。
+_PLATFORM_PHASES = frozenset({
+    "training", "evaluation_first", "evaluation_second",
+    "evaluation_finals", "verification",
+})
+
+
+def assert_case_root(root: str | os.PathLike) -> None:
+    """拦截"数据根误指向 ``datasets/`` 父目录"。
+
+    ``/2026aicompetition/datasets`` 下是 5 个阶段目录（``training`` /
+    ``evaluation_first`` / ``evaluation_second`` / ``evaluation_finals`` /
+    ``verification``），数据根要精确到其中一个。误传父目录时旧实现会把阶段名
+    当成检查号：
+
+    * 清单里出现 5 个假病例（``evaluation_first``…），把 5 份数据的像素混在一起；
+    * 金标准一张也对不上，``no_labels`` 全空，分类头实际从未收到有效监督；
+    * 全程不报错 —— 训练能跑完、指标能打印，直到提交才发现完全跑偏。
+
+    因此直接失败，并在报错里给出应该填的路径。
+    """
+    if not os.path.isdir(root):
+        return
+    children = sorted(e for e in os.listdir(root)
+                      if os.path.isdir(os.path.join(root, e)))
+    if len(children) < 2 or not {c.casefold() for c in children} <= _PLATFORM_PHASES:
+        return
+    raise ValueError(
+        f"数据根 {root} 指向数据集父目录，其下是平台阶段目录 {children}。"
+        f"请把数据根设为具体阶段（训练应为 {os.path.join(root, 'training')}）；"
+        f"否则这些目录名会被当作检查号，训练数据完全错误却不报错。"
+    )
 #: 纯模态名（这些是**影像**而非掩码；避免 "flair.nii.gz" 被误判成掩码）
 PURE_MODALITY_STEMS = {"t1c", "t1ce", "t1_ce", "t1", "t1w", "t1wi", "t2", "t2w", "t2wi",
                        "flair", "t2flair", "t2_flair", "dwi", "adc", "swi", "bold", "seg",
@@ -171,6 +205,7 @@ def scan_real(root: str, limit_cases: int | None = None,
     cases: list[dict] = []
     if not os.path.isdir(root):
         return cases
+    assert_case_root(root)
     entries = sorted(e for e in os.listdir(root)
                      if os.path.isdir(os.path.join(root, e)) and e.lower() != "annotation")
     for acc in entries:

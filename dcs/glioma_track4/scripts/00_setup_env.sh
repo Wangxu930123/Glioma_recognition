@@ -50,7 +50,25 @@ pip_do() {
     [[ -d "$WHEELS" ]] || { echo "[setup] ✗ 离线模式需本地 wheel 目录（先在联网机器跑 scripts/00b_prepare_wheels.sh）: $WHEELS" >&2; return 1; }
     args=(--no-index --find-links "$WHEELS")
   fi
-  "$PY" -m pip install "$@" "${args[@]+"${args[@]}"}"
+
+  # ---- PEP 668：系统 Python 被标记为 "externally managed" ----
+  # Ubuntu 24.04 / Debian 12+ 起，pip 直接装系统环境会报
+  #   Error: externally-managed-environment
+  # 训推平台容器（pytorch:*-cuda*-runtime）正是这类系统 Python。
+  #
+  # 这里加 --break-system-packages 是**安全**的，原因有二：
+  #   1) 本工程只装轻量**纯 Python** 包（fastapi/uvicorn/nibabel/openpyxl），
+  #      不含 torch（由平台镜像提供），也不含需要编译的本地扩展；
+  #   2) 调用处统一带 --upgrade-strategy only-if-needed，
+  #      不会去动镜像自带的 numpy/torch 版本。
+  # 不加则整个依赖安装直接失败，服务起不来。
+  local pep668=()
+  if "$PY" -c "import pathlib,sysconfig;raise SystemExit(0 if (pathlib.Path(sysconfig.get_paths()['stdlib']).parent/'EXTERNALLY-MANAGED').is_file() else 1)" 2>/dev/null; then
+    pep668=(--break-system-packages)
+    echo "[setup] 检测到系统 Python 受 PEP 668 保护，自动加 --break-system-packages"
+  fi
+
+  "$PY" -m pip install "$@" "${pep668[@]+"${pep668[@]}"}" "${args[@]+"${args[@]}"}"
 }
 
 echo "==================== 1/3 准备 Python 环境 ===================="

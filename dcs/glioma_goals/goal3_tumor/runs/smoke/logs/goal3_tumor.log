@@ -1,0 +1,6 @@
+2026-09-22 12:12:38,057 INFO goal3_tumor goal=goal3_tumor tag=smoke device=cuda
+2026-09-22 12:12:38,058 INFO goal3_tumor 产物目录：/mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_goals/goal3_tumor/runs/smoke
+2026-09-22 12:12:38,058 INFO goal3_tumor 数据根：/mnt/data_sdb/wangx/data/Brain_MRI/track4_sim
+2026-09-22 12:12:38,072 INFO goal3_tumor 样本数：train=5 val=1
+2026-09-22 12:12:38,114 INFO goal3_tumor 模型：MedNeXtNet  参数 1.33M
+2026-09-22 12:13:09,335 INFO goal3_tumor 完成：best=0.0 -> /mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_goals/goal3_tumor/runs/smoke/checkpoints/best.pth

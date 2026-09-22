@@ -1,0 +1,6 @@
+2026-09-22 12:16:09,074 INFO goal2_duplicate goal=goal2_duplicate tag=smoke device=cuda
+2026-09-22 12:16:09,074 INFO goal2_duplicate 产物目录：/mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_goals/goal2_duplicate/runs/smoke
+2026-09-22 12:16:09,074 INFO goal2_duplicate 数据根：/mnt/data_sdb/wangx/data/Brain_MRI/track4_sim
+2026-09-22 12:16:09,088 INFO goal2_duplicate 样本数：train=10 val=2
+2026-09-22 12:16:09,130 INFO goal2_duplicate 模型：MedNeXtNet  参数 1.33M
+2026-09-22 12:16:49,460 INFO goal2_duplicate 完成：best=0.0 -> /mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_goals/goal2_duplicate/runs/smoke/checkpoints/best.pth

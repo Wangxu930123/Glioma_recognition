@@ -1,0 +1,5 @@
+[thr] fold0 验证 60 例；权重 2 个（多折集成）
+        · /mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_track4/checkpoints/g4_fold0/best.pth
+        · /mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_track4/checkpoints/g4_fold2/best.pth
+[thr] 全图最优阈值 core=0.55（Dice 0.9292） peri=0.60（Dice 0.9448）
+[thr] 原阈值 [0.575, 0.42500000000000004]

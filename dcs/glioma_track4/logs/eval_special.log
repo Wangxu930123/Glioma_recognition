@@ -1,0 +1,43 @@
+[eval-sd] 624 例 | fake 6 | comp 6 | gold 12 对
+[eval-sd] 100/624 …
+[eval-sd] 200/624 …
+[eval-sd] 300/624 …
+[eval-sd] 400/624 …
+[eval-sd] 500/624 …
+[eval-sd] 600/624 …
+[eval-sd] 重复影像 w_fp=0.0: AUC-PR=0.00175 Recall@10%FPR=0.5833 Precision@15%Recall=0.00358 (n_pred=67402)
+[eval-sd] 重复影像 w_fp=0.5: AUC-PR=0.00439 Recall@10%FPR=0.8333 Precision@15%Recall=0.00284 (n_pred=25293)
+{
+ "n": 624,
+ "n_fake": 6,
+ "n_comp": 6,
+ "fake_auc": 0.993797195253506,
+ "fake_prob_mean_pos": 0.999847928682963,
+ "fake_prob_mean_neg": 0.00979595818747527,
+ "stitch_auc": 0.9964940668824164,
+ "stitch_prob_mean_pos": 0.999873697757721,
+ "stitch_prob_mean_neg": 0.00972418193387101,
+ "duplicate_fp0.0": {
+  "auc_pr": 0.0017529941644576646,
+  "recall@10fpr": 0.5833333333333334,
+  "precision@15recall": 0.0035778175313059034,
+  "n_pred": 67402,
+  "n_gold": 12
+ },
+ "duplicate_fp0.5": {
+  "auc_pr": 0.0043925353905159914,
+  "recall@10fpr": 0.8333333333333334,
+  "precision@15recall": 0.002840909090909091,
+  "n_pred": 25293,
+  "n_gold": 12
+ },
+ "calib": {
+  "a": 60.0,
+  "b": 0.9783377170562744,
+  "target_fpr": 0.1,
+  "n_pos": 12,
+  "n_neg": 2487
+ },
+ "n_gold_evaluated": 12
+}
+[eval-sd] 指纹 AUC=1.0000 正对最小=0.9398 负对最大=0.6817

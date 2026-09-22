@@ -1,0 +1,22 @@
+# 路径配置（平台路径可用环境变量覆盖，便于云桌面/容器/本地三处运行）
+#
+# 平台约定（《训推平台使用指南》）：
+#   /2026aicompetition/workspace        私有存储（answer/ train_model/ common/）
+#   /2026aicompetition/public_*         只读挂载（公共数据集/模型）
+workspace: /2026aicompetition/workspace
+
+raw:
+  # 比赛训练集根目录：其下应能看到 annotation/{Composition,fake,duplicate} 与各检查号目录
+  # 可用环境变量覆盖：export DATASET_ROOT=/your/path
+  track4: /2026aicompetition/datasets/training
+
+uif_root: data/uif              # 统一中间格式（原图 + 掩码 + 标签）
+manifest: data/manifest.json    # 扫描清单（病例/序列/掩码/结构化）
+folds: data/folds.json          # 多折划分
+preprocessed_root: data/preprocessed
+preprocess_cache: data/preprocess_cache   # 1mm 公共网格 + 整脑视图缓存（scripts/13_build_cache.py）
+logs_dir: logs                  # 平台环境自动切换为 {workspace}/logs（规范要求）
+checkpoints_dir: checkpoints
+runs_dir: runs
+stats_file: data/dataset_stats.json
+answer_root: /2026aicompetition/workspace/answer   # 推理结果（{evaluation_id}/）

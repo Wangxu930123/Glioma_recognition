@@ -1,0 +1,312 @@
+#!/usr/bin/env python
+"""校验**提交侧插件**（``Glioma_recognition-main/tasks/``）与**训练工程**
+（``glioma_goals/``）的对接正确性——即"训练出来的权重能否被推理链路正确使用"。
+
+为什么需要这个脚本
+------------------
+本轮排查发现的 7 个缺陷有一个共同特征：**全都不报错**。
+它们不会让程序崩溃，只会让指标悄悄变差，因此必须用**断言**固定下来：
+
+| # | 缺陷 | 静默后果 |
+|---|---|---|
+| 1 | 共享骨干的前向缓存用**固定键** | 后续 Task 复用**别人的权重**算出的结果 |
+| 2 | 全局头（cls/special/embed）用 96mm patch 训练 | 推理用 192mm 整脑视图 → 输入分布不一致 |
+| 3 | 重复影像指纹的键名与 ``retrieval`` 不匹配 | 指纹融合（权重 0.95）**完全失效** |
+| 4 | 指纹用 ``series_uid`` 索引 | UID 跨检查永不重叠 → 相似度恒为 0 |
+| 5 | ``asdict()`` 遇非 dataclass 配置对象 | 训练在**第一次保存 best 权重**时崩溃 |
+| 6 | 动态类实例的配置存在**类属性**上 | ``model_cfg`` 存空 → 推理按默认值重建网络 |
+| 7 | special / embed 的监督键缺失 | 损失分支被**静默跳过**，该头从未训练 |
+
+用法::
+
+    python scripts/25_verify_tasks_integration.py
+    GLIOMA_MAIN_ROOT=/path/to/Glioma_recognition-main python scripts/25_verify_tasks_integration.py
+"""
+from __future__ import annotations
+
+import inspect
+import math
+import os
+import sys
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+_TRACK4 = _HERE.parent
+_MAIN = Path(os.environ.get("GLIOMA_MAIN_ROOT")
+             or (_TRACK4.parent / "Glioma_recognition-main")).resolve()
+_GOALS = Path(os.environ.get("GLIOMA_GOALS_ROOT")
+              or (_TRACK4.parent / "glioma_goals")).resolve()
+
+if not (_MAIN / "tasks").is_dir():
+    raise SystemExit(f"找不到提交工程 tasks/：{_MAIN}（用 GLIOMA_MAIN_ROOT 指定）")
+if not (_GOALS / "shared").is_dir():
+    raise SystemExit(f"找不到训练工程 shared/：{_GOALS}（用 GLIOMA_GOALS_ROOT 指定）")
+
+#: 两条训练路径的引擎（用于源码级断言）
+_GE_ENGINE = _MAIN / "tasks/_common/training/engine.py"      # 提交侧：统一多任务训练
+_GG_ENGINE = _GOALS / "shared/engine.py"                     # 研发侧：各 Goal 独立训练
+
+_PASSED: list[str] = []
+_FAILED: list[str] = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    (_PASSED if cond else _FAILED).append(name)
+    print(f"  {'✓' if cond else '✗'} {name}" + (f"  {detail}" if detail else ""))
+
+
+def _section(title: str) -> None:
+    print(f"\n{title}")
+
+
+def main() -> int:
+    sys.path.insert(0, str(_MAIN))
+    sys.path.insert(0, str(_GOALS))
+
+    # ---------------------------------------------------------------- #
+    _section("① 共享前向缓存必须按权重隔离（否则 Task 之间串味）")
+    from tasks._common.backbone_runner import BackboneRunner
+
+    a = BackboneRunner(ckpt_root="/tmp/x", ckpt_rel="goal1_authenticity/model.pt")
+    b = BackboneRunner(ckpt_root="/tmp/x", ckpt_rel="goal3_tumor/model.pt")
+    a2 = BackboneRunner(ckpt_root="/tmp/x", ckpt_rel="goal1_authenticity/model.pt")
+    check("不同权重 → 缓存键不同", a.cache_key != b.cache_key,
+          f"{a.cache_key!r} ≠ {b.cache_key!r}")
+    check("相同权重 → 缓存键相同（仍能共享一次前向）", a.cache_key == a2.cache_key)
+
+    class _Ctx:
+        def __init__(self) -> None:
+            self.diagnostics, self.warnings = {}, []
+
+    ctx = _Ctx()
+    ctx.diagnostics[a.cache_key] = {"special": [1.0, 0.0]}
+    check("goal3 不会命中 goal1 的缓存", ctx.diagnostics.get(b.cache_key) is None)
+
+    # ---------------------------------------------------------------- #
+    _section("② 权重加载必须校验输出头（缺头时不能静默用随机初始化）")
+    _load_src = inspect.getsource(BackboneRunner.load)
+    check("已接入 _check_heads", "_check_heads" in _load_src)
+    check("已校验 cls_spec ⇄ cls_heads 一致性",
+          "cls_in_state" in _load_src and "cls_spec" in _load_src)
+
+    from tasks.goal4_diagnosis.labels import FIELD_ENUMS
+
+    _g4_src = inspect.getsource(
+        __import__("tasks.goal4_diagnosis.task", fromlist=["x"]).DiagnosisTask._collect)
+    check("goal4 分类头不足时显式失败（不再静默填默认值）",
+          "raise ValueError" in _g4_src and str(len(FIELD_ENUMS)) in _g4_src)
+
+    # ---------------------------------------------------------------- #
+    _section("③ 训练引擎的配置序列化（asdict 只接受 dataclass）")
+    from dataclasses import dataclass
+    from types import SimpleNamespace
+
+    from tasks._common.training.engine import _as_dict
+
+    @dataclass
+    class _DC:
+        base: int = 32
+
+    class _Dyn:
+        pass
+
+    _dyn = type("MC", (), {"base": 32, "in_ch": 4})()          # helpers.py 的旧写法
+    check("dataclass", _as_dict(_DC()) == {"base": 32})
+    check("动态类实例（配置在类属性上）",
+          _as_dict(_dyn) == {"base": 32, "in_ch": 4}, str(_as_dict(_dyn)))
+    check("SimpleNamespace（现写法）",
+          _as_dict(SimpleNamespace(base=32, in_ch=4)) == {"base": 32, "in_ch": 4})
+    check("dict / None", _as_dict({"x": 1}) == {"x": 1} and _as_dict(None) == {})
+
+    _help_src = (_MAIN / "tasks/_common/training/helpers.py").read_text(encoding="utf-8")
+    # 判据要盯着**赋值语句**，不能扫全文——修复说明的注释里必然会提到旧写法
+    check("helpers 用 SimpleNamespace 而非动态类",
+          "SimpleNamespace(**{**mc" in _help_src and "model.cfg = type(" not in _help_src)
+
+    # ---------------------------------------------------------------- #
+    _section("④ 全局头必须用整脑视图训练（与推理同尺度）")
+    _eng = inspect.getsource(
+        __import__("tasks._common.training.engine", fromlist=["train"]).train)
+    check("提交侧 train() 用 batch['whole'] 前向全局头", 'batch.get("whole")' in _eng)
+
+    from shared.data import BaseCaseDataset
+
+    _gd = inspect.getsource(BaseCaseDataset)
+    check("研发侧数据集产出 image_global", "image_global" in _gd)
+    check("global_view 可由 config.yaml 控制", "global_view" in _gd)
+    _ge = inspect.getsource(__import__("shared.engine", fromlist=["train"]).train)
+    check("研发侧 train() 用 image_global 前向全局头", "image_global" in _ge)
+    _dup = inspect.getsource(
+        __import__("goal2_duplicate.dataset", fromlist=["x"]))
+    check("配对数据集产出 image_global / image_global_b",
+          "image_global" in _dup and "image_global_b" in _dup)
+
+    # ---------------------------------------------------------------- #
+    _section("⑤ 重复影像指纹必须与 retrieval 的键名约定一致（否则融合静默失效）")
+    from tasks.goal2_duplicate import retrieval
+
+    def _fp(mod: str) -> dict:
+        """按 ``task._fingerprint`` 的产出格式造一个指纹。"""
+        return {"mods": [mod], f"shape_{mod}": [10, 10, 10],
+                f"zoom_{mod}": [1.0, 1.0, 1.0], f"aff_{mod}": [0.0] * 16,
+                "hist": {mod: [1, 2, 3, 4, 5]}, "thumb": {mod: [1.0, 2.0, 3.0, 4.0]}}
+
+    same = retrieval.fingerprint_similarity(_fp("t1c"), _fp("t1c"))
+    check("两例真重复 → 高相似度", same is not None and same > 0.9, f"sim={same}")
+    diff = _fp("t1c")
+    diff["thumb"] = {"t1c": [9.0, 9.0, 9.0, 9.0]}
+    low = retrieval.fingerprint_similarity(_fp("t1c"), diff)
+    check("缩略图不同 → 相似度显著下降", low is not None and low < same,
+          f"{same:.3f} → {low:.3f}")
+
+    # 反例：旧实现（geom 列表 + series_uid 索引）在 retrieval 眼里完全失效。
+    # 必须用**两个不同检查**才能复现——同一指纹自比时 mods 相同、
+    # Jaccard=1，会恰好给出 1.0 而掩盖问题。
+    old_a = {"mods": ["1.2.826.0.1.100"], "geom": [[1, 1, 1, 0, 0, 0]],
+             "hist": {"1.2.826.0.1.100": [1, 2, 3]}}
+    old_b = {"mods": ["1.2.826.0.1.999"], "geom": [[1, 1, 1, 0, 0, 0]],
+             "hist": {"1.2.826.0.1.999": [1, 2, 3]}}
+    check("旧格式指纹对两个不同检查恒为 0（复现原缺陷）",
+          retrieval.fingerprint_similarity(old_a, old_b) == 0.0)
+
+    _task_src = (_MAIN / "tasks/goal2_duplicate/task.py").read_text(encoding="utf-8")
+    # 同样只盯代码：用 ``s.series_uid``（旧实现的下标写法）判断，避免注释误报
+    check("task._fingerprint 已改用模态名索引",
+          'f"shape_{mod}"' in _task_src and "s.series_uid" not in _task_src)
+
+    # ---------------------------------------------------------------- #
+    _section("⑥ 监督信号缺失必须显式告警（而不是静默跳过）")
+    from tasks._common.training import losses as L
+
+    _lsrc = inspect.getsource(L.compute_losses)
+    check("special 缺失 → 告警", "special_target" in _lsrc and "_warn_once" in _lsrc)
+    check("embed 缺失 → 告警", "pair" in _lsrc and "embed" in _lsrc)
+
+    from tasks._common.training.helpers import _SpecialSupervised, _special_targets
+
+    check("提交侧已补 special 监督（Dataset 子类）",
+          _SpecialSupervised.__mro__[1].__name__ == "Dataset")
+    check("special 标签含两个通道（fake / stitched）",
+          len(_special_targets({})) == 2)
+
+    # ---------------------------------------------------------------- #
+    _section("⑦ 训练产物 → 推理重建的元信息完备")
+    _save_src = inspect.getsource(
+        __import__("tasks._common.training.engine", fromlist=["x"])._save)
+    for key in ("model_ema", "cls_spec", "arch", "model_cfg", "thresholds"):
+        check(f"_save 写入 {key}", f'"{key}"' in _save_src)
+    _ge_save = inspect.getsource(
+        __import__("shared.engine", fromlist=["x"])._save)
+    check("研发侧 cls_spec 从模型结构推导（不再裸导入 model）",
+          "_spec_from_model" in _ge_save and "from model import" not in _ge_save)
+
+    # ---------------------------------------------------------------- #
+    _section("⑧ best 权重一定会被保存（nan 选择指标不得阻断训练产物）")
+    from tasks._common.training.engine import _selection_score as _ss_tasks
+
+    _vals = [
+        ({"score": float("nan")}, {"seg": 0.5}, "nan + 有 loss"),
+        ({"score": float("inf")}, {"seg": 0.5}, "inf + 有 loss"),
+        ({}, {"seg": 0.5}, "缺 score"),
+        ({"score": float("nan")}, {}, "nan 且无 loss"),
+        ({"score": 0.83}, {"seg": 9.9}, "正常 score"),
+    ]
+    for val, met, tag in _vals:
+        out = _ss_tasks(dict(val), dict(met))
+        check(f"提交侧 _selection_score 有限（{tag}）", math.isfinite(out), f"→ {out}")
+
+    check("提交侧 best_score 初值为 -inf（保证首轮必存）",
+          'best_score, history = -float("inf")' in _GE_ENGINE.read_text(encoding="utf-8"))
+
+    from shared.engine import _selection_score as _ss_goals
+
+    for val, met, tag in _vals:
+        out = _ss_goals(dict(val), dict(met))
+        check(f"研发侧 _selection_score 有限（{tag}）", math.isfinite(out), f"→ {out}")
+    check("研发侧 best_score 初值为 -inf",
+          '-float("inf")' in _GG_ENGINE.read_text(encoding="utf-8"))
+
+    # 反向验证：旧写法 ``float(x or 0.0)`` 在 nan 上会穿透（这正是缺陷成因）
+    check("复现旧缺陷：nan or 0.0 仍是 nan",
+          not math.isfinite(float(float("nan") or 0.0)))
+
+    _section("⑨ 配对任务不做无用的 patch 前向（否则 3 个 96³ 激活叠加 → OOM）")
+    _gge = _GG_ENGINE.read_text(encoding="utf-8")
+    check("研发侧按 target 判定是否需要 patch 前向",
+          'if batch.get("target") is not None:' in _gge)
+    _g5 = (_GOALS / "goal5_segmentation/config.yaml").read_text(encoding="utf-8")
+    check("goal5 关闭整脑视图（只用分割头）", "enabled: false" in _g5)
+
+    _section("⑩ 提交侧必须补齐配对监督（否则 embed 头从未被训练）")
+    from tasks._common.training.helpers import _SpecialSupervised as _SP
+
+    check("_SpecialSupervised 支持 pair_prob", "pair_prob" in
+          inspect.signature(_SP.__init__).parameters)
+    _sp_src = inspect.getsource(_SP)
+    check("产出 image_b / pair", '"image_b"' in _sp_src and '"pair"' in _sp_src)
+    check("pair 用 0 维 tensor（[1] 会与 sim 广播成 [B,B] 而静默算错）",
+          "torch.tensor(1.0)" in _sp_src and "torch.tensor(0.0)" in _sp_src)
+    check("pair/image_b 在两条分支上都写入（避免 collate 缺键）",
+          _sp_src.count('item["pair"]') >= 3)
+
+    _hlp = (_MAIN / "tasks/_common/training/helpers.py").read_text(encoding="utf-8")
+    check("训练集启用配对、验证集不产配对",
+          "pair_prob=0.5" in _hlp and "pair_prob=0.0" in _hlp)
+
+    _section("⑪ 训练必须分阶段反向（3 个 96³ 前向同时驻留会 OOM）")
+    _eng2 = _GE_ENGINE.read_text(encoding="utf-8")
+    check("提交侧按阶段 backward（阶段 1 = patch/seg）",
+          "阶段 1：patch" in _eng2 and "bd_seg" in _eng2)
+    check("提交侧阶段 2 在整脑视图上跑全局头", "阶段 2：整脑视图" in _eng2)
+    check("优化器只在两阶段之后步进一次",
+          _eng2.count("scaler.step(opt)") == 1 and _eng2.count("opt.step()") == 1)
+
+    # ---------------------------------------------------------------- #
+    _section("⑫ 六个 Goal 必须用**同一份**折划分（串行/并行都要求口径一致）")
+    # 曾经的实现让每个 Goal 按自己的 val_ratio+seed 划分验证集，那是把
+    # "**支持**五个人并行做"误读成"**必须**并行做"。实际要求相反：
+    #   · 一个人串行做五个 Goal 时，统一口径才让五个指标互相可比；
+    #   · 五个人并行做时，统一口径才让各 Goal 的权重可以合并/集成。
+    if str(_GOALS) not in sys.path:
+        sys.path.insert(0, str(_GOALS))
+    from shared.data import discover_cases, split_train_val
+
+    _data = Path(os.environ.get("GLIOMA_GOALS_DATA")
+                 or "/mnt/data_sdb/wangx/data/Brain_MRI/track4_sim")
+    if _data.is_dir():
+        _cases, _tag = discover_cases(_data), f"真实数据（{_data.name}）"
+    else:
+        _cases = [{"accession": f"CASE{i:04d}", "dir": "/nonexistent"} for i in range(200)]
+        _tag = "合成数据（未找到数据根）"
+
+    _vals: dict[str, frozenset] = {}
+    _srcs: set[str] = set()
+    for _g in ("goal1_authenticity", "goal2_stitched", "goal2_duplicate",
+               "goal3_tumor", "goal4_diagnosis", "goal5_segmentation"):
+        _tr, _va, _src = split_train_val(_cases, {"train": {"fold": 0}, "data": {}},
+                                         _data, _GOALS / _g, 42)
+        _vals[_g] = frozenset(c["accession"] for c in _va)
+        _srcs.add(_src)
+    _uniq = len(set(_vals.values()))
+    check(f"六个 Goal 的验证集完全一致（{_tag}）", _uniq == 1,
+          f"共 {_uniq} 种不同划分" + ("" if _uniq == 1 else f" → {sorted(_vals)}"))
+    check("六个 Goal 都拿到了非空验证集", all(len(v) > 0 for v in _vals.values()),
+          f"val 规模={sorted({len(v) for v in _vals.values()})}")
+    check("划分来源一致（不会一半用 folds、一半用 ratio）", len(_srcs) == 1,
+          f"来源={sorted(_srcs)}")
+
+    # ---------------------------------------------------------------- #
+    print("\n" + "=" * 66)
+    total = len(_PASSED) + len(_FAILED)
+    print(f"通过 {len(_PASSED)}/{total}")
+    if _FAILED:
+        print("失败项：")
+        for f in _FAILED:
+            print(f"  ✗ {f}")
+        return 1
+    print("全部通过 ✓")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

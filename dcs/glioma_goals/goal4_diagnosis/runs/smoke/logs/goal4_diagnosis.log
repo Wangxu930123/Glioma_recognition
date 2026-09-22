@@ -1,0 +1,6 @@
+2026-09-22 12:16:53,989 INFO goal4_diagnosis goal=goal4_diagnosis tag=smoke device=cuda
+2026-09-22 12:16:53,989 INFO goal4_diagnosis 产物目录：/mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_goals/goal4_diagnosis/runs/smoke
+2026-09-22 12:16:53,990 INFO goal4_diagnosis 数据根：/mnt/data_sdb/wangx/data/Brain_MRI/track4_sim
+2026-09-22 12:16:54,004 INFO goal4_diagnosis 样本数：train=5 val=1
+2026-09-22 12:16:54,048 INFO goal4_diagnosis 模型：MedNeXtNet  参数 1.34M
+2026-09-22 12:17:17,320 INFO goal4_diagnosis 完成：best=0.0 -> /mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_goals/goal4_diagnosis/runs/smoke/checkpoints/best.pth

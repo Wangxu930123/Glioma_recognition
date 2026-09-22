@@ -1,0 +1,55 @@
+# 目标一 · 影像真实性识别 的独立配置
+# ---------------------------------------------------------------------------
+# ★ 本文件只属于 goal1_authenticity。改这里**不会**影响其他 Goal 的训练。
+#   若需要与别人不同的骨干/增强/超参，直接改本文件即可。
+# ---------------------------------------------------------------------------
+goal: goal1_authenticity
+
+# ---- 数据（所有 Goal 共享**只读**的数据根；缓存各自独立）----
+data:
+  root: /mnt/data_sdb/wangx/data/Brain_MRI/track4_sim     # 可用 --data 覆盖
+  common_spacing: [1.0, 1.0, 1.0]                         # 统一到 1mm 公共网格
+  cache: cache                                            # 本 Goal 私有缓存目录
+
+# ---- 模型 ----
+model:
+  arch: mednext
+  in_channels: 4
+  base: 32
+  depth: 4
+  blocks_per_stage: 2
+  k: 3
+  expand: 2
+  aniso_z: false
+  max_ch: 320
+
+# ---- 训练 ----
+train:
+  epochs: 100
+  batch_size: 2
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  ema_decay: 0.999
+  warmup_epochs: 3
+  num_workers: 4
+  patch: [96, 96, 96]
+  seed: 42
+  val_ratio: 0.2                                          # 本 Goal 自己划分验证集
+  save_every: 10
+
+# ---- 损失（本任务那一路的权重）----
+loss_weights: {special: 1.0}
+
+# ---- 增强（可按需调整；几何增强会同时作用于影像与掩码）----
+augment:
+  enabled: true
+  flip_prob: 0.5
+  affine_prob: 0.3
+  max_rot_deg: 12.0
+  max_scale: 0.12
+  intensity_prob: 0.8
+  gamma_range: 0.25
+  scale_range: 0.15
+  shift_range: 0.15
+  noise_prob: 0.3

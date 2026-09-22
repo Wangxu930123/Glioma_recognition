@@ -1,0 +1,15 @@
+# 赛道4 依赖（torch 由平台镜像提供；本文件只列其余依赖）
+# 安装：bash scripts/00_setup_env.sh [--mode system] [--offline --wheels wheels]
+torch>=2.4                 # 平台镜像自带 2.7~2.11+cu128；本工程显式传 weights_only=False 以兼容 >=2.6
+numpy>=1.24
+scipy>=1.10
+nibabel>=5.1               # NIfTI 读写（掩码必须原样保留 affine）
+SimpleITK>=2.3             # 重采样/几何（世界坐标桥接）
+scikit-image>=0.21
+pandas>=2.0
+openpyxl>=3.1              # 读金标准 .xlsx（ROI 统计表）
+pyyaml>=6.0
+fastapi>=0.110             # 推理服务（/call + /health）
+uvicorn>=0.29
+pydantic>=2.5
+requests>=2.31             # 结果回调

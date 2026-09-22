@@ -1,0 +1,6 @@
+2026-09-22 14:16:47,647 INFO goal1_authenticity goal=goal1_authenticity tag=smoke device=cuda
+2026-09-22 14:16:47,647 INFO goal1_authenticity 产物目录：/mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_goals/goal1_authenticity/runs/smoke
+2026-09-22 14:16:47,647 INFO goal1_authenticity 数据根：/mnt/data_sdb/wangx/data/Brain_MRI/track4_sim
+2026-09-22 14:16:47,662 INFO goal1_authenticity 样本数：train=5 val=1
+2026-09-22 14:16:47,704 INFO goal1_authenticity 模型：MedNeXtNet  参数 1.33M
+2026-09-22 14:17:07,429 INFO goal1_authenticity 完成：best=0.0 -> /mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_goals/goal1_authenticity/runs/smoke/checkpoints/best.pth

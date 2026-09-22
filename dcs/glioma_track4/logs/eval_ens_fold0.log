@@ -1,0 +1,46 @@
+[eval] fold=0  权重 2 个（多折集成）
+        · /mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_track4/checkpoints/g4_fold1/best.pth
+        · /mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_track4/checkpoints/g4_fold2/best.pth
+{
+ "fold": 0,
+ "n": 125,
+ "thresholds": [
+  0.65,
+  0.6
+ ],
+ "dice_core": 0.8876710212397364,
+ "dice_peri": 0.9407043181721751,
+ "nsd_core": 0.899459445373709,
+ "nsd_peri": 0.8775264391551074,
+ "dice_mean": 0.9141876697059558,
+ "hd95_peri": 6.496480281169661,
+ "thr_scan_core": [
+  0.6,
+  0.9270261956286229
+ ],
+ "thr_scan_peri": [
+  0.6,
+  0.948403942965969
+ ],
+ "duplicate_w0.0": {
+  "auc_pr": 0.0013998569806665155,
+  "recall@10fpr": 0.0,
+  "precision@15recall": 0.00043131334914815614,
+  "n_pred": 4635,
+  "n_gold": 12
+ },
+ "duplicate_w0.5": {
+  "auc_pr": 0.0010481619189098715,
+  "recall@10fpr": 0.0,
+  "precision@15recall": 0.0003228410008071025,
+  "n_pred": 6193,
+  "n_gold": 12
+ },
+ "calib": {
+  "a": 12.0,
+  "b": 0.913443511724472,
+  "target_fpr": 0.1,
+  "n_pos": 0,
+  "n_neg": 494
+ }
+}

@@ -1,0 +1,6 @@
+2026-09-22 12:11:40,926 INFO goal2_stitched goal=goal2_stitched tag=smoke device=cuda
+2026-09-22 12:11:40,926 INFO goal2_stitched 产物目录：/mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_goals/goal2_stitched/runs/smoke
+2026-09-22 12:11:40,927 INFO goal2_stitched 数据根：/mnt/data_sdb/wangx/data/Brain_MRI/track4_sim
+2026-09-22 12:11:40,941 INFO goal2_stitched 样本数：train=5 val=1
+2026-09-22 12:11:40,983 INFO goal2_stitched 模型：MedNeXtNet  参数 1.33M
+2026-09-22 12:12:09,821 INFO goal2_stitched 完成：best=0.0 -> /mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_goals/goal2_stitched/runs/smoke/checkpoints/best.pth

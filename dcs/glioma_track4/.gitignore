@@ -1,0 +1,49 @@
+# ============================================================================
+# 提交边界：代码 / 配置 / 文档入库，训练与推理产物一律排除。
+# ============================================================================
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# ---- 模型权重 ----
+# 规范 §5.2：权重放平台私有存储 `/2026aicompetition/workspace/checkpoint/<goal>/`，
+# 由 `integration/export_ckpt.py` 导出，**不进入代码库**（当前 checkpoints/ 约 635M）。
+/checkpoints/
+*.pth
+*.pt
+
+# ---- 本地实验产物 ----
+# ⚠️ 必须带前导 `/`（仅匹配仓库根目录）。若写成 `data/`，Git 会匹配**任意层级**的
+#    data 目录，从而把**源码 `src/data/`** 一并忽略 → 提交后 import 直接失败。
+# 根目录 data/ 的 manifest.json 内含本机绝对路径（/mnt/...），容器内无意义；
+# 推理路径**不依赖**它（数据集在运行时通过 scan_real 扫描）；
+# `resolve_cache_dir()` 在目录缺失时返回 None，属预期的优雅降级。
+/data/
+/logs/
+*.jsonl
+*.log
+
+# ---- 医学影像（体积大且与代码无关）----
+*.nii
+*.nii.gz
+*.dcm
+
+# ---- 平台文档的提取产物 ----
+# `docs/platform_images/` 下**被《平台使用指南》引用的 22 张**要进仓库；
+# 下面两处是中间产物与素材库（合计约 25MB），可用
+#   python scripts/27_extract_platform_docs.py     # 从三份官方 docx 提取
+#   python scripts/28_collect_platform_images.py   # 整理成关键截图
+# 重新生成，因此不入版本库。
+/docs/.platform_raw/
+/docs/platform_images/_原始截图/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store

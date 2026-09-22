@@ -1,0 +1,63 @@
+# 目标五 · 分割与可解释性 的独立配置
+# ---------------------------------------------------------------------------
+# ★ 本文件只属于 goal5_segmentation。改这里**不会**影响其他 Goal 的训练。
+#   若需要与别人不同的骨干/增强/超参，直接改本文件即可。
+# ---------------------------------------------------------------------------
+goal: goal5_segmentation
+
+# ---- 数据（所有 Goal 共享**只读**的数据根；缓存各自独立）----
+data:
+  root: /mnt/data_sdb/wangx/data/Brain_MRI/track4_sim     # 可用 --data 覆盖
+  common_spacing: [1.0, 1.0, 1.0]                         # 统一到 1mm 公共网格
+  cache: cache                                            # 本 Goal 私有缓存目录
+
+# ---- 模型 ----
+model:
+  arch: mednext
+  in_channels: 4
+  base: 32
+  depth: 4
+  blocks_per_stage: 2
+  k: 3
+  expand: 2
+  aniso_z: false
+  max_ch: 320
+
+# ---- 训练 ----
+train:
+  epochs: 100
+  batch_size: 2
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  ema_decay: 0.999
+  warmup_epochs: 3
+  num_workers: 4
+  patch: [96, 96, 96]
+  seed: 42
+  val_ratio: 0.2                                          # 本 Goal 自己划分验证集
+  save_every: 10
+
+# ---- 损失（本任务那一路的权重）----
+loss_weights: {seg: 1.0, ds: 0.4}
+
+# ---- 整脑视图（全局头 cls/special/embed 的输入尺度）----
+# 本 Goal 只用分割头（``seg`` / ``ds``），不读任何全局头，
+# 因此**关闭**整脑视图：否则每个样本会白做一次 96³ 前向与反传，
+# 既要时间也要显存，而且没有任何一路损失用到它。
+# 其余 Goal 保持默认开启（它们的头是检查级的，必须整脑尺度）。
+global_view:
+  enabled: false
+
+# ---- 增强（可按需调整；几何增强会同时作用于影像与掩码）----
+augment:
+  enabled: true
+  flip_prob: 0.5
+  affine_prob: 0.3
+  max_rot_deg: 12.0
+  max_scale: 0.12
+  intensity_prob: 0.8
+  gamma_range: 0.25
+  scale_range: 0.15
+  shift_range: 0.15
+  noise_prob: 0.3

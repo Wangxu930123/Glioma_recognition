@@ -1,0 +1,13 @@
+[serving] 启动预检通过：权重已加载，服务就绪
+INFO:     Started server process [552290]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8131 (Press CTRL+C to quit)
+INFO:     127.0.0.1:42634 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:42644 - "POST /call HTTP/1.1" 200 OK
+INFO:     Shutting down
+[infer] 完成 0/0 例；答案自检: ok=False errors=1
+[infer][校验] duplicate_pairs.jsonl 为空
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [552290]

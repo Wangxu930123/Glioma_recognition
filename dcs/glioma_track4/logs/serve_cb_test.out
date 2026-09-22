@@ -1,0 +1,24 @@
+==============================================================================
+[serving] ⚠️⚠️ 未解析到回调地址：推理完成后**无法回调平台，本次测评可能不计分**！
+[serving]   解决办法（任选其一）：
+[serving]     1) 启动命令加： CALLBACK_URL='http://<平台>/api/competition/inference/callback/'
+[serving]     2) 把地址写入文件： /2026aicompetition/workspace/callback_url.txt
+[serving]   地址见「容器实例页面」上方的完整回调地址。
+==============================================================================
+[serving] 启动预检通过：权重已加载，服务就绪
+INFO:     Started server process [3804890]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8021 (Press CTRL+C to quit)
+INFO:     127.0.0.1:57204 - "GET /health HTTP/1.1" 200 OK
+[serving] /call 受理 request_id=cb-001 evaluation_id=cb_eval dataset=/tmp/glioma_eval_ds
+INFO:     127.0.0.1:57212 - "POST /call HTTP/1.1" 200 OK
+[infer] BraTS2021_00002 ok (14485ms)
+[infer] BraTS2021_00006 ok (12024ms)
+[infer] 完成 2/2 例（兜底 0 例）；答案自检 ok=True errors=0
+[serving] ✗✗ 未解析到回调地址，无法回调平台（本次测评可能不计分）。请设置 CALLBACK_URL 环境变量或写入 workspace/callback_url.txt
+INFO:     127.0.0.1:42776 - "GET /status/cb-001 HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [3804890]

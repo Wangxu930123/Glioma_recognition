@@ -1,0 +1,295 @@
+==================== 1/5 集成阈值标定（写回所有折）====================
+[thr] fold0 验证 125 例；权重 3 个（多折集成）
+        · /mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_track4/checkpoints/g4_fold0/best.pth
+        · /mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_track4/checkpoints/g4_fold1/best.pth
+        · /mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_track4/checkpoints/g4_fold2/best.pth
+[thr] 全图最优阈值 core=0.65（Dice 0.9267） peri=0.60（Dice 0.9477）
+[thr] 原阈值 [0.5166666666666667, 0.46666666666666673]
+[thr] 已写回 /mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_track4/checkpoints/g4_fold0/best.pth
+[thr] 已写回 /mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_track4/checkpoints/g4_fold1/best.pth
+[thr] 已写回 /mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_track4/checkpoints/g4_fold2/best.pth
+
+==================== 2/5 全图评估（留一折集成，无泄漏）====================
+--- fold0：用其余 2 折集成（排除 fold0 自身）---
+  "recall@10fpr": 0.0,
+  "precision@15recall": 0.00043131334914815614,
+  "n_pred": 4635,
+  "n_gold": 12
+ },
+ "duplicate_w0.5": {
+  "auc_pr": 0.0010481619189098715,
+  "recall@10fpr": 0.0,
+  "precision@15recall": 0.0003228410008071025,
+  "n_pred": 6193,
+  "n_gold": 12
+ },
+ "calib": {
+  "a": 12.0,
+  "b": 0.913443511724472,
+  "target_fpr": 0.1,
+  "n_pos": 0,
+  "n_neg": 494
+ }
+}
+--- fold1：用其余 2 折集成（排除 fold1 自身）---
+  "recall@10fpr": 0.08333333333333333,
+  "precision@15recall": 0.00030248033877797946,
+  "n_pred": 6611,
+  "n_gold": 12
+ },
+ "duplicate_w0.5": {
+  "auc_pr": 0.08416049757421809,
+  "recall@10fpr": 0.08333333333333333,
+  "precision@15recall": 0.0002580312217778351,
+  "n_pred": 7750,
+  "n_gold": 12
+ },
+ "calib": {
+  "a": 12.0,
+  "b": 0.8198874533176421,
+  "target_fpr": 0.1,
+  "n_pos": 1,
+  "n_neg": 494
+ }
+}
+--- fold2：用其余 2 折集成（排除 fold2 自身）---
+  "recall@10fpr": 0.16666666666666666,
+  "precision@15recall": 0.4,
+  "n_pred": 6359,
+  "n_gold": 12
+ },
+ "duplicate_w0.5": {
+  "auc_pr": 0.16748477242534698,
+  "recall@10fpr": 0.16666666666666666,
+  "precision@15recall": 1.0,
+  "n_pred": 7633,
+  "n_gold": 12
+ },
+ "calib": {
+  "a": 12.0,
+  "b": 0.8837257921695709,
+  "target_fpr": 0.1,
+  "n_pos": 2,
+  "n_neg": 494
+ }
+}
+
+==================== 3/5 目标一/二 + 重复影像评估（OOF，无泄漏）====================
+ "stitch_prob_mean_neg": 0.013549061706171485,
+ "stitch_n_pos": 4,
+ "duplicate_fp0.0": {
+  "auc_pr": 0.11975320226947454,
+  "recall@10fpr": 0.6,
+  "precision@15recall": 0.16666666666666666,
+  "n_pred": 43226,
+  "n_gold": 5
+ },
+ "duplicate_fp0.5": {
+  "auc_pr": 0.600112854330976,
+  "recall@10fpr": 0.6,
+  "precision@15recall": 1.0,
+  "n_pred": 41052,
+  "n_gold": 5
+ },
+ "calib": {
+  "a": 12.0,
+  "b": 0.7565336048603059,
+  "target_fpr": 0.1,
+  "n_pos": 5,
+  "n_neg": 1494
+ },
+ "n_gold_evaluated": 5,
+ "fingerprint_auc": 1.0,
+ "fingerprint_gap": {
+  "pos_min": 0.9399499976376394,
+  "neg_max": 0.6817304608652452
+ }
+}
+
+==================== 4/5 按规范 §5.2 导出提交权重 ====================
+[09] 归一化后的折：g4_fold0,g4_fold1,g4_fold2
+[09] 目标：/home/wangx/glioma_submission_backup/checkpoint
+[export] 源权重 3 个: g4_fold0=best.pth, g4_fold1=best.pth, g4_fold2=best.pth
+[export] 目标根目录: /home/wangx/glioma_submission_backup/checkpoint（mode=copy）
+  · goal1_authenticity/model.pt  <-  best.pth  (copy)
+  · goal2_stitched/model.pt  <-  best.pth  (copy)
+  · goal2_duplicate/encoder.pt  <-  best.pth  (copy)
+  · goal3_tumor/model.pt  <-  best.pth  (copy)
+  · goal4_diagnosis/model.pt  <-  best.pth  (copy)
+  · goal5_segmentation/g4_fold0.pt  <-  best.pth  (copy)
+  · goal5_segmentation/g4_fold1.pt  <-  best.pth  (copy)
+  · goal5_segmentation/g4_fold2.pt  <-  best.pth  (copy)
+[export] 完成；清单 -> /home/wangx/glioma_submission_backup/checkpoint/export_manifest.json
+
+[09] 复核导出结果 …
+[verify] goal5_segmentation 解析到 3 个权重:
+  · /home/wangx/glioma_submission_backup/checkpoint/goal5_segmentation/g4_fold0.pt
+  · /home/wangx/glioma_submission_backup/checkpoint/goal5_segmentation/g4_fold1.pt
+  · /home/wangx/glioma_submission_backup/checkpoint/goal5_segmentation/g4_fold2.pt
+[verify] goal1_authenticity     ok  ['model.pt']
+[verify] goal2_stitched         ok  ['model.pt']
+[verify] goal2_duplicate        ok  ['encoder.pt']
+[verify] goal3_tumor            ok  ['model.pt']
+[verify] goal4_diagnosis        ok  ['model.pt']
+[verify] goal5_segmentation     ok  ['g4_fold0.pt', 'g4_fold1.pt', 'g4_fold2.pt']
+
+------------------------------------------------------------------------
+[09] 完成。后续步骤：
+  1) 多折集成时，测评容器里把全部折用逗号传入：
+       GLIOMA_CKPT=/home/wangx/glioma_submission_backup/checkpoint/goal5_segmentation/g4_fold0.pt,/home/wangx/glioma_submission_backup/checkpoint/goal5_segmentation/g4_fold1.pt,...
+     （不设置时，common.resolve_checkpoints() 会自动读取该目录下全部 .pt 做集成）
+  2) 跑一次 Mock Competition 验证闭环：
+       bash scripts/08_mock_competition.sh
+  3) 跑提交前检查清单：
+       bash scripts/23_pre_submit_check.sh
+------------------------------------------------------------------------
+
+==================== 提交前检查清单 ====================
+
+[1m① 语法编译 + 关键模块导入[0m
+  ✓ 全部 .py 语法通过
+  ✓ 关键模块导入通过
+
+[1m② 团队按钮测试（既有契约）[0m
+  ✓ 团队测试通过（含 fail-fast 契约断言）
+
+[1m③ P0 修复断言[0m
+  ✓ P0 修复 16/16 断言通过
+
+[1m④ 端到端自检[0m
+  ✓ 端到端自检 PASS
+
+[1m⑤ 桥接集成[0m
+  ✓ 桥接集成 PASS
+
+[1m⑥ 故障注入压测（22 类异常输入）[0m
+  ✓ 故障注入 22/22 均有合规答案
+
+[1m⑦ Mock Competition（平台协议闭环）[0m
+  ✓ Mock Competition 协议闭环通过
+
+[1m⑧ 提交边界（源码不得被 .gitignore 吞掉）[0m
+  ✓ .gitignore 存在
+  ✓ 源码 src/data/ 正常入库（未被忽略）
+  ✓ 本地产物 data/ 已正确排除
+  ✓ 运行时代码无硬编码本地路径
+  · 提示：自测脚本含本地默认路径（可 CLI 覆盖，不影响提交）：
+      scripts/12_bench.py
+      scripts/11_dicom_selftest.py
+      scripts/20_bridge_selftest.py
+      scripts/13_build_cache.py
+      scripts/10_brats_to_track4.py
+
+[1m⑨ 评估划分逻辑自检（OOF / 留一折）[0m
+  ✓ 评估划分逻辑自检通过（含 OOF 语义端到端验证）
+  · 提示（已知偏差，评估侧已处理）：
+        [WARN] 各折 val 存在重复（旧版 build_folds 缺陷，评估侧已去重）   3 例重复：['COMP_002', 'FAKE_000', 'FAKE_001']
+        [WARN] 有病例从未进入任何折 val（无法获得 OOF 预测）   2 例：['BraTS2021_00085', 'BraTS2021_00318']
+      汇总：6/6 项通过；2 项 WARN（全部 PASS ✔）
+        WARN: 各折 val 存在重复（旧版 build_folds 缺陷，评估侧已去重）  3 例重复：['COMP_002', 'FAKE_000', 'FAKE_001']
+        WARN: 有病例从未进入任何折 val（无法获得 OOF 预测）  2 例：['BraTS2021_00085', 'BraTS2021_00318']
+
+[1m⑩ 权重导出复核（规范 §5.2）[0m
+  ✓ 权重已导出（goal5_segmentation 下 3 个 .pt）
+      /home/wangx/glioma_submission_backup/checkpoint/goal5_segmentation/g4_fold0.pt
+      /home/wangx/glioma_submission_backup/checkpoint/goal5_segmentation/g4_fold2.pt
+      /home/wangx/glioma_submission_backup/checkpoint/goal5_segmentation/g4_fold1.pt
+      · goal1_authenticity: 1 个文件
+      · goal2_stitched: 1 个文件
+      · goal2_duplicate: 1 个文件
+      · goal3_tumor: 1 个文件
+      · goal4_diagnosis: 1 个文件
+
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+汇总：14 通过 / 0 失败 / 0 跳过
+==================================================================
+  ✓ 全部 .py 语法通过
+  ✓ 关键模块导入通过
+  ✓ 团队测试通过（含 fail-fast 契约断言）
+  ✓ P0 修复 16/16 断言通过
+  ✓ 端到端自检 PASS
+  ✓ 桥接集成 PASS
+  ✓ 故障注入 22/22 均有合规答案
+  ✓ Mock Competition 协议闭环通过
+  ✓ .gitignore 存在
+  ✓ 源码 src/data/ 正常入库（未被忽略）
+  ✓ 本地产物 data/ 已正确排除
+  ✓ 运行时代码无硬编码本地路径
+  ✓ 评估划分逻辑自检通过（含 OOF 语义端到端验证）
+  ✓ 权重已导出（goal5_segmentation 下 3 个 .pt）
+
+✔ 提交就绪
+
+------------------------------------------------------------------------
+[finalize] 完成。提交要点：
+  · 多折集成**无需手动指定权重**：resolve_checkpoints() 会自动读取
+    /2026aicompetition/workspace/checkpoint/goal5_segmentation/ 下的全部 .pt。
+  · 测评容器启动命令（启动脚本已内置 GLIOMA_LOADER_TOLERANT=1 容错）：
+      CALLBACK_URL="<平台回调地址>" bash .../scripts/06_platform_serve.sh
+  · 若检查清单有失败项，**不要提交**。
+------------------------------------------------------------------------

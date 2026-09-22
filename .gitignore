@@ -1,0 +1,23 @@
+# ============================================================================
+# 仓库根级忽略规则 —— 仅排除编辑器/系统垃圾与 Python 字节码。
+# 注意：本仓库为完整备份（含模型权重），大体积二进制由 .gitattributes 走 Git LFS，
+#       因此此处**不**排除 checkpoints / data / logs / *.pth / *.npz 等产物。
+# ============================================================================
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.tmp
+
+# ---- Python 字节码与工具缓存 ----
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/

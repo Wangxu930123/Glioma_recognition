@@ -1,0 +1,6 @@
+2026-09-22 12:17:21,717 INFO goal5_segmentation goal=goal5_segmentation tag=smoke device=cuda
+2026-09-22 12:17:21,717 INFO goal5_segmentation 产物目录：/mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_goals/goal5_segmentation/runs/smoke
+2026-09-22 12:17:21,717 INFO goal5_segmentation 数据根：/mnt/data_sdb/wangx/data/Brain_MRI/track4_sim
+2026-09-22 12:17:21,731 INFO goal5_segmentation 样本数：train=5 val=1
+2026-09-22 12:17:21,773 INFO goal5_segmentation 模型：MedNeXtNet  参数 1.33M
+2026-09-22 12:17:32,507 INFO goal5_segmentation 完成：best=0.001310048680771977 -> /mnt/data_sdb/wangx/code/BrainTumorSeg/glioma_goals/goal5_segmentation/runs/smoke/checkpoints/best.pth

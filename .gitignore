@@ -21,3 +21,6 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .ipynb_checkpoints/
+
+# ---- 平台文档目录（按需求排除，不入库）----
+docs/

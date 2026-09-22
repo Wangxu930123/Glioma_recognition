@@ -24,8 +24,11 @@ __pycache__/
 .ruff_cache/
 .ipynb_checkpoints/
 
-# ---- 平台文档目录（按需求排除，不入库）----
-docs/
+# ---- 平台文档目录 ----
+# docs/ 已改为入库。其中：
+#   docs/PLATFORM_GUIDE.md 与 docs/platform_images/ 下被《平台使用指南》引用的 22 张截图 → 入库
+#   docs/.platform_raw/ 与 docs/platform_images/_原始截图/ 属中间产物与素材库
+#   → 由 dcs/glioma_track4/.gitignore 自行排除（可用 27_/28_ 脚本重新生成）
 
 # ---- 模型权重（不再入库）----
 *.pth

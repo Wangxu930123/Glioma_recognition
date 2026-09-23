@@ -61,6 +61,22 @@ done
 FOLDS="$(IFS=','; echo "${NORM[*]}")"
 echo "[09] 归一化后的折：$FOLDS"
 
+# ⚠️ 演练权重 vs 提交权重
+# `checkpoint/` 是**平台评分真正读取的路径**。用 1~2 个 epoch 的冒烟权重演练完
+# 链路后若忘了换回正式权重，提交的就是"看起来齐全、实际未训练"的模型 ——
+# 而 `--verify` 只检查文件是否齐备、不会发现这件事。
+case "$FOLDS" in
+  *smoke*|*bench*|*debug*|*demo*|*rehearsal*)
+    echo
+    echo "  ⚠️  导出的折名含演练标记（$FOLDS）。"
+    echo "      若这是为了走通链路，请导出到**独立目录**，避免污染提交路径："
+    echo "        WORKSPACE=/tmp/ws_rehearsal bash scripts/09_export_submission.sh $FOLDS"
+    echo "      演练结束后，务必用正式折重新导出到 $GLIOMA_CHECKPOINT_ROOT ："
+    echo "        bash scripts/09_export_submission.sh"
+    echo
+    ;;
+esac
+
 echo "[09] 目标：$GLIOMA_CHECKPOINT_ROOT"
 # 正式提交用 copy（硬链接在跨文件系统/打包上传时不保证成立）
 "$PY" -m integration.export_ckpt --mode copy --folds "$FOLDS"

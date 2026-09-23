@@ -291,6 +291,61 @@ bash scripts/03_train.sh all 4          # 4 折并行
 bash scripts/16_finalize.sh             # 阈值标定 + 评估 + 导出权重
 ```
 
+### 6.4 先跑 2 个 epoch，走通"训练 → 推理 → 提交"链路
+
+**保存时机**：三处训练引擎都是**每个 epoch 结束就写 `last.pth`**，
+`best.pth` 只在被监控指标变好时写（`best` 初值为 -1，所以第 1 轮必写）。
+因此跑 2 个 epoch 后 `best.pth` 与 `last.pth` 都存在，且支持断点续训。
+
+**已备好 2-epoch 冒烟配置**（小模型 + 小 patch，只验证链路、指标无意义）：
+
+```bash
+cd /2026aicompetition/workspace/dcs/glioma_track4
+
+# ① 2 个 epoch（configs/_smoke_train.yaml：epochs=2，细粒度模型与 patch）
+CONFIG=_smoke_train TAG_PREFIX=smoke bash scripts/03_train.sh 0
+#   → checkpoints/smoke_fold0/best.pth + last.pth
+
+# ② 导出到**独立目录**（不要污染提交路径；见下方警告）
+WORKSPACE=/tmp/ws_rehearsal bash scripts/09_export_submission.sh smoke_fold0
+
+# ③ 真实插件 + 冒烟权重的本地推理
+cd ../Glioma_recognition-main
+export COMPETITION_PIPELINE_FACTORY=tasks.real_pipeline:build_pipeline
+export COMPETITION_CHECKPOINT_ROOT=/tmp/ws_rehearsal/checkpoint
+python scripts/local_eval.py \
+  --dataset /2026aicompetition/datasets/verification \
+  --output /tmp/ws_rehearsal/answer/local-001 --evaluation-id local-001
+
+# ④ 平台协议闭环（期望 5 行 PASS）
+python scripts/mock_competition.py \
+  --dataset /2026aicompetition/datasets/verification \
+  --workspace /tmp/ws_rehearsal --timeout 3600
+```
+
+**为什么小模型权重也能跑通**：推理侧按权重里的元信息重建 ——
+`tasks/_common/factory.py` 用 `ck["model_cfg"]` 建骨干（base/depth 跟着权重走），
+`tasks/_common/backbone_runner.py` 用 `ck["global_size"] / ck["global_size_mm"]`
+建整脑视图（冒烟配置是 32³/64mm，正式是 96³/192mm）。所以能加载、能前向，
+但**精度无意义**，这一步只看链路是否闭合。
+
+两个必须知道的点：
+
+1. **权重必须是多任务的**。推理插件依赖 `special` 与 `embed_head` 两组头；
+   研发侧单路权重（`glioma_goals/goal1_*/runs/*/best.pth`）会被
+   `BackboneRunner._check_heads` **明确拒绝**。`glioma_track4` 的训练器本身
+   就是多任务（分割 + 结构化 + 特殊影像 + 嵌入，一次前向），用它产出的权重。
+2. **演练权重绝不能留在提交路径**。`checkpoint/` 是平台评分真正读取的目录，
+   而 `--verify` 只检查文件是否齐备、查不出"这是 2 epoch 的权重"。
+   所以演练一律用独立 `WORKSPACE`；`09_export_submission.sh` 在折名含
+   `smoke/bench/debug/demo/rehearsal` 时会打印醒目警告，演练结束后用正式折重新导出：
+
+```bash
+cd /2026aicompetition/workspace/dcs/glioma_track4
+bash scripts/09_export_submission.sh            # 自动选择 checkpoints/g4_fold*
+bash scripts/09_export_submission.sh --verify
+```
+
 ## 7. 推理与提交自检
 
 ### 7.1 契约测试（改完代码先跑）

@@ -27,7 +27,7 @@ import torch
 from torch.utils.data import Dataset
 
 from ..utils.config import load_config, resolve
-from .labels import guess_modality, mask_role_for
+from .labels import describe_modality_sources, guess_modality, mask_role_for
 
 # --------------------------------------------------------------------------- #
 # 几何：公共网格 / 重采样（nibabel.processing，affine 直连，无轴序陷阱）
@@ -226,16 +226,22 @@ def build_case_volume(case: dict, cfg: dict, log: list | None = None
     picked = pick_series(case, cfg, log)
     if not picked:
         # 报出"清单里到底有哪些序列键"：键全为 other/空，说明模态没认出来
-        # （官方数据靠数据根下的 SeriesType.xlsx），而不是这张检查真的没影像。
+        # （官方数据靠 labels/3_serieslabel.xlsx），而不是这张检查真的没影像。
+        # 顺带自检两种模态来源的可用性，并给出可直接粘贴的两条命令 —— 见
+        # docs/DATASET_ROOT_TROUBLESHOOT.md「病例数正常、却报无任何可用序列」。
         imgs = case.get("images") or {}
         raise RuntimeError(
             f"病例 {case['accession']} 无任何可用序列"
             f"（清单里的序列键={sorted(imgs)[:8]}；"
             f"未知序列 {len(case.get('unknown_series') or [])} 路）。"
-            f"若键是 other/空，说明模态未识别：先确认数据根下有 SeriesType.xlsx / "
-            f"labels/3_serieslabel.xlsx（见 docs/DATASET_ROOT_TROUBLESHOOT.md）；"
-            f"评测集没有标注表，需用 scripts/31_train_modality_model.py 训练"
-            f"data/modality_model.json 走体素判别兜底"
+            f"模态来源自检：{describe_modality_sources(case.get('dir'))}。"
+            f"按顺序试：① export GLIOMA_LABELS_DIR=<含 3_serieslabel.xlsx 的目录>"
+            f"（或 ln -s 到 <工程>/labels），然后重跑 bash scripts/01_probe.sh 与 "
+            f"bash scripts/02_build_dataset.sh；"
+            f"② 没有标注表时训练体素判别模型："
+            f"python3 scripts/31_train_modality_model.py --root <数据根>"
+            f"（产出 data/modality_model.json）；"
+            f"③ 详见 docs/DATASET_ROOT_TROUBLESHOOT.md「病例数正常、却报无任何可用序列」"
         )
 
     # 参考序列优先级：t1c → flair → t2 → t1 → 其它（决定公共网格方向与原点）

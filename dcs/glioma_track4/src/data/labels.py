@@ -212,7 +212,64 @@ OFFICIAL_LABEL_FILES = {
 LABELS_DIR_ENV = "GLIOMA_LABELS_DIR"
 
 
-def find_official_labels(root: str | os.PathLike,
+#: 在 ``$WORKSPACE`` 下做有界搜索时要跳过的目录（缓存/日志里不可能有官方表，
+#: 但它们动辄上万个子目录，不剪掉会让这一步从"秒级"变成"分钟级"）
+_SKIP_WORKSPACE_DIRS = frozenset({
+    "cache", "cache_nifti", "cache_dicom", "logs", "checkpoints", "runs", "outputs",
+    "tmp", "node_modules", "__pycache__",
+})
+
+
+def workspace_labels_dirs(max_depth: int = 3) -> list[Path]:
+    """``$WORKSPACE`` 下所有名为 ``labels`` 的目录（按"官方表更全 + 更新"排序）。
+
+    为什么需要它：官方 5 张表**不随数据集下发**，通常躺在团队持久化工作区里
+    （如 ``<workspace>/dcs/goal1and2/Goal1and2/labels``）。有了这一步，容器里
+    **零配置**就能读到表，不必每个人都记得 ``export GLIOMA_LABELS_DIR``。
+
+    搜索是**有界**的（深度 ≤ ``max_depth``、目录名必须恰好是 ``labels``、
+    剪掉缓存/日志类目录），因此代价与工作区规模无关。
+    """
+    ws = Path(os.environ.get("WORKSPACE") or "/2026aicompetition/workspace").expanduser()
+    if not ws.is_dir():
+        return []
+    hits: list[Path] = []
+
+    def walk(d: Path, depth: int) -> None:
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            return
+        for e in entries:
+            try:
+                if not e.is_dir():
+                    continue
+            except OSError:
+                continue
+            if e.name.startswith(".") or e.name in _SKIP_WORKSPACE_DIRS:
+                continue
+            child = Path(e.path)
+            if e.name == "labels":
+                hits.append(child)                      # 命中即止，不再往里钻
+                continue
+            if depth < max_depth:
+                walk(child, depth + 1)
+
+    walk(ws, 0)
+
+    def score(p: Path) -> tuple[int, float]:
+        files = [p / name for name in OFFICIAL_LABEL_FILES.values()]
+        n = sum(f.is_file() for f in files)
+        try:
+            mt = max(f.stat().st_mtime for f in files if f.is_file())
+        except (OSError, ValueError):
+            mt = 0.0
+        return (n, mt)                                  # 表更全优先，其次更新
+
+    return sorted(set(hits), key=score, reverse=True)
+
+
+def find_official_labels(root: str | os.PathLike | None = None,
                          labels_dir: str | os.PathLike | None = None) -> dict[str, str]:
     """定位官方 5 张标注表 → ``{用途: 路径}``（找不到的键不出现）。
 
@@ -221,9 +278,12 @@ def find_official_labels(root: str | os.PathLike,
     1. 显式传入的 ``labels_dir``（对应官方 config 的 ``paths.labels_dir``）
     2. 环境变量 ``GLIOMA_LABELS_DIR``
     3. **本工程目录下的 ``labels/``**（官方默认 ``./labels``）
-    4. 数据根自身、父目录、祖父目录（平台有时把标注放在数据旁边）
+    4. ``$WORKSPACE`` 下名为 ``labels`` 的目录（**团队工作区里那份**；平台不随数据集下发，
+       见 :func:`workspace_labels_dirs`。容器里靠这一步做到零配置）
+    5. 数据根自身、父目录、祖父目录（平台有时把标注放在数据旁边）
 
     官方把标注放在**工程目录**而不是数据集里 —— 这也是"数据根下找不到金标准"的原因之一。
+    ``root=None`` 时只搜 1~4（用于报错时做"表到底在不在"的自检）。
     """
     cands: list[Path] = []
     if labels_dir:
@@ -231,12 +291,14 @@ def find_official_labels(root: str | os.PathLike,
     if os.environ.get(LABELS_DIR_ENV):
         cands.append(Path(os.environ[LABELS_DIR_ENV]).expanduser())
     cands.append(Path(__file__).resolve().parents[2] / "labels")      # <工程>/labels
-    base = Path(str(root)).expanduser()
-    try:
-        base = base.resolve()
-    except OSError:
-        base = base.absolute()
-    cands.extend([base, base.parent, base.parent.parent])
+    cands.extend(workspace_labels_dirs())                             # $WORKSPACE/**/labels
+    if root is not None:
+        base = Path(str(root)).expanduser()
+        try:
+            base = base.resolve()
+        except OSError:
+            base = base.absolute()
+        cands.extend([base, base.parent, base.parent.parent])
 
     found: dict[str, str] = {}
     for kind, name in OFFICIAL_LABEL_FILES.items():
@@ -768,6 +830,68 @@ def _norm_key(value: Any) -> str:
 #: 公开别名：序列类型表与其它模块共用同一套键归一化规则，
 #: 各写一份迟早会出现"一处去空白、一处不去"的静默错配。
 norm_key = _norm_key
+
+
+def build_uid_index(series_types: dict | None) -> dict[str, str]:
+    """``{(检查号, 序列号): 类型}`` → ``{序列号: 类型}``（UID 单键回退索引）。
+
+    为什么需要它：``3_serieslabel.xlsx`` 的**检查号列**与磁盘上的病例目录名并非
+    总能对上（平台匿名化口径不同、前导零、目录名是哈希而表里是原始检查号），
+    而 **SeriesUid 与影像同源**，是两边唯一必然一致的键。精确键查不到时按 UID
+    单键回退，能把整批"看起来没模态"的病例救回来。
+
+    在探针里**每次运行只构建一次**（表可能上万行，别放进每病例的循环里）。
+    """
+    out: dict[str, str] = {}
+    for key, value in (series_types or {}).items():
+        if not value:
+            continue
+        uid = key[1] if isinstance(key, (tuple, list)) and len(key) > 1 else key
+        out.setdefault(_norm_key(uid), str(value))
+    return out
+
+
+def lookup_series_type(series_types: dict | None, accession: str = "",
+                       uid_candidates: tuple | list = (),
+                       uid_index: dict | None = None) -> str:
+    """两级查表：``(检查号, 序列号)`` 精确键 → ``序列号`` 单键回退。
+
+    ``uid_candidates`` 按可靠性降序给（如 ``(序列目录名, 文件名主干)``）。
+    未传 ``uid_index`` 时本函数自行构建（单次调用用；循环里请在外面建好传进来）。
+    """
+    if not series_types:
+        return ""
+    for uid in uid_candidates:
+        value = series_types.get((_norm_key(accession), _norm_key(uid)))
+        if value:
+            return str(value)
+    index = uid_index if uid_index is not None else build_uid_index(series_types)
+    for uid in uid_candidates:
+        value = index.get(_norm_key(uid))
+        if value:
+            return str(value)
+    return ""
+
+
+def describe_modality_sources(root: str | os.PathLike | None = None) -> str:
+    """一句话自检"模态来源现在什么状态"（专供报错文案，省掉一轮来回排查）。
+
+    形如 ``标注表 3_serieslabel.xlsx=<路径或"未找到">；体素判别模型 <路径>=存在/缺失``。
+    两种来源都不可用时，任何模态相关报错都会附带它 —— 用户立刻能分清是
+    "表没接上"还是"体素模型没装"，不必猜。
+    """
+    labels = find_official_labels(root)
+    series = labels.get("series")
+    table_desc = (f"标注表 3_serieslabel.xlsx={series}" if series
+                  else "标注表 3_serieslabel.xlsx=未找到（已搜 $GLIOMA_LABELS_DIR、"
+                       "<工程>/labels、$WORKSPACE 下 3 层、数据根/父/祖父）")
+    try:
+        from .modality_model import DEFAULT_MODEL_PATH
+        model_desc = (f"体素判别模型 {DEFAULT_MODEL_PATH}="
+                      f"{'存在' if Path(str(DEFAULT_MODEL_PATH)).is_file() else '缺失'}")
+    except Exception:                                     # 依赖不全也不能让报错本身再抛
+        model_desc = "体素判别模型=不可用（依赖缺失）"
+    return f"{table_desc}；{model_desc}"
 
 
 #: sidecar JSON 里可能承载序列类型的键（按优先级）

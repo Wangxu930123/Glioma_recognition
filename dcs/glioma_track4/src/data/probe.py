@@ -20,11 +20,11 @@ import os
 from collections import Counter
 
 from ..utils.config import data_source_tag, load_paths, resolve
-from .labels import (find_official_labels, find_structured_tables, guess_modality,
-                     has_strict_mask_hint, id_key, mask_role_for, norm_key,
-                     read_abnormal_table, read_duplicate_pairs, read_mask_table,
-                     read_series_types, read_structured_table, sidecar_desc,
-                     structured_from_row)
+from .labels import (build_uid_index, find_official_labels, find_structured_tables,
+                     guess_modality, has_strict_mask_hint, id_key, lookup_series_type,
+                     mask_role_for, read_abnormal_table, read_duplicate_pairs,
+                     read_mask_table, read_series_types, read_structured_table,
+                     sidecar_desc, structured_from_row)
 
 IMG_EXT = (".nii.gz", ".nii")
 SKIP_NAME_KW = ("dicomdir", "license", "readme", "vht", ".mhd")
@@ -203,7 +203,8 @@ def resolve_case_root(root: str) -> str:
 
 def _collect_nifti(cdir: str, accession: str = "",
                    series_types: dict | None = None,
-                   mask_names: dict | None = None) -> tuple[dict, list, list]:
+                   mask_names: dict | None = None,
+                   uid_index: dict | None = None) -> tuple[dict, list, list]:
     """扫描一个检查目录下的 NIfTI：返回 ``(images, mask_entries, unknown)``。
 
     - images: ``{modality: {"path","series_uid","file"}}``
@@ -237,14 +238,11 @@ def _collect_nifti(cdir: str, accession: str = "",
             full = os.path.join(dirpath, fn)
             stem = _stem(fn)
             series_uid = sdir if sdir and sdir != os.path.basename(cdir) else stem
-            # 序列类型：类型表（官方主力）→ sidecar → 目录名/文件名（模拟集）
-            desc = ""
-            if series_types:
-                for uid_key in (series_uid, stem):
-                    desc = str(series_types.get(
-                        (norm_key(accession), norm_key(uid_key))) or "")
-                    if desc:
-                        break
+            # 序列类型：类型表（官方主力）→ sidecar → 目录名/文件名（模拟集）。
+            # 类型表里查不到精确键时按 SeriesUid 单键回退：检查号列与磁盘目录名
+            # 口径不一致（平台匿名化）时，UID 是两边唯一必然同源的键。
+            desc = lookup_series_type(series_types, accession,
+                                      (series_uid, stem), uid_index)
             desc = desc or (sidecar_desc(full) or "")
             mod = guess_modality(desc) or guess_modality(stem) or guess_modality(sdir)
             is_pure = stem.strip() in PURE_MODALITY_STEMS
@@ -313,6 +311,8 @@ def scan_real(root: str, limit_cases: int | None = None,
     if series_types:
         print(f"[probe] 已读取序列类型映射：{len(series_types)} 条"
               f"（来源：官方 3_serieslabel.xlsx 优先，其次 SeriesType.xlsx）", flush=True)
+    # UID 单键回退索引：一次建好、全病例复用（表可能上万行，别放进每病例的循环里）
+    uid_index = build_uid_index(series_types)
     entries = sorted(e for e in os.listdir(root)
                      if os.path.isdir(os.path.join(root, e))
                      and e.lower() != "annotation"
@@ -327,7 +327,8 @@ def scan_real(root: str, limit_cases: int | None = None,
         cdir = os.path.join(root, acc)
         images, mask_entries, unknown = _collect_nifti(
             cdir, acc, series_types,
-            (mask_by_acc or {}).get(acc.casefold()) or (mask_by_acc or {}).get(acc))
+            (mask_by_acc or {}).get(acc.casefold()) or (mask_by_acc or {}).get(acc),
+            uid_index)
         if not images:                                            # 纯 DICOM 检查
             images = _collect_dicom(cdir, log)
         if not images and not mask_entries:
@@ -372,6 +373,7 @@ def merge_special_cases(cases: list[dict], special: dict, log: list | None = Non
     ann = special.get("annotation_dir")
     if not ann:
         return cases
+    uid_index = build_uid_index(series_types)          # UID 单键回退索引（见 _collect_nifti）
     for cls, key in (("fake", "fake_cases"), ("Composition", "composition_cases")):
         base = os.path.join(ann, cls)
         for ident in (special.get(key) or []):
@@ -380,7 +382,8 @@ def merge_special_cases(cases: list[dict], special: dict, log: list | None = Non
             d = os.path.join(base, str(ident))
             if not os.path.isdir(d):
                 continue
-            imgs, masks, unknown = _collect_nifti(d, str(ident), series_types)
+            imgs, masks, unknown = _collect_nifti(d, str(ident), series_types,
+                                                  uid_index=uid_index)
             if not imgs:
                 imgs = _collect_dicom(d, log)
             if not imgs:
@@ -481,8 +484,10 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
     if label_counter:
         labels_hint = ""
     elif not tables:
-        labels_hint = ("数据根及其上级 1~2 层都没找到 csv/xlsx 金标准表；"
-                       "若表在别处，请把数据根定到与它同级的那一层")
+        labels_hint = ("数据根/父/祖父、<工程>/labels、$GLIOMA_LABELS_DIR、"
+                       "$WORKSPACE 下 3 层都没找到 csv/xlsx 金标准表；"
+                       "若表在别处：export GLIOMA_LABELS_DIR=<含表的目录>（或 ln -s 到 "
+                       "<工程>/labels），或把数据根定到与它同级的那一层")
     elif not struct:
         labels_hint = (f"找到 {len(tables)} 个表但一行都没解析出来："
                        f"表里需要有 检查号/AccessionNumber/PatientId 之类的列"
@@ -554,8 +559,10 @@ def main() -> None:
         print(f"[probe] ⚠️ 结构化字段金标准为空（label_field_counts={{}}）："
               f"{res['report']['labels_hint']}")
     if res["report"]["modality_counts"].get("other") and not res["report"]["series_type_rows"]:
-        print("[probe] ⚠️ 有序列落到 other 且没读到 SeriesType.xlsx："
-              "官方数据的模态要靠它，见 docs/DATASET_ROOT_TROUBLESHOOT.md")
+        print("[probe] ⚠️ 有序列落到 other 且没读到 3_serieslabel.xlsx（官方权威来源）："
+              "先 export GLIOMA_LABELS_DIR=<含该表的目录>（或 ln -s 到 <工程>/labels）"
+              "再重跑本探针；表也没有时走体素判别兜底（见下一条）。"
+              "排查步骤：docs/DATASET_ROOT_TROUBLESHOOT.md")
     if res["report"].get("unknown_series_total"):
         # 评测集没有标注表 → 关键词必然全失效。这条路是**预期**的，
         # 关键是别让它静默：说清有多少路要走模型判别、模型在不在。
@@ -564,7 +571,7 @@ def main() -> None:
         print(f"[probe] ℹ️ {res['report']['cases_with_unknown_series']} 例共 "
               f"{res['report']['unknown_series_total']} 路序列模态未知"
               f"（无标注表时的正常现象）→ 体素统计模型："
-              f"{'已就绪 data/modality_model.json' if has_model else '❌ 缺失，请先跑 python scripts/31_train_modality_model.py --root <数据根>'}")
+              f"{'已就绪 data/modality_model.json' if has_model else '❌ 缺失，请先跑 python3 scripts/31_train_modality_model.py --root <数据根>'}")
 
 
 if __name__ == "__main__":

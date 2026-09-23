@@ -38,12 +38,12 @@ ls -d */                                     # 期望：三个工程 + bak_*
 ############ ② 依赖（第 2 节）############
 pip install -r Glioma_recognition-main/requirements.txt
 pip install -r glioma_track4/requirements.txt
-pip install openpyxl                         # 读 SeriesType.xlsx 必需
+pip install openpyxl                         # 读 labels/3_serieslabel.xlsx 必需
 
 ############ ③ 定数据根（第 3 节）############
 cd "$DCS/glioma_track4"
 python scripts/29_locate_dataset_root.py     # 期望末行给出 DATASET_ROOT=...
-ls "$DATASET_ROOT" | head                    # 期望看到 <检查号> 目录与 SeriesType.xlsx
+ls "$DATASET_ROOT" | head                    # 期望看到 <检查号> 目录（标注表在团队工作区 labels/，探针自动找）
 
 ############ ④ 探针（第 4 节）############
 rm -f data/manifest.json data/folds.json     # 清掉从别处带来的旧清单/旧折划分
@@ -208,7 +208,7 @@ cd /2026aicompetition/workspace/dcs
 pip install -r Glioma_recognition-main/requirements.txt     # 推理/提交工程
 pip install -r glioma_track4/requirements.txt               # 算法工程
 
-# 官方数据要读 SeriesType.xlsx —— 训练侧的模态来源，缺了会报"无任何可用序列"
+# 官方数据要读 labels/3_serieslabel.xlsx —— 训练侧的模态来源，缺了会报"无任何可用序列"
 pip install openpyxl
 ```
 
@@ -253,7 +253,8 @@ python scripts/29_locate_dataset_root.py
 后者会**自动下钻**到 `annotation/` 并打印 `[probe][告警]`，不会静默扫到 0 例
 （`glioma_goals` 同理，两个工程行为一致）。唯一不能填的是
 `/2026aicompetition/datasets`（多阶段父目录，会直接 `ValueError` 拦住）。
-另外该层要有与检查号同级的 **`SeriesType.xlsx`**，否则模态认不出来。
+模态表**不在数据根这一层**：它在**团队工作区**的 `labels/3_serieslabel.xlsx`
+（探针会自动搜 `$WORKSPACE` 下 3 层，通常零配置；也可 `export GLIOMA_LABELS_DIR=<labels 目录>`）。
 
 ### 3.3 三个坑
 
@@ -261,7 +262,7 @@ python scripts/29_locate_dataset_root.py
 |---|---|---|
 | `ValueError: 数据根 /2026aicompetition/datasets 指向数据集父目录，其下是平台阶段目录 [...]` | 数据根停在了父目录，阶段名会被当成检查号 | 指到具体阶段目录（如 `.../datasets/training`）；父目录下只有一个阶段时会自动下钻 |
 | `training/` 下只有 `annotation/` | 实例只挂了标注那份存储 | 回「存储与数据服务」勾选训练影像数据集，或重建实例——不是代码问题 |
-| 扫出 3255 例，但每个病例都挑不出模态（`无任何可用序列`） | UID 命名的序列认不出模态，缺 `SeriesType.xlsx` | 见第 4 节 |
+| 扫出 3255 例，但每个病例都挑不出模态（`无任何可用序列`） | UID 命名的序列认不出模态，没读到 `labels/3_serieslabel.xlsx` | 见第 4 节（探针会自动搜 `$WORKSPACE`；仍为 0 就 `export GLIOMA_LABELS_DIR=<labels 目录>`） |
 
 ## 4. 探针：确认模态与掩膜都认得出
 
@@ -276,23 +277,25 @@ bash scripts/01_probe.sh
 
 | 报告字段 | 期望 | 含义 |
 |---|---|---|
-| `series_type_rows` | **> 0** | 读到 `SeriesType.xlsx` 的映射条数；0 = 类型表不在数据根那一层 |
+| `series_type_rows` | **> 0** | 读到 `labels/3_serieslabel.xlsx` 的映射条数；0 = 表没接上（会自动搜 `$WORKSPACE` 下 3 层，仍为 0 就 `export GLIOMA_LABELS_DIR=<labels 目录>` 后重跑探针） |
 | `modality_counts` | 出现 `t1c` / `flair` / `t2` / `t1` | 模态识别正常；只有 `other` = 全是 UID 命名、没读到类型表 |
 | `mask_role_counts` | 出现 `core` / `peri` | 掩膜识别正常 |
 | `label_field_counts` | 越多越好 | 结构化字段金标准命中数；0 = 没找到金标准表 |
 
-找不到类型表时先定位它：
+找不到类型表时**别在数据集挂载里找（它不在那儿）**，直接搜工作区：
 
 ```bash
-find /2026aicompetition/datasets -maxdepth 4 -name "SeriesType.xlsx"
+find /2026aicompetition/workspace -maxdepth 5 -name "3_serieslabel.xlsx" 2>/dev/null
 ```
 
-它所在的层就是数据根（必须与 `<检查号>/` 同级）。
+命中即用、零配置（探针按 `$GLIOMA_LABELS_DIR → <工程>/labels → $WORKSPACE 下 3 层 →
+数据根/父/祖父` 的顺序找）。表里"检查号"列与磁盘病例目录名对不上**也不影响**：
+`SeriesUid` 与影像同源，会自动单键回退。
 
 **背景**：训练侧原先只能从**目录名**猜模态。本地模拟集目录名是 `flair_0000` 所以一直正常；
-官方数据的目录名是 DICOM UID（`1.2.826.0.1...`），任何关键词都命中不了，于是
+官方数据的目录名是 DICOM UID（`2.25.25750572698...`），任何关键词都命中不了，于是
 "病例数正常、却一例都没有可用序列"。现已支持
-`SeriesType.xlsx → 同名 .json sidecar → 目录名` 三级取值，两条训练路径都已接入。
+`labels/3_serieslabel.xlsx → 同名 .json sidecar → 目录名` 三级取值，两条训练路径都已接入。
 
 ### 4.1 `label_field_counts: {}` 为空怎么查
 
@@ -390,49 +393,60 @@ python scripts/24_verify_eval_split.py   # 期望 0 项 WARN
 
 ### 4.2 报「无任何可用序列」时的三级定位
 
-**新版报错会自己说明它看到了什么**，先读这句：
+**新版报错会自己说明它看到了什么 + 自检两种模态来源**，先读这句（训练侧 `glioma_track4`，
+实际为单行，此处折行显示）：
 
 ```text
-study 'c0e1f8f253ba45be843411ca45073cac' 无任何可用序列
-（共 2 条序列；uid/描述前几条=[('8f14e45fceea167a...', '8f14e45fceea167a...'), ...]）。
-若 uid 是哈希或 DICOM UID，说明模态要靠数据根下的 SeriesType.xlsx 提供；
-请把数据根定到与它同级的那一层（见 docs/DATASET_ROOT_TROUBLESHOOT.md）
+病例 3d58e8712e064ec289da602fc594fd9 无任何可用序列（清单里的序列键=['other']；未知序列 2 路）。
+模态来源自检：标注表 3_serieslabel.xlsx=未找到（已搜 $GLIOMA_LABELS_DIR、<工程>/labels、
+$WORKSPACE 下 3 层、数据根/父/祖父）；体素判别模型 /…/data/modality_model.json=缺失。
+按顺序试：① export GLIOMA_LABELS_DIR=<含 3_serieslabel.xlsx 的目录>（或 ln -s 到 <工程>/labels），
+然后重跑 bash scripts/01_probe.sh 与 bash scripts/02_build_dataset.sh；② 没有标注表时训练体素判别模型：
+python3 scripts/31_train_modality_model.py --root <数据根>（产出 data/modality_model.json）；③ 详见 …
 ```
 
-按三级往下查：
+（提交/推理工程 `Glioma_recognition-main` 抛的是 `study '...' 无任何可用序列（共 N 条…）`，
+同一根因、同样处理。）
+
+按三级往下查（**第 2 级现在不再是问题**）：
 
 | 级别 | 查什么 | 结论 |
 |---|---|---|
-| 1 | `ls "$DATASET_ROOT/SeriesType.xlsx"` | 不存在 → 数据根偏了一层（表在别处） |
-| 2 | 表里的**检查号**能否对上目录名 | 对不上 → 表用原始检查号、目录被改成哈希（需额外映射，把输出贴出来） |
+| 1 | 报错里的"**标注表 3_serieslabel.xlsx=…**"自检行 / 探针的 `series_type_rows` | `未找到` / 0 → 表没接上：`export GLIOMA_LABELS_DIR=<含表的目录>`（探针会自动搜 `$WORKSPACE` 下 3 层，通常零配置），重跑 01/02 |
+| 2 | 表里的**检查号**能否对上目录名 | 对不上**不用管**：自动按 `SeriesUid` 单键回退（UID 与影像同源）。连 UID 都对不上才需贴输出 |
 | 3 | 表里的**序列号**能否对上序列目录/文件名 | 对不上 → 类型表不覆盖这批序列，需要看 sidecar 或其它来源 |
 
 一条命令把三级一起查（用加固后的解析器）：
 
 ```bash
 cd /2026aicompetition/workspace/dcs/glioma_track4
-python - <<'PY'
+python3 - <<'PY'
 import os
 from pathlib import Path
-from src.data.labels import read_series_types
+from src.data.labels import (build_uid_index, find_official_labels, norm_key,
+                             read_series_types)
 
 root = Path(os.environ["DATASET_ROOT"])
+found = find_official_labels(str(root))
+print("标注表位置:", found.get("series")
+      or "未找到（已搜 $GLIOMA_LABELS_DIR、<工程>/labels、$WORKSPACE 下 3 层）")
 types = read_series_types(root)
-print("SeriesType.xlsx 映射条数:", len(types))
+uid_index = build_uid_index(types)          # 检查号列对不上时的回退索引
+print("3_serieslabel.xlsx 映射条数:", len(types), "| UID 单键索引:", len(uid_index))
 if not types:
-    print("→ 数据根下没有 SeriesType.xlsx（或未装 openpyxl）")
+    print("→ 表没接上：export GLIOMA_LABELS_DIR=<含 3_serieslabel.xlsx 的目录> 后重跑探针")
 else:
     accs = {a for a, _ in types}
     dirs = {p.name for p in root.iterdir() if p.is_dir()}
     print("表里检查号前 3 个:", sorted(accs)[:3])
     print("磁盘检查号前 3 个:", sorted(dirs)[:3])
-    print(f"检查号能对上 {len(accs & dirs)} / 磁盘 {len(dirs)} 例")
+    print(f"检查号能对上 {len(accs & dirs)} / 磁盘 {len(dirs)} 例（对不上也会按 SeriesUid 回退）")
     case = next((p for p in root.iterdir() if p.is_dir()), None)
-    if case:                                    # 抽查一个病例的序列 UID 是否在表里
+    if case:                                # 抽查一个病例：序列 UID 在不在表里
         print("抽查病例:", case.name)
         for d in sorted(case.iterdir())[:6]:
-            hit = [v for (a, u), v in types.items() if u == d.name.lower()]
-            print(f"  序列 {d.name[:24]:<26} 表里命中: {hit or '（无）'}")
+            hit = uid_index.get(norm_key(d.name), "（无）")
+            print(f"  序列 {d.name[:24]:<26} 表里命中: {hit}")
 PY
 ```
 
@@ -440,9 +454,9 @@ PY
 会在取数之前先打印一条前置预警（不必等到 DataLoader worker 里才看到崩溃）：
 
 ```text
-[data] ⚠️ 没有任何序列能识别出模态：数据根下没有 SeriesType.xlsx，且目录名/文件名都不含模态关键词。
+[data] ⚠️ 没有任何序列能识别出模态：数据根下没有官方 3_serieslabel.xlsx，且目录名/文件名都不含模态关键词。
        继续训练会在取数时报「无任何可用序列」。
-       处理：把数据根定到与 SeriesType.xlsx 同级的那一层
+       处理：把官方 labels/ 放到 <工程>/labels/ 或设 GLIOMA_LABELS_DIR
 ```
 
 ## 5. 折划分：换数据必须重建（先 01，再 02）
@@ -656,7 +670,7 @@ bash scripts/23_pre_submit_check.sh             # 加 --quick 跳过耗时项
 |---|---|---|---|
 | ① | `ValueError: 数据根 ... 指向数据集父目录，其下是平台阶段目录 [...]` | 数据根填成了父目录 | 用 `scripts/29_locate_dataset_root.py` 重定；指到具体阶段目录 |
 | ② | `training/` 下只有 `annotation/`，扫不到病例 | 影像那份存储没挂到实例 | 实例的「存储与数据服务」勾选训练影像数据集 |
-| ③ | `ValueError: study '...' 无任何可用序列`（病例数却正常） | 序列是 UID 命名，缺 `SeriesType.xlsx` | 已支持类型表/sidecar；确认数据根那层有 `SeriesType.xlsx`（第 4 节） |
+| ③ | `ValueError: ... 无任何可用序列`（病例数却正常） | 序列是 UID 命名，没读到 `labels/3_serieslabel.xlsx` | 报错已自带自检（表在不在/模型在不在）；`export GLIOMA_LABELS_DIR=<labels 目录>`（或软链到 `<工程>/labels`）后重跑 01/02。第 4 节 |
 | ④ | `folds.json 的 fold=0 与当前数据不匹配（train=0 val=0）→ 退回 val_ratio` | 折划分来自另一个数据集 | 按第 5 节"先 01 再 02"重建；`data/` 是从别处拷来的话先删 `manifest.json`/`folds.json` |
 | ⑤ | `train.py: error: unrecognized arguments: --fold 0` | 旧版入口没有该参数 | 已支持：六个 `train.py` + 生成器模板都加了 `--fold`（产物落 `runs/<tag>_foldN/`） |
 | ⑥ | 六个 Goal 的验证集不一致 / 指标不可比 | 某个 Goal 没读到 `folds.json`，自退回按比例划分 | 跑 `python scripts/25_verify_tasks_integration.py`，看"六个 Goal 的验证集完全一致"是否通过 |
@@ -665,8 +679,8 @@ bash scripts/23_pre_submit_check.sh             # 加 --quick 跳过耗时项
 | ⑨ | `找不到数据集根目录；请用 --data 指定…`（明明 export 了数据根） | 两个工程历史上用不同的变量名：算法工程 `DATASET_ROOT`、研发侧 `GLIOMA_DATASET_ROOT` | 已支持互相兼容（`GLIOMA_DATASET_ROOT` / `DATASET_ROOT` / `DATASET_PATH` 任一均可），建议按 §10 两个都设 |
 | ⑩ | 训练日志出现 `special: 0.0` / `embed: 0.0` | 损失已收敛（小数据集上很快被"背下来"），不是信号断裂 | 首行若为 `special≈0.69`（未训练头初值）即链路正常；缺监督信号时会打印 `[loss][告警]` |
 | ⑪ | `label_field_counts: {}`（探针报告） | 结构化字段金标准没读到；目标三/四的分类头学不到东西，**但训练照常跑完** | 看 `labels_hint` 区分三种原因，按 §4.1 处理 |
-| ⑫ | `discover_cases` 打印「没有任何序列能识别出模态」 | 数据根下没有 `SeriesType.xlsx`，且目录名不含模态关键词 | 按 §4.2 三级定位；把数据根定到与类型表同级那层 |
-| ⑬ | `无任何可用序列`，报错里 uid 是哈希/UUID | 同 ⑫；若表里检查号与目录名对不上，说明需要额外的 ID 映射 | 跑 §4.2 的命令并把输出贴出来 |
+| ⑫ | `discover_cases` 打印「没有任何序列能识别出模态」 | 没读到官方 `3_serieslabel.xlsx`，且目录名不含模态关键词 | 按 §4.2 第 1 级把表接上（探针/加载器会自动搜 `$WORKSPACE` 下 3 层） |
+| ⑬ | `无任何可用序列`，报错里 uid 是哈希/UUID | 同 ⑫ | 先按 §4.2 第 1 级把表接上；检查号列与目录名对不上**不影响**（自动按 SeriesUid 回退），连 UID 都无法命中再贴输出 |
 | ⑭ | 提交后分数极低，但权重"齐全" | `checkpoint/` 里是演练（1~2 epoch）权重，`--verify` 查不出来 | 演练一律用独立 `WORKSPACE`；提交前按 §7.5 用正式折重新导出 |
 
 ## 9. 一键自检清单
@@ -695,6 +709,10 @@ cat > /2026aicompetition/workspace/common/env.sh <<'EOF'
 export DATASET_ROOT=/2026aicompetition/datasets/training/annotation   # ← 换成 3.2 的结论
 export GLIOMA_DATASET_ROOT="$DATASET_ROOT"        # glioma_goals 用的名字
 
+# 官方标注表（5 张 xlsx）：不在数据集里，在团队工作区 labels/；
+# 探针/加载器会自动搜 $WORKSPACE 下 3 层 —— 这行只是显式兜底，路径不对也不会出错
+export GLIOMA_LABELS_DIR=/2026aicompetition/workspace/dcs/goal1and2/Goal1and2/labels
+
 export GLIOMA_FOLDS=/2026aicompetition/workspace/dcs/glioma_track4/data/folds.json
 export WORKSPACE=/2026aicompetition/workspace
 export CACHE_DIR=/2026aicompetition/workspace/cache     # 缓存放私有存储，容器删了不丢
@@ -706,8 +724,9 @@ source /2026aicompetition/workspace/common/env.sh
 
 | 变量 | 作用 | 备注 |
 |---|---|---|
-| `DATASET_ROOT` | 数据根（算法工程） | 必须精确到含 `<检查号>/` 与 `SeriesType.xlsx` 的那一层 |
+| `DATASET_ROOT` | 数据根（算法工程） | 精确到含 `<检查号>/` 的那一层（如 `.../training/annotation`）；标注表不在数据集里，在团队工作区 `labels/` |
 | `GLIOMA_DATASET_ROOT` | 数据根（研发侧六个 Goal） | 与上一行同值；两个名字都已支持，设一个也行 |
+| `GLIOMA_LABELS_DIR` | 官方标注表目录（`3_serieslabel.xlsx` 等 5 张） | 在团队工作区 `<workspace>/dcs/*/*/labels`；**不设也会自动搜** `$WORKSPACE` 下 3 层，通常零配置 |
 | `GLIOMA_FOLDS` | 统一折划分文件 | 六个 Goal 共用同一份，否则指标不可比 |
 | `WORKSPACE` | 私有存储根 | 容器删除后数据会清除，产物必须放这里 |
 | `CACHE_DIR` | 预处理缓存 | 放私有存储，避免重建 |

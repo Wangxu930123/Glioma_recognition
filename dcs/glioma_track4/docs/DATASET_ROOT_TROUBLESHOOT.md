@@ -4,6 +4,8 @@
 > - `/2026aicompetition/datasets/training` 下**只有 `annotation/`**，看不到影像；
 > - 跑探针/发现病例时报
 >   `ValueError: 数据根 /2026aicompetition/datasets 指向数据集父目录，其下是平台阶段目录 [...]`；
+> - 病例数正常、却能训练出 0 个样本，报 `无任何可用序列`
+>   （→ 直接看 [「病例数正常、却报无任何可用序列」](#病例数正常却报无任何可用序列)）；
 > - 不确定 `DATASET_ROOT` 到底该填哪一层。
 
 ## 一条命令解决
@@ -138,18 +140,17 @@ ValueError: Caught ValueError in DataLoader worker process
 **病例数扫得出来（示例里 3255 例），但每个病例都挑不出模态** —— 这是训练侧
 "模态识别"的问题，不是数据损坏、也不是路径错。
 
-原因：序列的模态原本**只能从目录名猜**（`shared/data.py: _AsSeries.modality = s["uid"]`）。
-本地模拟集的目录名是 `flair_0000` / `t1c_0000`，所以一直没暴露；官方数据的
-序列目录名是 **DICOM UID**（`1.2.826.0.1.3680043.2.1125.1.1001`），任何关键词
-都命中不了，于是 `pick_series` 返回空 → 报错。
+原因：序列的模态**只能从官方标注表取**，而官方数据的序列目录名是 **DICOM UID**
+（`2.25.25750572698...`）、病例目录名是 32 位哈希，任何"按名字猜关键词"都命中不了，
+于是 `pick_series` 返回空 → 报错。
 
-正确来源是官方数据根下的 **`SeriesType.xlsx`**（`AccessionNumber + SeriesUid →
-SeriesType`），提交工程一直用它的 `data/metadata.py`，训练侧此前没实现。
-现已补齐两条训练路径，取值优先级为：
+权威来源是 **`labels/3_serieslabel.xlsx`**（列 `SeriesLabel` ∈ {T1CE, T2, FLAIR}），取值优先级：
 
 ```text
-SeriesType.xlsx  →  同名 .json sidecar  →  目录名（模拟集仍照旧）
+labels/3_serieslabel.xlsx  →  同名 .json sidecar  →  目录名（本地模拟集仍照旧）
 ```
+
+> `SeriesType.xlsx` 是团队 README 里的旧名，**官方数据里通常并没有**，不必再找它。
 
 对应的代码：
 
@@ -158,30 +159,73 @@ SeriesType.xlsx  →  同名 .json sidecar  →  目录名（模拟集仍照旧�
 | `glioma_goals` | `shared/data.py: discover_cases / read_series_types` | 训练取数（`train.py` 走这条） |
 | `glioma_track4` | `src/data/probe.py: scan_real / _collect_nifti`、`src/data/labels.py: read_series_types` | 探针、缓存、独立推理 |
 
-### 怎么确认它生效
+### 先跑这一条命令
 
 ```bash
-python -m src.data.probe --root <数据根> --out /tmp/probe.json | grep series_type
-# 期望：[probe] 已读取 SeriesType.xlsx：N 条序列类型映射
-#       报告里 "series_type_rows": N（不是 0）
+cd <你平时跑 01_probe.sh 的 glioma_track4 目录>   # 容器里通常是 /2026aicompetition/workspace/dcs/glioma_track4
+bash scripts/01_probe.sh
 ```
 
-`series_type_rows: 0` 且模态全是 `other` → 类型表**不在数据根那一层**。
-它在哪一层，数据根就该填哪一层（`SeriesType.xlsx` 与 `<检查号>/` 目录同级）：
+只看**三个数**（探针报告 + 末尾告警里都有）：
 
-```bash
-find /2026aicompetition/datasets -maxdepth 4 -name "SeriesType.xlsx"
+| 报告字段 | 期望 | 含义 |
+|---|---|---|
+| `series_type_rows` | **> 0** | 类型表读到 N 条 `(检查号, 序列号) → 模态` |
+| `modality_counts` | 出现 `t1c` / `flair` / `t2` | 模态认出来了 |
+| `unknown_series_total` | **0** | 没有需要兜底模型去猜的序列 |
+
+**接了表必须重跑探针**（训练读的是 `data/manifest.json`，不重跑不生效），之后
+`bash scripts/02_build_dataset.sh`。
+
+### 表在哪：默认会自动找（零配置）
+
+探针按这个顺序定位 `3_serieslabel.xlsx`，**命中即止**：
+
+```text
+显式 --labels / $GLIOMA_LABELS_DIR  →  <工程>/labels  →  $WORKSPACE 下 3 层内所有 labels/  →  数据根/父/祖父
 ```
 
-找不到任何 `SeriesType.xlsx` 时，请把**一个病例目录的完整结构**贴出来：
+团队工作区里那份（`/2026aicompetition/workspace/dcs/goal1and2/Goal1and2/labels/`）
+**通常不做任何操作就能被找到**（搜索有界：深度 ≤ 3、只认名为 `labels` 的目录、跳过
+`cache`/`logs` 等）。工作区在别处或层级更深时，二选一显式接上：
 
 ```bash
+# 方式①（推荐，一次到位）：软链到工程目录，之后所有脚本都认
+ln -s /2026aicompetition/workspace/dcs/goal1and2/Goal1and2/labels labels
+
+# 方式②：每个会话 export 一次
+export GLIOMA_LABELS_DIR=/2026aicompetition/workspace/dcs/goal1and2/Goal1and2/labels
+```
+
+> 表里的"检查号"列与磁盘病例目录名**对不上也没关系**：只要 `SeriesUid` 与影像
+> 同源（官方数据必然如此），会自动按 **UID 单键回退**命中，不必改表。
+
+### 还是 0：三条诊断命令
+
+```bash
+# ① 表到底在哪
+find /2026aicompetition/workspace /2026aicompetition/datasets -maxdepth 5 -name "3_serieslabel.xlsx" 2>/dev/null
+
+# ② 表与影像是不是同一批（看 SeriesUid ∩ 磁盘序列名 是否 > 0）
+python3 - <<'PY'
+import os, pandas as pd
+ACC  = sorted(os.listdir("/2026aicompetition/datasets/training/annotation"))[0]
+ROOT = f"/2026aicompetition/datasets/training/annotation/{ACC}"
+LAB  = "/2026aicompetition/workspace/dcs/goal1and2/Goal1and2/labels/3_serieslabel.xlsx"
+df   = pd.read_excel(LAB, dtype=str)
+uid  = next(c for c in df.columns if c.lower() in ("seriesuid", "series_uid", "序列号"))
+seqs = {s for s in os.listdir(ROOT) if os.path.isdir(f"{ROOT}/{s}")}
+print("病例:", ACC, "| 磁盘序列:", len(seqs), "| 表内 UID ∩ 磁盘 =", len(set(df[uid].astype(str)) & seqs))
+print("表的列名:", list(df.columns))
+PY
+
+# ③ 一个病例的完整结构（贴出来就能定位是哪一层的问题）
 ls -la /2026aicompetition/datasets/training/annotation/<某个检查号>/
 ls -la /2026aicompetition/datasets/training/annotation/<某个检查号>/<某个序列目录>/
 ```
 
-有了这两条，就能确定模态还能从哪里取（目录名约定 / sidecar 字段名 / 其它映射表），
-不必再靠猜。
+> 报错里若是"**共 2 条序列**"而正常检查应有 3~4 路（T1C/T2/FLAIR[/T1]）：
+> 先用 ③ 区分是"这个检查确实只有 2 路"还是"数据根指深/浅了一层"。
 
 ## 连类型表都没有：用体素统计模型兜底判模态
 
@@ -197,14 +241,17 @@ ls -la /2026aicompetition/datasets/training/annotation/<某个检查号>/<某个
 
 ```bash
 # 用官方训练集训练（标签来自 labels/3_serieslabel.xlsx）—— 生产推荐路径
-python scripts/31_train_modality_model.py --root $DATASET_ROOT
+python3 scripts/31_train_modality_model.py --root $DATASET_ROOT
 
 # 只看精度不写模型（5 折 + 混淆矩阵 + 特征权重）
-python scripts/31_train_modality_model.py --root $DATASET_ROOT --dry-run
+python3 scripts/31_train_modality_model.py --root $DATASET_ROOT --dry-run
 
 # 本地模拟集（标签来自目录名 flair_0000 / t1c_0000 …）
-python scripts/31_train_modality_model.py --root /path/to/track4_sim
+python3 scripts/31_train_modality_model.py --root /path/to/track4_sim
 ```
+
+> 训练侧那条 `无任何可用序列` 报错**已经自带自检**：会打印"标注表找到了没 / 体素模型
+> 在不在"以及上面两条命令，照着做即可，不用回来翻文档。
 
 产出 `data/modality_model.json`，由 `src/data/dataset.py: pick_series` 在
 **按名字挑不出通道时**自动调用（懒加载：常规路径零开销）。判别依据是物理量，

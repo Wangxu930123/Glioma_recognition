@@ -170,9 +170,11 @@ ValueError: 数据根 /2026aicompetition/datasets 指向数据集父目录，
 > 扫描时会被跳过，只有 `annotation/{fake,Composition}` 中的病例会作为
 > 特殊影像正样本补进清单。
 
-**模态与掩膜来自 `SeriesType.xlsx`。** 官方数据的序列目录名/文件名是 DICOM UID，
-靠关键词猜不出模态；数据根（与 `<检查号>/` 同级）必须有 `SeriesType.xlsx`，
-探针报告里的 `series_type_rows` 应大于 0、`modality_counts` 应出现 t1c/flair/t2/t1。
+**模态与掩膜来自官方标注表 `labels/3_serieslabel.xlsx`。** 官方数据的序列目录名/文件名是
+DICOM UID，靠关键词猜不出模态；这张表**不在数据集里**，在团队工作区（如
+`<workspace>/dcs/goal1and2/Goal1and2/labels/`），探针会自动搜 `$WORKSPACE` 下 3 层
+（也可 `export GLIOMA_LABELS_DIR=<labels 目录>` 或软链到 `<工程>/labels`）。
+探针报告里的 `series_type_rows` 应大于 0、`modality_counts` 应出现 t1c/flair/t2/t1，
 否则表现为"病例数正常、却报 `无任何可用序列`"或整批归到 `other`。
 
 > 遇到数据根/模态相关的问题，先按 `docs/DATASET_ROOT_TROUBLESHOOT.md` 排查：

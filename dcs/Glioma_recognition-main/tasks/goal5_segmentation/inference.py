@@ -54,6 +54,10 @@ def resolve_ckpts(ckpt_root: Path, rel: str) -> list[Path]:
     2. 否则取该目录下**全部** ``*.pt`` → 多折集成（顺序稳定，保证可复现）。
 
     两种布局都能工作，队友不需要为了"是否集成"改代码或配置。
+
+    ⚠️ 本函数由 ``tasks/_common/backbone_runner.py`` **懒加载复用**：所有 Goal 的
+    权重都走这一套解析规则。所以报错信息里**不要写死某个 Goal 名** ——
+    否则 Goal1 缺权重时会报成 "未找到 Goal5 权重"，把排障的人带偏一整天。
     """
     target = resolve_ckpt(ckpt_root, rel)
     if target.is_file():
@@ -64,7 +68,7 @@ def resolve_ckpts(ckpt_root: Path, rel: str) -> list[Path]:
         if cks:
             return cks
     raise FileNotFoundError(
-        f"未找到 Goal5 权重：{target}（规范 §5.2 约定 {rel}；"
+        f"未找到权重：{target}（规范 §5.2 约定 {rel}；"
         f"多折集成时该目录下应有若干 *.pt）"
     )
 

@@ -27,8 +27,8 @@ QUICK=0
 PASS=0; FAIL=0; SKIP=0
 declare -a REPORT=()
 
-_ok()   { PASS=$((PASS+1)); REPORT+=("  ✓ $1"); printf '  ✓ %s\n' "$1"; }
-_bad()  { FAIL=$((FAIL+1)); REPORT+=("  ✗ $1"); printf '  ✗ %s\n' "$1"; }
+_ok()   { PASS=$((PASS+1)); REPORT+=("  ✓ $*"); printf '  ✓ %s\n' "$*"; }
+_bad()  { FAIL=$((FAIL+1)); REPORT+=("  ✗ $*"); printf '  ✗ %s\n' "$*"; }
 _skip() { SKIP=$((SKIP+1)); REPORT+=("  - $1（跳过）"); printf '  - %s（跳过）\n' "$1"; }
 
 _sec() { printf '\n\033[1m%s\033[0m\n' "$1"; }
@@ -113,6 +113,7 @@ if [[ -f .gitignore ]]; then
   mkdir -p "$tmp/src/data" "$tmp/data" "$tmp/checkpoints" "$tmp/logs"
   cp .gitignore "$tmp/"
   touch "$tmp/src/data/dataset.py" "$tmp/data/manifest.json" \
+        "$tmp/data/folds.json" "$tmp/data/modality_model.json" \
         "$tmp/checkpoints/best.pth" "$tmp/logs/train.log"
   if (cd "$tmp" && git init -q 2>/dev/null && git add -A 2>/dev/null \
         && git ls-files --error-unmatch src/data/dataset.py >/dev/null 2>&1); then
@@ -124,6 +125,20 @@ if [[ -f .gitignore ]]; then
     _bad "本地产物 data/ 被误入库"
   else
     _ok "本地产物 data/ 已正确排除"
+  fi
+  # 模态判别兜底模型：评测集没有标注表时**唯一**的模态来源，而平台流程里
+  # 没有任何步骤会生成它（folds.json 能由 02_build_dataset.sh 重建，它不能）
+  # → 必须随库分发。被 .gitignore 吞掉 = 容器内缺失 = 掩膜写不回正确空间。
+  if (cd "$tmp" && git ls-files --error-unmatch data/modality_model.json >/dev/null 2>&1); then
+    _ok "模态兜底模型 data/modality_model.json 随库分发"
+  else
+    _bad "data/modality_model.json 被 .gitignore 吞掉 —— 评测期模态全判不出！" \
+         "（.gitignore 需为 '/data/*' + '!/data/modality_model.json'，'!' 不能穿透被排除的目录）"
+  fi
+  if (cd "$tmp" && git ls-files --error-unmatch data/folds.json >/dev/null 2>&1); then
+    _bad "data/folds.json 被误入库（折划分须在平台按实际数据集重建）"
+  else
+    _ok "折划分 data/folds.json 未被入库（平台重建）"
   fi
   rm -rf "$tmp"
 else

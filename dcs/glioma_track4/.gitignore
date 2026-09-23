@@ -24,10 +24,24 @@ venv/
 # 根目录 data/ 的 manifest.json 内含本机绝对路径（/mnt/...），容器内无意义；
 # 推理路径**不依赖**它（数据集在运行时通过 scan_real 扫描）；
 # `resolve_cache_dir()` 在目录缺失时返回 None，属预期的优雅降级。
-/data/
+#
+# ⚠️⚠️ 下面是 `/data/*` 而不是 `/data/`，**不要改回去**：
+#    Git 的否定规则不能"穿透"被排除的目录（`/data/` + `!/data/x.json` 是无效的），
+#    所以必须先排除目录**内容**，再按文件白名单放行。
+/data/*
 /logs/
 *.jsonl
 *.log
+
+# ---- 唯一入库的 data/ 文件：模态判别兜底模型（eval-critical）----
+# 评测集**不给** labels/3_serieslabel.xlsx，序列目录名是 DICOM UID，
+# 关键词路径完全失效 → 评测期只能靠这个模型（体素统计特征 + 逻辑回归）判模态。
+# 它不在平台流程的任何步骤里生成（folds.json 可由 02_build_dataset.sh 重建，
+# 这个不行），所以**必须随库分发**，否则容器内缺失 = 模态全判不出 =
+# 掩膜写不回正确序列空间（评测端直接判错）。仅 ~2KB。
+#   平台侧推荐用官方训练集覆盖重训（跨域更稳）：
+#     python scripts/31_train_modality_model.py --root $DATASET_ROOT
+!/data/modality_model.json
 
 # ---- 医学影像（体积大且与代码无关）----
 *.nii

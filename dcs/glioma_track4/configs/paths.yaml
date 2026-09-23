@@ -6,7 +6,9 @@
 workspace: /2026aicompetition/workspace
 
 raw:
-  # 比赛训练集根目录：其下应能看到 annotation/{Composition,fake,duplicate} 与各检查号目录
+  # 比赛训练集根目录（平台实测：`/2026aicompetition/datasets/training` 下只有 `annotation/`，
+  #   影像与 SeriesType.xlsx 都在 `training/annotation/`；填上一层会**自动下钻并告警**，
+  #   所以这两层填哪个都能跑通，见 docs/CLOUD_DESKTOP_RUNBOOK.md §3.2）
   # 可用环境变量覆盖：export DATASET_ROOT=/your/path
   track4: /2026aicompetition/datasets/training
 

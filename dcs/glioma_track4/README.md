@@ -148,7 +148,10 @@ export COMPETITION_PIPELINE_FACTORY=tasks.glioma.pipeline:build_pipeline
 └── verification/        ← 验证集
 ```
 
-**数据根必须精确到阶段目录**：`DATASET_ROOT=/2026aicompetition/datasets/training`。
+**数据根填阶段目录即可**：`DATASET_ROOT=/2026aicompetition/datasets/training`。
+平台实测影像在 `training/annotation/` 下，代码会**自动下钻**并打印 `[probe][告警]`
+（也可直接填 `.../training/annotation`）；填 `/2026aicompetition/datasets` 这类
+多阶段父目录才会被 `ValueError` 拦住。
 停在上层是很容易犯的错，而且后果不会当场显现——阶段名会被当成检查号，
 清单里出现 5 个假病例、金标准一张也对不上，训练却照常跑完。
 现在两条训练路径都会**在扫描前直接失败**并给出应填的路径：
@@ -179,7 +182,7 @@ ValueError: 数据根 /2026aicompetition/datasets 指向数据集父目录，
 
 ```bash
 bash scripts/17_reset_for_official.sh                    # ① 归档本地验证产物（不删除）
-export DATASET_ROOT=/2026aicompetition/datasets/training # ② 官方训练集根（含 annotation/ 与各检查号目录）
+export DATASET_ROOT=/2026aicompetition/datasets/training # ② 官方训练集根（影像在 training/annotation/，会自动下钻）
 export CACHE_DIR=/2026aicompetition/workspace/cache      #    缓存放私有存储（容器删除不丢）
 bash scripts/01_probe.sh                                 # ③ 重新探针（写入 data_source=official/train_v1）
 bash scripts/02_build_dataset.sh                         # ④ 分层折划分

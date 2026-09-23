@@ -587,6 +587,266 @@ def main() -> int:
               f"keys={sorted(_rep3['label_field_counts'])[:4]}")
 
     # ---------------------------------------------------------------- #
+    _section("⑯ 研发侧（glioma_goals）官方标注对接")
+    # 官方 5 张标注表是模态/掩膜/字段/异常标记的**唯一权威来源**。
+    # 之前这些走的是 label.json、目录名关键词、中文列名 —— 官方数据里都不存在，
+    # 于是 special 标签恒为 0、字段全空，训练照跑完却什么都没学到。
+    _goals_mod = (_GOALS / "shared/official_labels.py")
+    _goals_data = (_GOALS / "shared/data.py").read_text(encoding="utf-8")
+    check("研发侧新增 official_labels 模块", _goals_mod.is_file())
+    check("研发侧 discover_cases 接官方表",
+          "_official_context" in _goals_data and "read_characteristics" in _goals_data)
+    check("研发侧跳过 fake/compositing/duplicate 当检查号",
+          "SPECIAL_SOURCE_DIRS" in _goals_data)
+    check("研发侧序列类型不再「缺 SeriesType.xlsx 就提前 return」",
+          "不能提前 return" in _goals_data or "read_series_labels" in _goals_data)
+    _g1 = (_GOALS / "goal1_authenticity/dataset.py").read_text(encoding="utf-8")
+    _g2a = (_GOALS / "goal2_stitched/dataset.py").read_text(encoding="utf-8")
+    check("goal1 用官方 special.fake", 'special.get("fake")' in _g1 or '"fake" in special' in _g1)
+    check("goal2_stitched 用官方 special.stitched",
+          'special.get("stitched")' in _g2a or '"stitched" in special' in _g2a)
+
+    # 行为级：官方格式（含 fake/compositing 子目录 + 5 张表）跑一遍发现流程
+    with tempfile.TemporaryDirectory() as _tmo:
+        from openpyxl import Workbook as _WB2                          # noqa: PLC0415
+        _oroot = Path(_tmo) / "annotation"
+        _olabels = Path(_tmo) / "labels"
+        _A, _F, _C = "a" * 32, "f" * 32, "c" * 32
+        _U = [f"1.2.826.0.1.3680043.2.1125.1.20{i:02d}" for i in range(3)]
+        _tiny_nii(_oroot / _A / _U[0] / f"{_U[0]}.nii.gz")
+        _tiny_nii(_oroot / _A / _U[1] / f"{_U[1]}.nii.gz")
+        _tiny_nii(_oroot / _A / _U[1] / "mask_x.nii.gz")               # 任意名掩膜
+        _tiny_nii(_oroot / "fake" / _F / _U[2] / f"{_U[2]}.nii.gz")
+        _xlsx_rows = [("1_abnormal.xlsx", ["AccessionNumber", "SeriesUid", "Label"],
+                       [(_A, _U[0], "true"), (_A, _U[1], "true"), (_F, _U[2], "fake")]),
+                      ("3_serieslabel.xlsx", ["AccessionNumber", "SeriesUid", "SeriesLabel"],
+                       [(_A, _U[0], "FLAIR"), (_A, _U[1], "T1CE"), (_F, _U[2], "T2")]),
+                      ("4_masklabel.xlsx", ["AccessionNumber", "SeriesUid", "Maskname"],
+                       [(_A, _U[1], "mask_x.nii.gz")]),
+                      ("5_characteristics.xlsx",
+                       ["AccessionNumber", "Glioma", "WHO_grade", "Morphology"],
+                       [(_A, "Yes", 3, "Irregular")])]
+        for _fn, _hdr, _rows in _xlsx_rows:
+            _w = _WB2()
+            _w.active.append(_hdr)
+            for _r in _rows:
+                _w.active.append(list(_r))
+            _olabels.mkdir(parents=True, exist_ok=True)
+            _w.save(_olabels / _fn)
+        _prev_env = os.environ.get("GLIOMA_LABELS_DIR")
+        os.environ["GLIOMA_LABELS_DIR"] = str(_olabels)
+        try:
+            sys.path.insert(0, str(_GOALS))
+            from shared.data import discover_cases as _disc            # noqa: PLC0415
+            _cases = {c["accession"]: c for c in _disc(_oroot)}
+            check("官方格式：正常 + 异常病例都被发现",
+                  _A in _cases and _F in _cases, f"{len(_cases)} 例")
+            check("官方格式：special.fake 正确（原来恒为 0）",
+                  _cases.get(_F, {}).get("special", {}).get("fake") == 1.0)
+            check("官方格式：模态来自 3_serieslabel",
+                  sorted(s["desc"] for s in _cases[_A]["series"]) == ["FLAIR", "T1CE"])
+            check("官方格式：任意名掩膜被识别",
+                  "core" in (_cases[_A].get("masks") or {}))
+            check("官方格式：字段来自 5_characteristics",
+                  (_cases[_A].get("labels") or {}).get("WHO_Grade") == "3")
+        finally:
+            if _prev_env is None:
+                os.environ.pop("GLIOMA_LABELS_DIR", None)
+            else:
+                os.environ["GLIOMA_LABELS_DIR"] = _prev_env
+
+    # ---------------------------------------------------------------- #
+    _section("⑰ 目标二-B：使用官方重复金标准，且负样本不与之冲突")
+    # 早期实现把"同一病例两次增强"当正对 —— 那是必然相同的图，学到的是
+    # "增强不变性"而不是"识别重复上传"。更危险的是负样本随机抽：
+    # 若抽到官方标注的重复对，同一对就被打上两种标签（正 1 / 负 0），
+    # 模型只会学到噪声，而且不会报任何错。
+    _dup_src = (_GOALS / "goal2_duplicate/dataset.py").read_text(encoding="utf-8")
+    check("读取官方 2_duplicate.xlsx", "read_duplicate_pairs" in _dup_src)
+    check("负样本排除已知重复对（dup_of）", "dup_of" in _dup_src)
+    check("退化时有语义差异告警", "语义不同" in _dup_src)
+    check("导出 B 侧检查号以供核验", '"accession_b"' in _dup_src)
+
+    with tempfile.TemporaryDirectory() as _td:
+        from openpyxl import Workbook as _WB3                           # noqa: PLC0415
+        _droot = Path(_td) / "annotation"
+        _dlabels = Path(_td) / "labels"
+        _accs = [ch * 32 for ch in "abcdef"]
+        _uids = {a: [f"1.2.826.0.1.3680043.2.1125.1.{i:02d}0{j}"
+                     for j in (1, 2)] for i, a in enumerate(_accs)}
+        for _a in _accs:
+            for _u in _uids[_a]:
+                _tiny_nii(_droot / _a / _u / f"{_u}.nii.gz")
+        _w = _WB3()
+        _w.active.append(["AccessionNumber", "SeriesUid", "SeriesLabel"])
+        for _a in _accs:
+            for _u in _uids[_a]:
+                _w.active.append([_a, _u, "FLAIR"])
+        _dlabels.mkdir(parents=True, exist_ok=True)
+        _w.save(_dlabels / "3_serieslabel.xlsx")
+        _pairs = [(_accs[0], _accs[1]), (_accs[2], _accs[3])]
+        _w2 = _WB3()
+        _w2.active.append(["src_img", "desc_img"])
+        for _p in _pairs:
+            _w2.active.append(list(_p))
+        _w2.save(_dlabels / "2_duplicate.xlsx")
+
+        _prev = os.environ.get("GLIOMA_LABELS_DIR")
+        os.environ["GLIOMA_LABELS_DIR"] = str(_dlabels)
+        try:
+            if str(_GOALS / "goal2_duplicate") not in sys.path:
+                sys.path.insert(0, str(_GOALS / "goal2_duplicate"))
+            from dataset import DuplicatePairDataset as _DPD              # noqa: PLC0415
+            from shared.data import discover_cases as _dc                 # noqa: PLC0415
+            from shared.official_labels import read_duplicate_pairs        # noqa: PLC0415
+            _ds_cases = _dc(_droot)
+            _off = read_duplicate_pairs(str(_dlabels / "2_duplicate.xlsx"))
+            _dset = _DPD(_ds_cases, train=True, gold_pairs=_off)
+            _gold = {frozenset(p) for p in _pairs}
+            _bad_neg = _pos_gold = _neg = 0
+            for _i in range(48):
+                _s = _dset[_i]
+                _a, _b = str(_s["accession"]), str(_s["accession_b"])
+                if float(_s["pair"]) == 1.0:
+                    _pos_gold += int(frozenset({_a, _b}) in _gold)
+                else:
+                    _neg += 1
+                    _bad_neg += int(frozenset({_a, _b}) in _gold or _a == _b)
+            check("行为级：负样本从不撞官方重复对", _bad_neg == 0, f"bad={_bad_neg}")
+            check("行为级：正对确实来自官方金标准", _pos_gold > 0, f"gold={_pos_gold}")
+            check("行为级：负样本存在", _neg > 0, f"neg={_neg}")
+        finally:
+            if _prev is None:
+                os.environ.pop("GLIOMA_LABELS_DIR", None)
+            else:
+                os.environ["GLIOMA_LABELS_DIR"] = _prev
+
+    # ---------------------------------------------------------------- #
+    _section("⑱ 评测期无标注表：体素统计模型兜底判模态")
+    # 官方训练集给了 labels/3_serieslabel.xlsx，评测集**不给**；评测集的序列
+    # 目录名是 DICOM UID，关键词一个都命中不了。此时若不判模态：
+    # 训练侧表现为"无任何可用序列"直接崩；推理侧更隐蔽 ——
+    # inference/pipeline.py 要先知道"哪个序列是 T1C"才能把掩膜写回它的空间，
+    # 认不出就写不回去，提交上去的掩膜空间是错的（评测端直接判错）。
+    from src.data.dataset import _MODEL_STATE as _MSTATE              # noqa: PLC0415
+    from src.data.dataset import pick_series as _pick                # noqa: PLC0415
+    from src.data.modality_model import load_default_model as _ldm    # noqa: PLC0415
+    from src.data.probe import scan_real as _scan                    # noqa: PLC0415
+    from src.utils.config import load_config as _lcfg                 # noqa: PLC0415
+
+    _model = _ldm()
+    check("模态模型可用（data/modality_model.json）", _model is not None,
+          "缺失时用 scripts/31_train_modality_model.py 训练")
+
+    # 真实通道名必须覆盖模型的输出，否则兜底会**静默失效**（判出来了却填不进去）
+    _chs = {str(c["name"]) for c in _lcfg("preprocess")["channels"]}
+    check("配置通道名覆盖模型输出", {"t1c", "flair", "t2"} <= _chs, f"channels={sorted(_chs)}")
+
+    _sim_root = Path(os.environ.get("GLIOMA_SIM_ROOT")
+                     or "/mnt/data_sdb/wangx/data/Brain_MRI/track4_sim")
+    # 用**训练时没见过**的病例：训练脚本按目录序只取每类前 250 例，
+    # 高编号病例是留出的 → 这里测的是泛化，不是背题。
+    _case_dir = _sim_root / "BraTS2021_01664"
+    if _model is not None and _case_dir.is_dir():
+        with tempfile.TemporaryDirectory() as _td:
+            _like = Path(_td) / "eval_like"
+            _uids = {"flair": "1.2.826.0.1.3680043.2.1125.9.101",
+                     "t2": "1.2.826.0.1.3680043.2.1125.9.102",
+                     "t1c": "1.2.826.0.1.3680043.2.1125.9.103"}
+            _truth: dict[str, str] = {}
+            for _mod, _uid in _uids.items():
+                _src = _case_dir / f"{_mod}_0000" / f"{_mod}.nii.gz"
+                if not _src.is_file():
+                    continue
+                _dst = _like / "ACC9001" / _uid / f"{_uid}.nii.gz"
+                _dst.parent.mkdir(parents=True, exist_ok=True)
+                _dst.write_bytes(_src.read_bytes())     # 目录名/文件名全是 UID，无标注表
+                _truth[str(_dst)] = _mod
+            _cases = _scan(str(_like))
+            check("UID 目录名且无标注表时仍能扫出检查", len(_cases) == 1, f"cases={len(_cases)}")
+
+            if _cases:
+                _c = _cases[0]
+                # 前提确认：关键词路径确实**完全失效**（否则本段测不到兜底）
+                check("关键词确实认不出模态（只剩 other）",
+                      set(_c.get("images") or {}) <= {"other"},
+                      f"images={sorted(_c.get('images') or {})}")
+                check("未知序列被完整保留（不再只留第一个）",
+                      len(_c.get("unknown_series") or []) == len(_truth),
+                      f"unknown={len(_c.get('unknown_series') or [])}/{len(_truth)}")
+
+                _log: list[str] = []
+                _picked = _pick(_c, _lcfg("preprocess"), _log)
+                check("兜底把三路模态都判了出来",
+                      {"t1c", "flair", "t2"} <= set(_picked),
+                      f"picked={sorted(_picked)}")
+                _wrong = [ch for ch, m in _picked.items()
+                          if ch in ("t1c", "flair", "t2")
+                          and _truth.get(str(m["path"])) != ch]
+                check("判出的模态各自对应**正确**的源文件", not _wrong,
+                      f"错配={_wrong}")
+                check("判别过程有日志可追溯", any("模态判别" in s for s in _log),
+                      f"{_log[:1]}")
+
+                # 模型缺失时必须优雅降级（不能抛异常、不能瞎填通道）
+                _saved = dict(_MSTATE)
+                try:
+                    _MSTATE.update(loaded=True, model=None)
+                    _none_log: list[str] = []
+                    _picked2 = _pick(_c, _lcfg("preprocess"), _none_log)
+                    check("无模型时不抛异常且不瞎填模态",
+                          not ({"t1c", "flair", "t2"} & set(_picked2)),
+                          f"picked={sorted(_picked2)}")
+                    check("无模型时给出可操作的提示",
+                          any("modality_model.json" in s for s in _none_log))
+                finally:
+                    _MSTATE.clear()
+                    _MSTATE.update(_saved)
+
+                # argmax 撞车时必须靠**次优**标签救回通道：
+                # 逐路"先到先得"会把 uid1 错填成 T2、并把 uid2 整路丢掉（3 路只剩 2 路且错 1 路）；
+                # 全局贪心指派应把三路全部对齐（uid2 拿 T2 0.95，uid1 落到次优 T1CE 0.55）。
+                class _FakeModel:                                     # noqa: D401
+                    def __init__(self, table):
+                        self.table = table
+
+                    def predict_file(self, path, stride: int = 2):     # noqa: ARG002
+                        p = self.table[os.path.basename(str(path))]
+                        return max(p, key=p.get), p
+
+                _tbl = {
+                    f"{_uids['t2']}.nii.gz": {"T2": 0.90, "T1CE": 0.55, "FLAIR": 0.05},
+                    f"{_uids['flair']}.nii.gz": {"FLAIR": 0.98, "T2": 0.01, "T1CE": 0.01},
+                    f"{_uids['t1c']}.nii.gz": {"T1CE": 0.97, "FLAIR": 0.02, "T2": 0.01},
+                }
+                _saved2 = dict(_MSTATE)
+                try:
+                    _MSTATE.update(loaded=True, model=_FakeModel(_tbl))
+                    _picked3 = _pick(_c, _lcfg("preprocess"), None)
+                    # 注意 UID 本身含 "." —— 不能用 split(".")[0] 取文件名（会只剩 "1"）
+                    _map3 = {ch: os.path.basename(str(m["path"])).replace(".nii.gz", "")
+                             for ch, m in _picked3.items() if ch in _uids}
+                    check("撞车时按全局贪心指派（三路全对）",
+                          _map3 == dict(_uids),
+                          f"got={ {k: v[-7:] for k, v in _map3.items()} }")
+                finally:
+                    _MSTATE.clear()
+                    _MSTATE.update(_saved2)
+
+                # 端到端：真的构建出多通道体数据（含公共网格重采样）
+                try:
+                    from src.data.dataset import build_case_volume as _bcv  # noqa: PLC0415
+                    _vol, _aff, _ = _bcv(_c, _lcfg("preprocess"))
+                    _ok = tuple(_vol.shape) == (len(_lcfg("preprocess")["channels"]),
+                                                *_vol.shape[1:])
+                    check("端到端：多通道体数据可构建", _ok and _vol.std() > 0,
+                          f"vol={tuple(_vol.shape)} std={float(_vol.std()):.3f}")
+                except Exception as _exc:                             # noqa: BLE001
+                    check("端到端：多通道体数据可构建", False, f"{type(_exc).__name__}: {_exc}")
+    elif _model is not None:
+        check("找到可用于验证的留出病例", False, str(_case_dir))
+
+    # ---------------------------------------------------------------- #
     print("\n" + "=" * 66)
     total = len(_PASSED) + len(_FAILED)
     print(f"通过 {len(_PASSED)}/{total}")

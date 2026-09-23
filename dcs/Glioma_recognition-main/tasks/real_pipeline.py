@@ -73,4 +73,16 @@ def build_pipeline() -> InferencePipeline:
         StudyTaskBinding("goal4", _pick("goal4", enabled, device)),
     )
     duplicate_task = _pick("goal2_duplicate", enabled, device)
+
+    # staged rollout（规范 §15.1「每次只替换一个插件」）最危险的失误是
+    # "以为全开了、其实只有 GLIOMA_GOALS 里列的那几个是真的" —— 打印成一行，一眼可见。
+    all_keys = tuple(_BUILDERS)
+    real = [k for k in all_keys if k in enabled]
+    dummy = [k for k in all_keys if k not in enabled]
+    print(
+        f"[real_pipeline] GLIOMA_GOALS={','.join(sorted(enabled)) or '(空)'} → "
+        f"真实插件 {len(real)}/{len(all_keys)}: {','.join(real) or '无'}"
+        + (f"  ⚠️ Dummy 补位: {','.join(dummy)}" if dummy else "  ✓ 无 Dummy 补位"),
+        flush=True,
+    )
     return InferencePipeline(study_tasks=study_tasks, duplicate_task=duplicate_task)

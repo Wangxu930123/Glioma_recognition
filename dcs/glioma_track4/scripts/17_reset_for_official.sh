@@ -50,7 +50,7 @@ fi
 
 echo
 echo "[17] 完成。接下来用**官方数据**重建："
-echo "    export DATASET_ROOT=/2026aicompetition/datasets/training        # 官方训练集根（含 annotation/ 与各检查号目录）"
+echo "    export DATASET_ROOT=/2026aicompetition/datasets/training        # 官方训练集根（影像在 training/annotation/，会自动下钻）"
 echo "    export CACHE_DIR=/2026aicompetition/workspace/cache             # 缓存放私有存储（容器删除不丢）"
 echo "    bash scripts/01_probe.sh                                        # 探针（会写入 data_source=official/train_v1）"
 echo "    bash scripts/02_build_dataset.sh                                # 分层折划分"

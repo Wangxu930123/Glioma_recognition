@@ -20,9 +20,11 @@ import os
 from collections import Counter
 
 from ..utils.config import data_source_tag, load_paths, resolve
-from .labels import (find_structured_tables, guess_modality, has_strict_mask_hint,
-                     mask_role_for, norm_key, read_series_types,
-                     read_structured_table, sidecar_desc, structured_from_row)
+from .labels import (find_official_labels, find_structured_tables, guess_modality,
+                     has_strict_mask_hint, mask_role_for, norm_key,
+                     read_abnormal_table, read_duplicate_pairs, read_mask_table,
+                     read_series_types, read_structured_table, sidecar_desc,
+                     structured_from_row)
 
 IMG_EXT = (".nii.gz", ".nii")
 SKIP_NAME_KW = ("dicomdir", "license", "readme", "vht", ".mhd")
@@ -100,8 +102,12 @@ def scan_special(root: str) -> dict:
     """
     out: dict = {"annotation_dir": None, "composition": [], "fake": [], "duplicate": [],
                  "gold_pairs": [], "composition_cases": [], "fake_cases": []}
+    # 目录名两套写法都要认：本地模拟集用 `Composition`，**官方用 `compositing`**
+    # （见天坛 `AIRecongition/src/data/paths.py`）。只认前者会让"拼接"这一类
+    # 正样本整批找不到 → 目标二-A 的头没有监督信号，而且不报错。
     for cand in (os.path.join(root, "annotation"), root):
-        if os.path.isdir(os.path.join(cand, "Composition")) or os.path.isdir(os.path.join(cand, "fake")):
+        if any(os.path.isdir(os.path.join(cand, name))
+               for name in ("Composition", "compositing", "fake")):
             out["annotation_dir"] = cand
             break
     if not out["annotation_dir"]:
@@ -119,12 +125,17 @@ def scan_special(root: str) -> dict:
                 ids.append(_stem(name))
         return ids
 
-    for cls, key in (("Composition", "composition"), ("fake", "fake"), ("duplicate", "duplicate")):
-        d = os.path.join(ann, cls)
-        if os.path.isdir(d):
+    # 每个用途可能对应多个目录名（本地 `Composition` / 官方 `compositing`）
+    for names, key in ((("Composition", "compositing"), "composition"),
+                       (("fake",), "fake"), (("duplicate",), "duplicate")):
+        for cls in names:
+            d = os.path.join(ann, cls)
+            if not os.path.isdir(d):
+                continue
             items = _identifiers(d)
-            out[key] = items[:500]
-            out[f"{key}_cases"] = items[:500]
+            merged = list(dict.fromkeys(out[key] + items))[:500]   # 去重且保序
+            out[key] = merged
+            out[f"{key}_cases"] = merged
 
     # 重复影像金标准（csv/txt，每行 src,desc）
     for dirpath, _dirs, files in os.walk(os.path.join(ann, "duplicate")):
@@ -147,12 +158,67 @@ def scan_special(root: str) -> dict:
 # --------------------------------------------------------------------------- #
 # 真实影像
 # --------------------------------------------------------------------------- #
+#: 官方数据里"异常影像"的子目录名（`AIRecongition/src/data/paths.py` 约定）：
+#: ``<根>/fake/<检查号>/…``、``<根>/compositing/<检查号>/…``、``<根>/duplicate/<检查号>/…``。
+#: 它们与主目录**同构**，因此绝不能被当成检查号 —— 否则会多出三个名叫 fake/compositing/
+#: duplicate 的"病例"，而它们的"序列"是几百上千个真实病例目录。
+SPECIAL_SOURCE_DIRS = ("fake", "compositing", "composition", "duplicate")
+
+#: 允许自动下钻的中间层：``annotation``（影像/标注表所在层）+ 平台阶段名。
+#: 平台实际布局比"数据集根"多这一层，见 ``docs/CLOUD_DESKTOP_RUNBOOK.md`` §3.2。
+_DESCEND_DIRS = frozenset({"annotation"}) | _PLATFORM_PHASES
+#: 顶层非病例目录：本层出现其中任何一个，说明"还没到病例层"
+_NON_CASE_DIRS = (frozenset({"annotation", "cache", "runs", "folds", "labels",
+                             "logs", "checkpoints", "weights"})
+                  | frozenset(SPECIAL_SOURCE_DIRS))
+
+
+def resolve_case_root(root: str) -> str:
+    """把"填高了一层"的数据根下钻到真正含病例目录的那一层。
+
+    平台实测结论（``docs/CLOUD_DESKTOP_RUNBOOK.md`` §3.2）：
+    ``/2026aicompetition/datasets/training`` 下**只有** ``annotation/``，
+    影像、``SeriesType.xlsx`` 与标注表都在 ``training/annotation/`` 里。
+
+    填高一层**不报错**、只静默扫到 0 例 —— 这是最容易踩、也最难查的坑。
+    规则与提交工程 ``data/loader.py::_resolve_dataset_root`` 保持一致：
+    只有"下一层唯一候选"时才下钻并告警；候选多于一个时**不下钻**，
+    交给 :func:`assert_case_root` 报错（猜错阶段比直接失败更糟）。
+    """
+    if not os.path.isdir(root):
+        return root
+    if any(os.path.isdir(os.path.join(root, e)) and e.lower() not in _NON_CASE_DIRS
+           for e in os.listdir(root)):
+        return root                                       # 本层已经有病例目录
+    children = sorted(e for e in os.listdir(root)
+                      if os.path.isdir(os.path.join(root, e)))
+    cands = [c for c in children if c.casefold() in _DESCEND_DIRS]
+    if len(cands) == 1:
+        sub = os.path.join(root, cands[0])
+        print(f"[probe][告警] 数据根 {root} 下没有病例目录，已自动下钻到 "
+              f"{cands[0]}/（若不对请用 DATASET_ROOT 显式指定）", flush=True)
+        return sub
+    return root
+
+
 def _collect_nifti(cdir: str, accession: str = "",
-                   series_types: dict | None = None) -> tuple[dict, dict]:
-    """扫描一个检查目录下的 NIfTI：返回 (images, mask_entries)。
+                   series_types: dict | None = None,
+                   mask_names: dict | None = None) -> tuple[dict, list, list]:
+    """扫描一个检查目录下的 NIfTI：返回 ``(images, mask_entries, unknown)``。
 
     - images: ``{modality: {"path","series_uid","file"}}``
     - mask_entries: ``[(role, modality, path, series_uid), ...]``（同一角色可多条 → 取并集）
+    - unknown: **认不出模态的序列全表**（``[{...}]``）
+
+    ``unknown`` 为什么必须单独返回：评测集没有 ``3_serieslabel.xlsx``，
+    序列目录名是 DICOM UID，关键词一个都命中不了 —— 此时唯一的出路是
+    **读体素用统计模型判模态**（``data.modality_model``）。而原先的实现
+    只把**第一个**认不出的序列塞进 ``images["other"]``、其余直接丢弃，
+    兜底模型最多只能看到 1 个序列，且拿不到完整候选。
+
+    不能把列表塞进 ``images``（如 ``images["unknown"] = [...]``）：
+    ``inference/writer.py`` 会 ``for mod, meta in images.items()`` 后取
+    ``meta["path"]``，遇到 list 会直接崩。
 
     ``series_types`` 是官方 ``SeriesType.xlsx`` 解析出的
     ``{(检查号, 序列号): 序列类型}``。**官方数据必须靠它**：序列目录名是
@@ -162,6 +228,7 @@ def _collect_nifti(cdir: str, accession: str = "",
     """
     images: dict[str, dict] = {}
     masks: list[tuple[str, str | None, str, str]] = []
+    unknown: list[dict] = []
     for dirpath, _dirs, files in os.walk(cdir):
         sdir = os.path.basename(dirpath)
         for fn in sorted(files):
@@ -187,13 +254,21 @@ def _collect_nifti(cdir: str, accession: str = "",
             # 直接送进 mask_role_for 会被判成 core 掩膜。
             if role is None and desc and has_strict_mask_hint(desc):
                 role = mask_role_for(f"{desc} {fn}", mod)
+            # 官方 `4_masklabel.xlsx` 指定的掩膜：文件名是**任意的**（如 core.nii.gz），
+            # 靠关键词认不出。不同步排除的话，掩膜会被当成一路"影像"混进输入通道。
+            if role is None and mask_names and fn in (mask_names.get(series_uid) or []):
+                role = mask_role_for(f"{fn} {desc}", mod) or "core"
             if role:
                 masks.append((role, mod, full, series_uid))
             else:
+                meta = {"path": full, "series_uid": series_uid, "file": fn}
                 key = mod or "other"
                 if key not in images:
-                    images[key] = {"path": full, "series_uid": series_uid, "file": fn}
-    return images, masks
+                    images[key] = dict(meta)          # 兼容旧语义：仍是"第一个"
+                if mod is None:
+                    # 认不出模态的序列**全部保留**（见 docstring：评测期要靠模型回头判）
+                    unknown.append({**meta, "reason": desc or stem or sdir})
+    return images, masks, unknown
 
 
 def _collect_dicom(cdir: str, log: list | None = None) -> dict:
@@ -220,7 +295,8 @@ def _collect_dicom(cdir: str, log: list | None = None) -> dict:
 def scan_real(root: str, limit_cases: int | None = None,
               struct_tables: dict[str, dict] | None = None,
               log: list | None = None,
-              series_types: dict | None = None) -> list[dict]:
+              series_types: dict | None = None,
+              mask_by_acc: dict | None = None) -> list[dict]:
     """扫描真实影像：一级目录 = 检查号；其下收集影像（NIfTI/DICOM）与掩码。
 
     ``SeriesType.xlsx``（若存在于数据根）会一次性读入并用于识别**模态与掩膜**：
@@ -228,18 +304,30 @@ def scan_real(root: str, limit_cases: int | None = None,
     掩膜全无"，而目录结构看起来完全正常。
     """
     cases: list[dict] = []
+    root = resolve_case_root(root)                 # 填高一层（如 .../training）时自动下钻
     if not os.path.isdir(root):
         return cases
     assert_case_root(root)
     if series_types is None:
         series_types = read_series_types(root)
     if series_types:
-        print(f"[probe] 已读取 SeriesType.xlsx：{len(series_types)} 条序列类型映射", flush=True)
+        print(f"[probe] 已读取序列类型映射：{len(series_types)} 条"
+              f"（来源：官方 3_serieslabel.xlsx 优先，其次 SeriesType.xlsx）", flush=True)
     entries = sorted(e for e in os.listdir(root)
-                     if os.path.isdir(os.path.join(root, e)) and e.lower() != "annotation")
+                     if os.path.isdir(os.path.join(root, e))
+                     and e.lower() != "annotation"
+                     and e.lower() not in SPECIAL_SOURCE_DIRS)   # fake/compositing/duplicate 是"来源"不是检查号
+    skipped_sources = [e for e in sorted(os.listdir(root))
+                       if os.path.isdir(os.path.join(root, e))
+                       and e.lower() in SPECIAL_SOURCE_DIRS]
+    if skipped_sources:
+        print(f"[probe] 已按官方约定跳过异常影像目录：{skipped_sources}"
+              f"（其内容与主目录同构，按来源区分而非当成检查号）", flush=True)
     for acc in entries:
         cdir = os.path.join(root, acc)
-        images, mask_entries = _collect_nifti(cdir, acc, series_types)
+        images, mask_entries, unknown = _collect_nifti(
+            cdir, acc, series_types,
+            (mask_by_acc or {}).get(acc.casefold()) or (mask_by_acc or {}).get(acc))
         if not images:                                            # 纯 DICOM 检查
             images = _collect_dicom(cdir, log)
         if not images and not mask_entries:
@@ -258,8 +346,11 @@ def scan_real(root: str, limit_cases: int | None = None,
                 if key in struct_tables:
                     labels = structured_from_row(struct_tables[key])
                     break
+        # unknown_series：认不出模态的序列清单。评测集没有标注表时，
+        # 数据集侧（``dataset.pick_series``）会读它们的体素用统计模型判模态。
         cases.append({"accession": acc, "dir": cdir, "images": images,
-                      "masks": masks, "labels": labels})
+                      "masks": masks, "labels": labels,
+                      **({"unknown_series": unknown} if unknown else {})})
         if limit_cases and len(cases) >= limit_cases:
             break
     return cases
@@ -284,13 +375,14 @@ def merge_special_cases(cases: list[dict], special: dict, log: list | None = Non
             d = os.path.join(base, str(ident))
             if not os.path.isdir(d):
                 continue
-            imgs, masks = _collect_nifti(d, str(ident), series_types)
+            imgs, masks, unknown = _collect_nifti(d, str(ident), series_types)
             if not imgs:
                 imgs = _collect_dicom(d, log)
             if not imgs:
                 continue
             c = {"accession": ident, "dir": d, "images": imgs, "masks": {},
-                 "labels": {}, "special": cls}
+                 "labels": {}, "special": cls,
+                 **({"unknown_series": unknown} if unknown else {})}
             cases.append(c)
             by[ident] = c
     return cases
@@ -298,35 +390,74 @@ def merge_special_cases(cases: list[dict], special: dict, log: list | None = Non
 
 def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -> dict:
     log: list[str] = []
+    # 先把根定到病例层：否则下面读标注表、列检查号都会落在空的父目录上，
+    # 报告里出现"0 例 + 0 张表"，看起来像数据没挂载，实际只是根填高了一层。
+    root = resolve_case_root(root)
     # "按取值找检查号列"需要磁盘上真实存在的检查号（列名叫什么都不影响），
     # 这里先轻量列一次目录名，口径与 scan_real 一致（一级子目录、排除 annotation）。
     known_ids = ({str(e) for e in os.listdir(root)
                   if os.path.isdir(os.path.join(root, e)) and e.lower() != "annotation"}
                  if os.path.isdir(root) else set())
-    tables = find_structured_tables(root)
+    # ★ 官方 5 张标注表（`1_abnormal` / `2_duplicate` / `3_serieslabel` /
+    #   `4_masklabel` / `5_characteristics`）是**权威来源**：模态、掩膜、
+    #   字段金标准都在这里，而不是靠目录名或关键词能猜出来的。
+    label_files = find_official_labels(root)
+    if label_files:
+        print("[probe] 官方标注表：" + ", ".join(
+            f"{k}={os.path.basename(v)}" for k, v in label_files.items()), flush=True)
+
+    chars = label_files.get("characteristics")                    # 字段金标准（官方列名）
+    tables = ([chars] if chars else []) + [t for t in find_structured_tables(root)
+                                          if t != chars]
     struct = {}
     for t in tables:
         try:
             struct.update(read_structured_table(t, known_ids=known_ids))
         except Exception:                                         # noqa: BLE001
             pass
-    # 序列类型表只读一次，影像与特殊影像两条分支共用（避免"一处读了、一处没读"
-    # 导致两边口径不一致）
     # 字典里同一行会有多个键（原值 / 去前导零 / 大小写折叠），
     # 直接 len() 会把"行数"报成实际的两倍以上，把诊断带偏 —— 按**唯一记录**计数。
     n_struct_rows = len({id(v) for v in struct.values()})
 
     series_types = read_series_types(root)
+
+    # 掩膜：官方 `4_masklabel.xlsx` 的 Maskname（文件名任意，靠关键词认不出）
+    mask_by_acc: dict[str, dict[str, list[str]]] = {}
+    if label_files.get("mask"):
+        for (acc, uid), names in read_mask_table(label_files["mask"]).items():
+            slot = mask_by_acc.setdefault(acc.casefold(), {})
+            slot[uid] = names
+            slot[uid.casefold()] = names
+    # 异常影像（fake/compositing/duplicate）的标注来自官方 `1_abnormal.xlsx` 的 Label
+    abnormal = (read_abnormal_table(label_files["abnormal"])
+                if label_files.get("abnormal") else {})
+
     special = scan_special(root)
-    cases = scan_real(root, limit_cases, struct, log, series_types)
+    # 官方重复金标准在 `2_duplicate.xlsx`（两列检查号），不在 `duplicate/` 目录下的 csv；
+    # 只扫目录会得到 0 对 → 目标二-B 没有正样本。
+    if label_files.get("duplicate"):
+        official_pairs = [[a, b] for a, b in read_duplicate_pairs(label_files["duplicate"])]
+        if official_pairs:
+            special["gold_pairs"] = official_pairs
+            print(f"[probe] 已读官方重复金标准 {os.path.basename(label_files['duplicate'])}："
+                  f"{len(official_pairs)} 对", flush=True)
+
+    cases = scan_real(root, limit_cases, struct, log, series_types, mask_by_acc)
     cases = merge_special_cases(cases, special, log, series_types)
 
     mod_counter, mask_counter, label_counter = Counter(), Counter(), Counter()
     geom_samples = []
+    n_unknown_series = n_unknown_cases = 0
     for c in cases:
         mod_counter.update(c["images"].keys())
         mask_counter.update(c["masks"].keys())
         label_counter.update(c["labels"].keys())
+        # 认不出模态的序列数：评测集（无标注表、UID 目录名）会整批落在这里。
+        # 这是"评测期要不要靠模型判模态"的唯一可见指标 —— 不报出来就只能等
+        # 训练时崩「无任何可用序列」才发现。
+        n_u = len(c.get("unknown_series") or [])
+        n_unknown_series += n_u
+        n_unknown_cases += int(n_u > 0)
         if len(geom_samples) < sample_geometry:
             for mod, meta in list(c["images"].items())[:1]:
                 geom_samples.append({"accession": c["accession"], "modality": mod,
@@ -355,10 +486,19 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
         "n_cases": len(cases),
         "structured_tables": tables,
         "n_structured_rows": n_struct_rows,
+        # 官方 5 张标注表的命中情况（看不到某个键 = 那类标注没找到）
+        "official_label_files": {k: os.path.basename(v)
+                                 for k, v in label_files.items()},
+        "n_abnormal_rows": len(abnormal),
+        "abnormal_label_counts": dict(Counter(abnormal.values())),
         # 序列类型表命中数：0 且在官方数据上 → 模态/掩膜必然认不出，
         # 先解决这个再谈训练（"病例数正常但全 other"就是这个原因）
         "series_type_rows": len(series_types),
         "modality_counts": dict(mod_counter),
+        # 认不出模态的序列总数 / 涉及病例数。评测集没有标注表时它会等于"序列总数"，
+        # 此时全靠 data/modality_model.json 兜底（见 DATASET_ROOT_TROUBLESHOOT.md）
+        "unknown_series_total": n_unknown_series,
+        "cases_with_unknown_series": n_unknown_cases,
         "mask_role_counts": dict(mask_counter),
         "label_field_counts": dict(label_counter),
         "labels_hint": labels_hint,
@@ -405,6 +545,15 @@ def main() -> None:
     if res["report"]["modality_counts"].get("other") and not res["report"]["series_type_rows"]:
         print("[probe] ⚠️ 有序列落到 other 且没读到 SeriesType.xlsx："
               "官方数据的模态要靠它，见 docs/DATASET_ROOT_TROUBLESHOOT.md")
+    if res["report"].get("unknown_series_total"):
+        # 评测集没有标注表 → 关键词必然全失效。这条路是**预期**的，
+        # 关键是别让它静默：说清有多少路要走模型判别、模型在不在。
+        from .modality_model import load_default_model
+        has_model = load_default_model() is not None
+        print(f"[probe] ℹ️ {res['report']['cases_with_unknown_series']} 例共 "
+              f"{res['report']['unknown_series_total']} 路序列模态未知"
+              f"（无标注表时的正常现象）→ 体素统计模型："
+              f"{'已就绪 data/modality_model.json' if has_model else '❌ 缺失，请先跑 python scripts/31_train_modality_model.py --root <数据根>'}")
 
 
 if __name__ == "__main__":

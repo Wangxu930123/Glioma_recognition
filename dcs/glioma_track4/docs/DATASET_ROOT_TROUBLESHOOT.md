@@ -35,9 +35,13 @@ python scripts/29_locate_dataset_root.py --base /2026aicompetition --goals ../gl
 结论行示例：
 
 ```text
-结论：数据根 = /2026aicompetition/datasets/training（204 例）
-      export DATASET_ROOT=/2026aicompetition/datasets/training
+结论：数据根 = /2026aicompetition/datasets/training/annotation（3255 例）
+      export DATASET_ROOT=/2026aicompetition/datasets/training/annotation
 ```
+
+> 填 `.../training` 也一样能用：两个工程都会自动下钻到 `annotation/` 并打印告警
+> （见 `CLOUD_DESKTOP_RUNBOOK.md` §3.2）。只有多阶段的父目录 `/2026aicompetition/datasets`
+> 会被 `ValueError` 拦住。
 
 ## 为什么 `training/` 下会只有 `annotation/`
 
@@ -178,6 +182,52 @@ ls -la /2026aicompetition/datasets/training/annotation/<某个检查号>/<某个
 
 有了这两条，就能确定模态还能从哪里取（目录名约定 / sidecar 字段名 / 其它映射表），
 不必再靠猜。
+
+## 连类型表都没有：用体素统计模型兜底判模态
+
+**这是评测期的默认情形**：官方训练集给了 `labels/3_serieslabel.xlsx`，
+**评测集不给任何标注**，序列目录名是 DICOM UID。此时若一个模态都认不出来：
+
+* 训练侧：`无任何可用序列` 直接崩；
+* 推理侧更隐蔽：`inference/pipeline.py` 要先知道"哪个序列是 T1C"才能把掩膜
+  **写回它的空间**，认不出就写不回去 —— 提交上去的掩膜空间是错的。
+
+官方为这种情况在推理主链里放了一个 `sequence` 任务（3 分类）专门判模态。
+本工程的对等实现是**体素统计特征 + 逻辑回归**（无 GPU、无额外依赖，模型 ~2KB）：
+
+```bash
+# 用官方训练集训练（标签来自 labels/3_serieslabel.xlsx）—— 生产推荐路径
+python scripts/31_train_modality_model.py --root $DATASET_ROOT
+
+# 只看精度不写模型（5 折 + 混淆矩阵 + 特征权重）
+python scripts/31_train_modality_model.py --root $DATASET_ROOT --dry-run
+
+# 本地模拟集（标签来自目录名 flair_0000 / t1c_0000 …）
+python scripts/31_train_modality_model.py --root /path/to/track4_sim
+```
+
+产出 `data/modality_model.json`，由 `src/data/dataset.py: pick_series` 在
+**按名字挑不出通道时**自动调用（懒加载：常规路径零开销）。判别依据是物理量，
+不是黑盒：T2 的脑脊液亮（`bright_frac`）、FLAIR 的脑脊液被抑制（`dark_frac`）、
+T1CE 的增强灶（高强度尾部）—— 权重可直接打印检视。
+
+**两个必须知道的行为**：
+
+1. **判错比判不出更糟**：置信度 < 0.5 一律弃用（留空通道 = 明确的"缺失"），
+   把 FLAIR 当成 T1C 会把水肿送进"增强核心区"通道；
+2. **多路之间做全局贪心一对一指派**，不是逐路先到先得 —— 否则 argmax 撞车时
+   会白丢一路（详见 `dataset.classify_unknown` 的注释）。
+
+### 精度与跨域风险（务必如实看待）
+
+| 训练数据 | 5 折准确率 | 对**评测集**的可靠性 |
+|---|---|---|
+| 本地模拟集（BraTS 派生，750 例） | **0.960** | **未知** —— 与官方数据不同厂商/协议，存在域差 |
+| 官方训练集（`--root $DATASET_ROOT`） | 现场测得 | 同分布，**这才是生产路径** |
+
+模拟集训出的模型只保证**管线是通的**（`scripts/25_verify_tasks_integration.py`
+第 ⑱ 段用**训练未见过**的病例做行为级断言）。真正上评测前，请用官方训练集重训一次
+—— 标签现成，CPU 几分钟，没有任何理由跳过。
 
 ## 定根之后
 

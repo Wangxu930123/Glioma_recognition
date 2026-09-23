@@ -59,17 +59,30 @@ class StitchedDataset(BaseCaseDataset):
     """Goal2 Stitched 的数据集。"""
 
     def build_label(self, case: dict, masks: dict, vol_shape) -> dict:
-        """拼接影像标签（``label.json`` 的 ``stitched`` 字段，或目录名含 composition/stitch）。"""
+        """拼接影像标签。
+
+        来源（按优先级）：
+        1. **官方 ``1_abnormal.xlsx`` 的 ``Label=compositing``**
+           （``discover_cases`` 已汇总进 ``case["special"]["stitched"]``）；
+        2. ``label.json`` 的 ``stitched`` / ``composition`` 字段；
+        3. 目录名含 composition / stitch / 拼接。
+
+        官方数据的拼接影像放在 ``<根>/compositing/`` 子目录下，
+        靠目录名或 ``label.json`` 都认不出来 —— 只有第 1 条能拿到正样本。
+        """
         import json as _json
         from pathlib import Path as _P
 
-        y = 0.0
-        lj = _P(case["dir"]) / "label.json"
-        if lj.is_file():
-            d = _json.loads(lj.read_text(encoding="utf-8"))
-            y = float(int(d.get("stitched", d.get("composition", 0))))
+        special = case.get("special") or {}
+        if "stitched" in special:
+            y = float(special["stitched"])
         else:
-            name = case["accession"].lower()
-            y = 1.0 if any(k in name for k in ("comp", "stitch", "拼接")) else 0.0
+            lj = _P(case["dir"]) / "label.json"
+            if lj.is_file():
+                d = _json.loads(lj.read_text(encoding="utf-8"))
+                y = float(int(d.get("stitched", d.get("composition", 0))))
+            else:
+                name = case["accession"].lower()
+                y = 1.0 if any(k in name for k in ("comp", "stitch", "拼接")) else 0.0
         return {"special_target": np.array([y], np.float32),
                 "special_mask": np.ones(1, np.float32)}

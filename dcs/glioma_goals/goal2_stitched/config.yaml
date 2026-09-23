@@ -7,7 +7,7 @@ goal: goal2_stitched
 
 # ---- 数据（所有 Goal 共享**只读**的数据根；缓存各自独立）----
 data:
-  root: /mnt/data_sdb/wangx/data/Brain_MRI/track4_sim     # 可用 --data 覆盖
+  root: /2026aicompetition/datasets/training             # 平台训练集根；--data / GLIOMA_DATASET_ROOT 可覆盖
   common_spacing: [1.0, 1.0, 1.0]                         # 统一到 1mm 公共网格
   cache: cache                                            # 本 Goal 私有缓存目录
 

@@ -1,0 +1,44 @@
+# ============================================================================
+# 提交边界：代码 / 配置 / 文档入库，训练产物一律排除。
+# ----------------------------------------------------------------------------
+# 本工程被六个 Goal **各自独立**使用，每个 goalX/ 下都有自己的
+# runs/（权重 + 日志 + jsonl）与 cache/（预计算 npz）—— 全是本地产物：
+#   · 权重按规范 §5.2 导出到 `/2026aicompetition/workspace/checkpoint/<goal>/`
+#     （由 glioma_track4/integration/export_ckpt.py 完成），**不进入代码库**；
+#   · cache/*.npz 删除后下次训练会按需重建。
+# 不排除的话，一次 `git add -A` 会推上约 578MB（当前实测），clone 都会变慢。
+#
+# ⚠️ 与 glioma_track4 不同，本工程**没有**需要随库分发的 data/ 资产
+#    （折划分 folds.json 由 glioma_track4 产出后经 GLIOMA_FOLDS 共享）。
+# ============================================================================
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# ---- 模型权重（规范 §5.2：走私有存储，不进代码库）----
+*.pth
+*.pt
+
+# ---- 训练产物：每个 Goal 各自一份 ----
+# 不带前导 `/`：要匹配任意层级的 goalX/runs、goalX/cache
+runs/
+cache/
+*.npz
+*.log
+*.jsonl
+
+# ---- 医学影像（体积大且与代码无关）----
+*.nii
+*.nii.gz
+*.dcm
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store

@@ -249,8 +249,11 @@ python scripts/29_locate_dataset_root.py
       export DATASET_ROOT=/2026aicompetition/datasets/training/annotation
 ```
 
-**硬要求**：数据根必须精确到"含 `<检查号>/` 目录的那一层"，
-并且该层要有与检查号同级的 **`SeriesType.xlsx`**。
+**数据根怎么填**：`.../training/annotation`（精确层，推荐）或 `.../training` 都行 ——
+后者会**自动下钻**到 `annotation/` 并打印 `[probe][告警]`，不会静默扫到 0 例
+（`glioma_goals` 同理，两个工程行为一致）。唯一不能填的是
+`/2026aicompetition/datasets`（多阶段父目录，会直接 `ValueError` 拦住）。
+另外该层要有与检查号同级的 **`SeriesType.xlsx`**，否则模态认不出来。
 
 ### 3.3 三个坑
 
@@ -380,6 +383,10 @@ bash scripts/01_probe.sh         # 期望 label_field_counts 非空
 bash scripts/02_build_dataset.sh # 看「含标注/掩码 N」这个 N 是否合理
 python scripts/24_verify_eval_split.py   # 期望 0 项 WARN
 ```
+
+> ⚠️ **只删 `data/folds.json`，不要 `rm -rf data/`**：`data/modality_model.json`
+> （模态判别兜底模型）是**随代码入库**的唯一 data 文件，评测期没有标注表时全靠它；
+> 误删后要么重新 clone，要么 `python scripts/31_train_modality_model.py --root <数据根>` 重训。
 
 ### 4.2 报「无任何可用序列」时的三级定位
 

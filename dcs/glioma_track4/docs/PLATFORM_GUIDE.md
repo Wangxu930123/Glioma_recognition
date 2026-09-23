@@ -40,7 +40,7 @@ flowchart LR
 |---|---|---|
 | `glioma_goals/` | **训练工程**：六个 Goal 各自或串行训练 | ✅ 要（在容器里训） |
 | `glioma_track4/` | **算法工程**：数据管线、自研推理、全流程脚本 | ✅ 要（训练依赖它的数据管线与折划分） |
-| `Glioma_recognition-main/` | **提交工程**：Docker 镜像主体、推理服务 | ✅ 要（测评容器跑的就是它） |
+| `Glioma_recognition-main/` | **提交工程**：Docker 镜像主体、官方规范接口基线 | ✅ 要（镜像主体；启动命令见 §5.2） |
 
 ```mermaid
 flowchart TB
@@ -58,6 +58,19 @@ flowchart TB
 > **为什么不合并**：规范 §5.2 要求"权重不放在代码仓库"，§5.1 要求
 > "`[研发]` 文件不得被比赛运行入口传递导入"。靠一个导出脚本 + 一份同源校验衔接
 > （见 `scripts/26_audit_plugin_completeness.py`）。
+
+> ⚠️ **"镜像主体"不等于"启动命令"，两者别混着用**：
+> - 测评容器的启动命令见 **§5.2**，跑的是 `glioma_track4/scripts/06_platform_serve.sh`
+>   （glioma_track4 的服务，**默认就是真实模型**，不需要任何环境变量）。
+> - 提交工程里也有一个服务（`start.sh` → `app.server:app`，Docker 镜像的默认入口），
+>   但它按官方规范**默认跑 Dummy 基线**：接口格式正确、却没有真实模型输出，
+>   必须显式设置 `COMPETITION_PIPELINE_FACTORY` 才切到真实插件
+>   （候选值见 `configs/competition.env.example`，两个工厂：
+>   `tasks.real_pipeline:build_pipeline` 为目标架构，`tasks.glioma.pipeline:build_pipeline`
+>   为用 glioma_track4 权重的过渡桥接）。
+> - 也就是说：**把启动命令改成 `start.sh` 时必须同时带上那个环境变量**，否则就是
+>   "服务一切正常、答案没有意义"的静默失败。启动日志里会打印
+>   `[registry] ⚠️ ... Dummy 基线` / `[registry] ✓ 真实插件工厂已加载: ...` 供核对。
 
 ### 0.3 存储布局（决定你把东西放哪）
 
@@ -459,9 +472,18 @@ cd /2026aicompetition/workspace/dcs/<库名> && git pull
 # ① 进入代码目录
 cd /2026aicompetition/workspace/dcs
 
-# ② 装依赖（requirements 里已注明 torch 由平台镜像提供，不会重复装）
-pip install -r Glioma_recognition-main/requirements.txt
-#    若报 `Error: externally-managed-environment` → 见下方「装依赖报错怎么办」
+# ② 装依赖
+#    ⚠️ 测评容器的启动命令跑的是 **glioma_track4** 的服务（06_platform_serve.sh），
+#       所以运行期依赖以 glioma_track4/requirements.txt 为准
+#       （requests / pyyaml / scipy / SimpleITK / scikit-image / pandas 都在里面）。
+cd /2026aicompetition/workspace/dcs/glioma_track4
+bash scripts/00_setup_env.sh --mode system     # 自动沿用镜像自带 torch，只补缺失的包
+#    · 手动等价写法：pip install -r glioma_track4/requirements.txt
+#      （文件里有 torch>=2.4，镜像已带会被跳过，不会重装 2GB）
+#    · Glioma_recognition-main/requirements.txt 只覆盖**提交工程自身**的轻量包
+#      （Docker 镜像主体用），单装它**不足以**跑评测容器。
+#    · 报 `Error: externally-managed-environment` → 见下方「装依赖报错怎么办」
+cd /2026aicompetition/workspace/dcs
 
 
 # ③ 让训练能用上统一折划分（关键！否则六个 Goal 的验证集各不相同）
@@ -476,9 +498,11 @@ export GLIOMA_FOLDS=/2026aicompetition/workspace/common/folds.json
 #      /2026aicompetition/public_models    ← 公共模型（只读）
 #      /2026aicompetition/workspace        ← 你的私有存储（读写 + 持久）
 #
-#    但"数据根"要精确到**含病例号目录的那一层**。两种常见结构：
-#      A) datasets/training/<病例号>/<序列>/*.nii.gz  → 数据根 = .../datasets/training
-#      B) datasets/<病例号>/<序列>/*.nii.gz           → 数据根 = .../datasets
+#    数据根填"含病例号目录的那一层"，或它的**上一层**（会自动下钻并打印告警）：
+#      A) datasets/training/annotation/<病例号>/<序列>/*.nii.gz
+#           → 数据根 = .../datasets/training/annotation（推荐）或 .../datasets/training（自动下钻）
+#      B) datasets/<阶段>/<病例号>/<序列>/*.nii.gz   → 数据根 = .../datasets/<阶段>
+#    ✗ datasets/ 本身（下面是多个阶段）会被 ValueError 拦住，不会猜错
 ls /2026aicompetition/datasets/          # 先看下一层是什么
 ```
 
@@ -490,7 +514,8 @@ python -c "
 import sys; sys.path.insert(0, '.')
 from pathlib import Path
 from shared.data import discover_cases
-for cand in ['/2026aicompetition/datasets', '/2026aicompetition/datasets/training']:
+for cand in ['/2026aicompetition/datasets', '/2026aicompetition/datasets/training',
+             '/2026aicompetition/datasets/training/annotation']:
     p = Path(cand)
     if not p.is_dir():
         print(f'{cand}  (不存在)'); continue
@@ -526,13 +551,16 @@ ls "$GLIOMA_DATASET_ROOT/annotation/"    # 应看到 Composition / fake / duplic
 **A. 加一个参数（最快，一条命令）**
 
 ```bash
-pip install --break-system-packages -r Glioma_recognition-main/requirements.txt
+pip install --break-system-packages -r glioma_track4/requirements.txt   # ← 运行期依赖
 ```
 
-> **为什么这里安全**：本工程 requirements 只有 5 个**轻量纯 Python 包**
-> （`fastapi` / `uvicorn` / `numpy` / `nibabel` / `openpyxl`），
-> **不含 torch**（由平台镜像提供）；`numpy` 系统已有会被跳过，
-> 因此不会动到镜像自带的 torch / numpy。
+> **为什么这里安全**：这些包**不含 torch**（由平台镜像提供；`numpy`/`scipy`
+> 等系统已有会被跳过），不会动到镜像自带的 torch —— 装出来的都是纯 Python 小包。
+>
+> **为什么是 glioma_track4 而不是 Glioma_recognition-main 的 requirements**：
+> 测评容器的启动命令跑的是 `glioma_track4/scripts/06_platform_serve.sh`，
+> 也就是 **glioma_track4 的代码**（`src.serving.app`）。只装提交工程那份 5 个包，
+> 容器会在 `import requests`（回调平台）或 `import SimpleITK`（重采样）上**直接崩**。
 
 **B. 用本工程的环境脚本（会自动识别并处理）**
 
@@ -550,7 +578,7 @@ bash scripts/00_setup_env.sh --mode system
 ```bash
 python3 -m venv --system-site-packages /2026aicompetition/workspace/common/venv
 source /2026aicompetition/workspace/common/venv/bin/activate
-pip install -r Glioma_recognition-main/requirements.txt
+pip install -r glioma_track4/requirements.txt
 
 # 以后再进容器，先激活：
 source /2026aicompetition/workspace/common/venv/bin/activate
@@ -558,11 +586,17 @@ source /2026aicompetition/workspace/common/venv/bin/activate
 
 > `--system-site-packages` 让 venv **复用镜像自带的 torch**，不必重装 2GB+；
 > venv 放在 `workspace` 下所以会持久保留。
+>
+> ⚠️ **venv 只对交互式训练/调试有效**：测评容器的启动命令是
+> `bash .../06_platform_serve.sh`，它内部调用的是**系统 `python3`**，
+> 不会自动进入 venv。想让测评容器用 venv，得把它的 bin 目录加进 PATH
+> 或直接写进启动命令（`source .../venv/bin/activate && bash 06_platform_serve.sh`）。
+> **最稳的做法**：依赖装进系统环境（方案 A / B），别让评测依赖一个可能被忘记激活的 venv。
 
-**验证装好了**：
+**验证装好了**（与 `06_platform_serve.sh` 的启动自检同一份清单，缺谁装谁）：
 
 ```bash
-python -c "import fastapi, uvicorn, nibabel, openpyxl; print('依赖 OK')"
+python -c "import fastapi, uvicorn, pydantic, requests, yaml, pandas, numpy, scipy, nibabel, SimpleITK, skimage, openpyxl; print('依赖 OK')"
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
 ```
 
@@ -596,6 +630,29 @@ cd goal1_authenticity && python train.py --limit 6 --epochs 2 --tag smoke
 [smoke] epoch 0 special=... | auc=...
 [train] 已保存 .../runs/smoke/checkpoints/best.pth（best=..., epoch=0）
 ```
+
+### 4.0.1 训练模态判别兜底模型（1 分钟，正式评测前必做）
+
+**为什么必须有**：官方训练集给了 `labels/3_serieslabel.xlsx`，**评测集不给任何标注**，
+序列目录名是 DICOM UID —— 按名字认模态的路径在评测期**完全失效**。认不出模态：
+训练侧直接崩「无任何可用序列」，推理侧更隐蔽 —— 要先知道"哪个序列是 T1C"才能
+把掩膜**写回它的空间**，认不出就写不回去，提交上去的掩膜空间是错的。
+
+仓库里已随代码带一份 `data/modality_model.json`（本地模拟集训练，~2KB，5 折 0.96），
+保证"开箱即通"；但它与官方数据存在**域差**，正式评测前请用官方训练集覆盖重训：
+
+```bash
+cd /2026aicompetition/workspace/dcs/glioma_track4
+python scripts/31_train_modality_model.py --root "$GLIOMA_DATASET_ROOT"   # 覆盖 data/modality_model.json
+#   只想看精度不写文件：加 --dry-run（打印 5 折准确率 + 混淆矩阵 + 特征权重）
+```
+
+判别依据是**物理量**不是黑盒：T2 的脑脊液亮（`bright_frac`）、FLAIR 的脑脊液被抑制
+（`dark_frac`）、T1CE 的增强灶。训练完可用 `scripts/25_verify_tasks_integration.py`
+第 ⑱ 段复核（用**训练未见过**的病例做行为级断言）。
+
+> ⚠️ 这个文件是 `/data/` 下**唯一**入库的文件（`.gitignore` 里 `!/data/modality_model.json`）。
+> 别用 `rm -rf data/` 清理产物 —— 会把兜底模型一起删掉（重新 clone 或重训可恢复）。
 
 ### 4.1 正式训练
 
@@ -763,6 +820,13 @@ python scripts/26_audit_plugin_completeness.py   # 结构 + API + 同源
 ```
 
 - [ ] 六个 Goal 训练完成，`runs/<tag>/checkpoints/best.pth` 都在
+- [ ] `data/modality_model.json` 已用官方训练集重训（见 4.0.1）且**随代码入库**
+      （`bash scripts/23_pre_submit_check.sh` ⑧ 段会检查；被 `.gitignore` 吞掉则评测期模态全判不出）
+- [ ] 容器内依赖自检通过：启动 `06_platform_serve.sh` 时打印「缺失依赖: 无 ✓」
+      （自检清单含 torch/numpy/scipy/nibabel/SimpleITK/skimage/pandas/yaml/requests/fastapi/uvicorn/pydantic/openpyxl）
+- [ ] Codeup 上推的是 **3 个自建工程**：`glioma_goals`（训练）/ `glioma_track4`（算法+启动脚本）
+      / `Glioma_recognition-main`（提交工程）；**组委会的参考实现 `AIRecongition` 不入库**
+      （无任何代码依赖它，只作协议约定来源；入库存放会增大 clone 体积且引起来源混淆）
 - [ ] `export_to_submission.sh` 输出「成功 6 个 / 缺失 0 个」
 - [ ] `checkpoint/<goal>/` 下权重文件齐全
 - [ ] `curl http://127.0.0.1:8000/health` 返回 200

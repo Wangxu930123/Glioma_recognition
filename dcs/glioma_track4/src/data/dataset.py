@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 from typing import Any
 
 import numpy as np
@@ -87,7 +88,97 @@ def zscore_volume(arr: np.ndarray, clip=(0.5, 99.5), foreground_only: bool = Tru
 # --------------------------------------------------------------------------- #
 # 病例 → 多通道体数据 + 目标
 # --------------------------------------------------------------------------- #
-def pick_series(case: dict, cfg: dict) -> dict[str, dict]:
+#: 统计模态判别模型的状态（``data/modality_model.json``）。
+#: **懒加载且只尝试一次**：常规路径（序列名带模态 / 有官方标注表）永远不会碰它，
+#: 因此对常规训练与推理零开销；评测集的 UID 目录名才会走到这里。
+_MODEL_STATE: dict[str, Any] = {"loaded": False, "model": None}
+
+#: 模型输出的官方模态 → 内部通道名（与 ``CHANNEL_ORDER`` 一致）
+_MODEL_TO_CHANNEL = {"T1CE": "t1c", "T1CE ": "t1c", "T2": "t2", "FLAIR": "flair"}
+
+
+def _modality_model():
+    if not _MODEL_STATE["loaded"]:
+        _MODEL_STATE["loaded"] = True
+        try:
+            from .modality_model import load_default_model
+            _MODEL_STATE["model"] = load_default_model()
+        except Exception:                                         # noqa: BLE001
+            _MODEL_STATE["model"] = None
+    return _MODEL_STATE["model"]
+
+
+def classify_unknown(case: dict, cfg: dict, log: list | None = None) -> dict[str, dict]:
+    """把"认不出模态"的序列交给统计模型判别 → ``{通道名: meta}``。
+
+    **为什么必须有这条路**：官方训练集给了 ``3_serieslabel.xlsx``，评测集不给；
+    评测集的序列目录名是 DICOM UID，任何关键词都命中不了。此时若不判模态：
+    训练侧表现为"无任何可用序列"直接崩，推理侧更隐蔽 ——
+    ``inference/pipeline.py`` 要先知道"哪个序列是 T1C"才能把掩码写回它的空间，
+    认不出就写不回去，提交上去的掩码空间是错的（评测端直接判错）。
+
+    依赖 ``case["unknown_series"]``（``data.probe`` 产出，已剔除能靠名字认出的序列）。
+    """
+    unknown = case.get("unknown_series") or []
+    if not unknown:
+        return {}
+    model = _modality_model()
+    if model is None:
+        if log is not None:
+            log.append(f"{case.get('accession')}: 有 {len(unknown)} 路序列模态未知，"
+                       f"但未找到 data/modality_model.json → 无法判别"
+                       f"（用 scripts/31_train_modality_model.py 训练）")
+        return {}
+
+    wanted = [ch["name"] for ch in cfg["channels"]]
+    probs: list[tuple[dict, dict[str, float]]] = []
+    for meta in unknown:
+        try:
+            _label, prob = model.predict_file(str(meta["path"]))
+        except Exception as exc:                                  # noqa: BLE001
+            if log is not None:
+                log.append(f"{case.get('accession')}: 模态判别失败 {meta.get('file')}（{exc}）")
+            continue
+        probs.append((meta, prob))
+    if not probs:
+        return {}
+
+    # **全局贪心的一对一指派**（而不是逐路"先到先得"）：
+    # 一路序列只能是一个模态，但"先到先得"在 argmax 撞车时会白丢一路 ——
+    # 真值 (T1CE,T2,FLAIR) 被判成 (FLAIR,T2,FLAIR) 时，第三路会被整个丢弃，
+    # 于是 t1c 通道空着，而它其实还能靠**次优**标签救回来。
+    # 把所有 (序列, 通道) 候选按概率降序逐个占用，即可拿到"尽量对齐"的指派。
+    cand: list[tuple[float, int, str]] = []
+    for si, (_meta, prob) in enumerate(probs):
+        for label, p in prob.items():
+            name = _MODEL_TO_CHANNEL.get(str(label).strip().upper())
+            if name in wanted:
+                cand.append((float(p), si, name))
+    cand.sort(reverse=True)
+
+    out: dict[str, dict] = {}
+    used_series: set[int] = set()
+    for p, si, name in cand:
+        # 置信度不足宁可不填：把 FLAIR 当成 T1C 会把水肿送进"增强核心区"通道，
+        # 比留一个空通道更有害（空通道至少是明确的"缺失"）。候选已降序 → 可直接停。
+        if p < 0.5:
+            break
+        if name in out or si in used_series:
+            continue
+        meta, _prob = probs[si]
+        out[name] = {**meta, "modality": name,
+                     "from_model": name, "model_confidence": round(p, 3)}
+        used_series.add(si)
+        if log is not None:
+            log.append(f"{case.get('accession')}: 模态判别 → {name}"
+                       f"（{os.path.basename(str(meta['path']))}，置信 {p:.2f}）")
+    if log is not None and not out:
+        log.append(f"{case.get('accession')}: {len(probs)} 路序列模态判别置信度均 <0.5 → "
+                   f"全部弃用（宁可缺通道，也不把模态填错）")
+    return out
+
+
+def pick_series(case: dict, cfg: dict, log: list | None = None) -> dict[str, dict]:
     """按 channels 定义（含 fallback）决定每个通道实际使用的序列。
 
     返回 ``{通道名: {"modality","path","series_uid"}}``；推理侧据此决定
@@ -101,6 +192,10 @@ def pick_series(case: dict, cfg: dict) -> dict[str, dict]:
                 meta["modality"] = cand
                 out[ch["name"]] = meta
                 break
+    # 名字全都对不上 → 用体素统计模型判（评测集 UID 目录名走这里）
+    if len(out) < len(cfg["channels"]):
+        for name, meta in classify_unknown(case, cfg, log).items():
+            out.setdefault(name, meta)
     return out
 
 
@@ -128,16 +223,19 @@ def build_case_volume(case: dict, cfg: dict, log: list | None = None
     - ``abn`` ：非肿瘤性病变（脑梗死等）的异常信号（检测负样本的弱标签）。
     """
     ch_defs = cfg["channels"]
-    picked = pick_series(case, cfg)
+    picked = pick_series(case, cfg, log)
     if not picked:
         # 报出"清单里到底有哪些序列键"：键全为 other/空，说明模态没认出来
         # （官方数据靠数据根下的 SeriesType.xlsx），而不是这张检查真的没影像。
         imgs = case.get("images") or {}
         raise RuntimeError(
             f"病例 {case['accession']} 无任何可用序列"
-            f"（清单里的序列键={sorted(imgs)[:8]}）。"
-            f"若键是 other/空，说明模态未识别：确认数据根下有 SeriesType.xlsx"
-            f"（见 docs/DATASET_ROOT_TROUBLESHOOT.md）"
+            f"（清单里的序列键={sorted(imgs)[:8]}；"
+            f"未知序列 {len(case.get('unknown_series') or [])} 路）。"
+            f"若键是 other/空，说明模态未识别：先确认数据根下有 SeriesType.xlsx / "
+            f"labels/3_serieslabel.xlsx（见 docs/DATASET_ROOT_TROUBLESHOOT.md）；"
+            f"评测集没有标注表，需用 scripts/31_train_modality_model.py 训练"
+            f"data/modality_model.json 走体素判别兜底"
         )
 
     # 参考序列优先级：t1c → flair → t2 → t1 → 其它（决定公共网格方向与原点）
@@ -620,10 +718,24 @@ class GliomaDataset(Dataset):
                 labels[fi] = 1.0 if int(val) else 0.0
             else:
                 classes = [str(c) for c in f["classes"]]
-                if str(val) in classes:
-                    labels[fi] = classes.index(str(val))
+                text = str(val)
+                if text in classes:
+                    labels[fi] = classes.index(text)
                 else:
-                    continue
+                    # 官方 `5_characteristics.xlsx` 的 ``Location`` 是**多标签**
+                    # （``|`` 分隔，如 ``LeftTemporal|LeftFrontal``），而比赛枚举是单值。
+                    # 旧实现直接 ``continue``：这些样本的该字段被**静默 mask 掉**，
+                    # Location 头实际拿不到任何监督（且不报错）。
+                    # 这里取**第一个能匹配上的标签**——保留监督且确定。
+                    tokens = [t.strip() for t in re.split(r"[|,;/、]", text) if t.strip()]
+                    hit = next((t for t in tokens if t in classes), None)
+                    if hit is None:
+                        lower = {c.lower(): c for c in classes}
+                        hit = next((lower[t.lower()] for t in tokens
+                                    if t.lower() in lower), None)
+                    if hit is None:
+                        continue
+                    labels[fi] = classes.index(hit)
             lmask[fi] = 1.0
         return {"image": torch.from_numpy(np.ascontiguousarray(v)),
                 "target": torch.from_numpy(np.ascontiguousarray(t)),

@@ -109,9 +109,23 @@ def read_series_types(root: Path) -> dict[tuple[str, str], str]:
     """
     global _WARNED_NO_OPENPYXL
 
+    # ---- ① 官方 `3_serieslabel.xlsx`（权威来源，列 `SeriesLabel`）----
+    # 官方数据的模态**只能**从这里得到；`SeriesType.xlsx` 是我们早期按团队 README
+    # 猜的名字，官方数据集里并没有它。
+    from shared.official_labels import find_official_labels, read_series_labels
+
+    out: dict[tuple[str, str], str] = {}
+    series_file = find_official_labels(root).get("series")
+    if series_file:
+        for (acc, uid), value in read_series_labels(series_file).items():
+            out[(_norm_key(acc), _norm_key(uid))] = value
+        print(f"[data] 已读官方序列类型 {Path(series_file).name}：{len(out)} 条",
+              flush=True)
+
+    # ---- ② `SeriesType.xlsx`（兼容旧命名；不存在就跳过，**不能提前 return**）----
     path = Path(root) / "SeriesType.xlsx"
     if not path.is_file():
-        return {}
+        return out
     try:
         from openpyxl import load_workbook
     except ImportError:                                           # pragma: no cover
@@ -128,7 +142,7 @@ def read_series_types(root: Path) -> dict[tuple[str, str], str]:
         "typ": ("seriestype", "type", "序列类型", "模态", "序列描述"),
     }
     workbook = load_workbook(path, read_only=True, data_only=True)
-    out: dict[tuple[str, str], str] = {}
+    seen_here: dict[tuple[str, str], str] = {}                     # 仅用于本文件内冲突检测
     try:
         for sheet in workbook.worksheets:
             rows = list(sheet.iter_rows(values_only=True))
@@ -154,11 +168,12 @@ def read_series_types(root: Path) -> dict[tuple[str, str], str]:
                 value = str(typ).strip()
                 if not value:
                     continue
-                if key in out and out[key] != value:
+                if key in seen_here and seen_here[key] != value:
                     raise ValueError(
                         f"SeriesType.xlsx 冲突：检查号={acc!r} 序列={uid!r} "
-                        f"同时映射到 {out[key]!r} 与 {value!r}（{path}）")
-                out[key] = value
+                        f"同时映射到 {seen_here[key]!r} 与 {value!r}（{path}）")
+                seen_here[key] = value
+                out.setdefault(key, value)                        # 官方表优先，这里只补缺
     finally:
         workbook.close()
     return out
@@ -229,59 +244,196 @@ def _mask_role(filename: str, desc: str) -> str | None:
 # --------------------------------------------------------------------------- #
 # 病例发现
 # --------------------------------------------------------------------------- #
+#: 官方数据里"异常影像"的子目录名（天坛参考实现 ``paths.py``）：
+#: ``<根>/fake/``、``<根>/compositing/``、``<根>/duplicate/``，与主目录**同构**。
+#: 绝不能被当成检查号（否则会出现三个名叫 fake/compositing/duplicate 的"病例"），
+#: 但它们的影像**正是目标一/二的正样本**，必须作为带标记的病例并入。
+SPECIAL_SOURCE_DIRS = ("fake", "compositing", "composition", "duplicate")
+
+#: 允许自动下钻的中间层：``annotation``（影像/标注表所在层）+ 平台阶段名。
+_DESCEND_DIRS = frozenset({"annotation"}) | _PLATFORM_PHASES
+#: 顶层非病例目录：本层出现其中任何一个，说明"还没到病例层"
+_NON_CASE_DIRS = (frozenset({"annotation", "cache", "runs", "folds", "labels",
+                             "logs", "checkpoints", "weights"})
+                  | frozenset(SPECIAL_SOURCE_DIRS))
+
+
+def resolve_case_root(root):
+    """把"填高了一层"的数据根下钻到真正含病例目录的那一层。
+
+    平台实测结论见 ``glioma_track4/docs/CLOUD_DESKTOP_RUNBOOK.md`` §3.2：
+    ``/2026aicompetition/datasets/training`` 下**只有** ``annotation/``，
+    影像与 ``SeriesType.xlsx`` 都在 ``training/annotation/``。
+
+    填高一层不报错、只静默扫到 0 例（训练照常启动、损失照常不动）。
+    规则与提交工程 ``data/loader.py::_resolve_dataset_root`` 一致：
+    仅当"下一层唯一候选"时下钻并告警，候选多于一个时交给
+    :func:`assert_case_root` 报错。
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return root
+    if any(p.is_dir() and p.name.lower() not in _NON_CASE_DIRS for p in root.iterdir()):
+        return root                                       # 本层已经有病例目录
+    children = sorted(p for p in root.iterdir() if p.is_dir())
+    cands = [p for p in children if p.name.casefold() in _DESCEND_DIRS]
+    if len(cands) == 1:
+        print(f"[data][告警] 数据根 {root} 下没有病例目录，已自动下钻到 "
+              f"{cands[0].name}/（若不对请用 --data / GLIOMA_DATASET_ROOT 指定）",
+              flush=True)
+        return cands[0]
+    return root
+
+
+def _official_context(root: Path) -> dict:
+    """一次性读取官方 5 张标注表（缺失的键为默认空值）。
+
+    这是研发侧**唯一权威**的标签来源：模态、掩膜、结构化字段、异常标记
+    全都来自它，而不是 ``label.json``、目录名关键词或中文列名——
+    官方数据里那些都不存在，于是 special 标签恒为 0、字段全空，
+    训练照常跑完却什么都没学到（最难发现的一类失效）。
+    """
+    from shared.official_labels import (find_official_labels, read_abnormal_labels,
+                                        read_characteristics, read_duplicate_pairs,
+                                        read_mask_labels)
+
+    files = find_official_labels(root)
+    if files:
+        print("[data] 官方标注表：" + ", ".join(
+            f"{k}={Path(v).name}" for k, v in files.items()), flush=True)
+    mask_by_acc: dict[str, dict[str, list[str]]] = {}
+    if files.get("mask"):
+        for (acc, uid), names in read_mask_labels(files["mask"]).items():
+            slot = mask_by_acc.setdefault(_norm_key(acc), {})
+            slot[_norm_key(uid)] = names
+    abnormal: dict[tuple[str, str], str] = {}
+    if files.get("abnormal"):
+        abnormal = {(_norm_key(a), _norm_key(u)): v
+                    for (a, u), v in read_abnormal_labels(files["abnormal"]).items()}
+    labels: dict[str, dict] = {}
+    if files.get("characteristics"):
+        labels = read_characteristics(files["characteristics"])
+    pairs: list[tuple[str, str]] = []
+    if files.get("duplicate"):
+        pairs = read_duplicate_pairs(files["duplicate"])
+    return {"files": files, "masks": mask_by_acc, "abnormal": abnormal,
+            "labels": labels, "pairs": pairs}
+
+
 def discover_cases(dataset_root: Path, limit: int | None = None) -> list[dict]:
     """扫描 ``<root>/<AccessionNumber>/<SeriesUid>/*.nii[.gz]``。
 
-    返回 ``[{"accession", "dir", "series": [{"path","uid","desc"}], "masks"}, ...]``。
-    只做轻量发现（不读体素），真正的读取延迟到 ``load_case``。
+    返回的每个 case 除 ``accession``/``dir``/``series`` 外，还可能带：
 
-    ``desc`` 是该序列的**类型描述**（类型表 → sidecar → 目录名），
-    ``masks`` 是从类型表/sidecar 解析出的掩膜（按角色分组）。
-    官方数据的序列目录名是 UID，**没有这两项就完全无法区分模态与掩膜**。
+    - ``series[].desc``：序列类型描述（官方 `3_serieslabel.xlsx` → sidecar → 目录名）
+    - ``masks``：按角色分组的掩膜（官方 `4_masklabel.xlsx` 的 Maskname 或名称启发）
+    - ``labels``：结构化字段（官方 `5_characteristics.xlsx`，已是规范字段名）
+    - ``special``：``{fake, stitched, duplicate}``（官方 `1_abnormal.xlsx`）
+    - ``source``：``true`` / ``fake`` / ``compositing`` / ``duplicate``（影像所在子目录）
+
+    只做轻量发现（不读体素），真正的读取延迟到 ``load_case``。
     """
-    root = Path(dataset_root)
+    root = resolve_case_root(Path(dataset_root))   # 填高一层（如 .../training）时自动下钻
     assert_case_root(root)
     series_types = read_series_types(root)
+    ctx = _official_context(root)
     cases: list[dict] = []
-    for acc_dir in sorted(p for p in root.iterdir() if p.is_dir()):
-        if acc_dir.name.lower() in ("annotation", "cache", "runs"):
-            continue
+
+    def _collect(acc_dir: Path, source: str) -> dict | None:
+        """扫一个病例目录 → case dict（无可用序列时返回 None）。"""
         series: list[dict] = []
         masks: dict[str, list[str]] = {}
+        acc_key = _norm_key(acc_dir.name)
+        table_masks = ctx["masks"].get(acc_key, {})
         for f in sorted(acc_dir.rglob("*")):
-            if not f.is_file():
-                continue
-            if not f.name.lower().endswith(NIFTI_SUFFIXES):
+            if not f.is_file() or not f.name.lower().endswith(NIFTI_SUFFIXES):
                 continue
             uid = f.parent.name
             desc = _series_desc(f, acc_dir.name, uid, series_types)
+            # 官方掩膜表：文件名任意（core.nii.gz…），关键词认不出，必须查表
+            if f.name in (table_masks.get(_norm_key(uid)) or []):
+                role = _mask_role(f.name, desc) or "core"
+                masks.setdefault(role, []).append(str(f))
+                continue
             role = _mask_role(f.name, desc)
             if role:
                 masks.setdefault(role, []).append(str(f))
                 continue
             if any(h in f.name.lower() for h in MASK_HINTS):
-                continue                                          # 名称启发式：仍按掩膜排除
+                continue
             series.append({"path": str(f), "uid": uid, "desc": desc})
-        if series:
-            case = {"accession": acc_dir.name, "dir": str(acc_dir), "series": series}
-            if masks:
-                case["masks"] = masks
+        if not series:
+            return None
+        case = {"accession": acc_dir.name, "dir": str(acc_dir),
+                "series": series, "source": source}
+        if masks:
+            case["masks"] = masks
+        rec = ctx["labels"].get(acc_dir.name) or ctx["labels"].get(acc_key)
+        if rec:
+            case["labels"] = dict(rec)
+        return case
+
+    def _special_of(case: dict) -> dict[str, float]:
+        """由官方 `1_abnormal.xlsx` 汇总出该病例的特殊影像标记（逐序列 → 取最大）。"""
+        from shared.official_labels import special_flags
+
+        flags = {"fake": 0.0, "stitched": 0.0, "duplicate": 0.0}
+        for s in case["series"]:
+            label = ctx["abnormal"].get((_norm_key(case["accession"]), _norm_key(s["uid"])))
+            if label:
+                for k, v in special_flags(label).items():
+                    flags[k] = max(flags[k], v)
+        if case.get("source") == "fake":
+            flags["fake"] = 1.0
+        elif case.get("source") in ("compositing", "composition"):
+            flags["stitched"] = 1.0
+        elif case.get("source") == "duplicate":
+            flags["duplicate"] = 1.0
+        return flags
+
+    # ---- 正常影像（主目录一级子目录 = 检查号）----
+    for acc_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        low = acc_dir.name.lower()
+        if low in ("annotation", "cache", "runs") or low in SPECIAL_SOURCE_DIRS:
+            continue
+        case = _collect(acc_dir, "true")
+        if case:
+            case["special"] = _special_of(case)
             cases.append(case)
         if limit and len(cases) >= limit:
             break
 
+    # ---- 异常影像（fake / compositing / duplicate）：与主目录同构，逐例并入 ----
+    # 它们是目标一（真实性）与目标二-A（拼接）**唯一的正样本来源**，
+    # 漏掉这一段的后果是这两个头永远学不到东西（而且不报错）。
+    for src in SPECIAL_SOURCE_DIRS:
+        src_dir = root / src
+        if not src_dir.is_dir():
+            continue
+        added = 0
+        for acc_dir in sorted(p for p in src_dir.iterdir() if p.is_dir()):
+            case = _collect(acc_dir, src)
+            if case:
+                case["special"] = _special_of(case)
+                cases.append(case)
+                added += 1
+            if limit and len(cases) >= limit:
+                break
+        if added:
+            print(f"[data] 已并入 {src}/ 下 {added} 例异常影像"
+                  f"（目标一/二-A 的正样本来源）", flush=True)
+
     # 前置预警：一条序列都认不出模态时，训练会在 DataLoader worker 里抛
     # 「无任何可用序列」——堆栈落在 torch 的取数内部，看不出根因。
-    # 这里在**发现阶段**就把原因和办法说清楚（抽查前若干例，几乎不会误报）。
     if cases and not any(
         guess_modality(s.get("desc") or s.get("uid") or "")
         for c in cases[:50] for s in c.get("series") or []
     ):
-        print("[data] ⚠️ 没有任何序列能识别出模态：数据根下没有 SeriesType.xlsx，"
-              "且目录名/文件名都不含模态关键词。\n"
+        print("[data] ⚠️ 没有任何序列能识别出模态：数据根下没有官方 "
+              "3_serieslabel.xlsx，且目录名/文件名都不含模态关键词。\n"
               "       继续训练会在取数时报「无任何可用序列」。\n"
-              "       处理：把数据根定到与 SeriesType.xlsx 同级的那一层"
-              "（见 docs/DATASET_ROOT_TROUBLESHOOT.md）", flush=True)
+              "       处理：把官方 labels/ 放到 <工程>/labels/ 或设 GLIOMA_LABELS_DIR",
+              flush=True)
     return cases
 
 

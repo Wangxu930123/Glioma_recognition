@@ -62,8 +62,10 @@ class AuthenticityDataset(BaseCaseDataset):
         """检查级二分类标签：假人体/非人体 = 1。
 
         标签来源（按优先级）：
-        1. 病历目录下的 ``label.json``（``{"fake": 1}`` / ``{"not_human": 1}``）；
-        2. 目录名包含 ``fake`` / ``fakehuman`` / ``not_human``。
+        1. **官方 ``1_abnormal.xlsx`` 的 ``Label``**（``discover_cases`` 已汇总进
+           ``case["special"]["fake"]``）—— 官方数据下这是唯一正确的来源；
+        2. 病历目录下的 ``label.json``（``{"fake": 1}`` / ``{"not_human": 1}``）；
+        3. 目录名包含 ``fake`` / ``fakehuman`` / ``not_human``。
 
         **为什么不用"有无掩码"当标签**：真实病例也可能没有掩码（未标注），
         用掩码判断会把"未标注的正常病例"误当作正样本。
@@ -71,13 +73,16 @@ class AuthenticityDataset(BaseCaseDataset):
         import json as _json
         from pathlib import Path as _P
 
-        y = 0.0
-        lj = _P(case["dir"]) / "label.json"
-        if lj.is_file():
-            d = _json.loads(lj.read_text(encoding="utf-8"))
-            y = float(int(d.get("fake", d.get("not_human", 0))))
+        special = case.get("special") or {}
+        if "fake" in special:
+            y = float(special["fake"])
         else:
-            name = case["accession"].lower()
-            y = 1.0 if any(k in name for k in ("fake", "nothuman", "not_human")) else 0.0
+            lj = _P(case["dir"]) / "label.json"
+            if lj.is_file():
+                d = _json.loads(lj.read_text(encoding="utf-8"))
+                y = float(int(d.get("fake", d.get("not_human", 0))))
+            else:
+                name = case["accession"].lower()
+                y = 1.0 if any(k in name for k in ("fake", "nothuman", "not_human")) else 0.0
         return {"special_target": np.array([y], np.float32),
                 "special_mask": np.ones(1, np.float32)}

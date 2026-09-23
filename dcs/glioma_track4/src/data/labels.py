@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
 from typing import Any
 
 # ---- 位置：中文 → 英文枚举（规范 15 类）----
@@ -181,6 +182,184 @@ def _find_id_column(header) -> str | None:
             if kw in key_lower:
                 return key
     return None
+
+
+# --------------------------------------------------------------------------- #
+# 官方标注表（天坛医院参考实现 `AIRecongition/` 的约定）
+# --------------------------------------------------------------------------- #
+#: 官方标注表文件名 → 用途
+#:
+#: | 文件 | 关键列 | 用途 |
+#: |---|---|---|
+#: | ``1_abnormal.xlsx`` | AccessionNumber, SeriesUid, **Label** ∈ {true,fake,compositing,duplicate} | 目标一/二的正样本（**逐序列**） |
+#: | ``2_duplicate.xlsx`` | src_img, desc_img | 重复影像 pair |
+#: | ``3_serieslabel.xlsx`` | AccessionNumber, SeriesUid, **SeriesLabel** ∈ {T1CE,T2,FLAIR} | **模态的唯一来源** |
+#: | ``4_masklabel.xlsx`` | AccessionNumber, SeriesUid, **Maskname** | 掩膜文件名（任意名，关键词认不出） |
+#: | ``5_characteristics.xlsx`` | AccessionNumber + 14 个英文列 | 结构化字段金标准 |
+#:
+#: 这套约定是**唯一权威**。在此之前我们按 ``SeriesType.xlsx`` / 中文列名去猜，
+#: 于是出现"病例数正常、一例都挑不出模态""字段金标准为空"——
+#: 表一直都在，只是文件名和列名都不是我们猜的那套。
+OFFICIAL_LABEL_FILES = {
+    "abnormal": "1_abnormal.xlsx",
+    "duplicate": "2_duplicate.xlsx",
+    "series": "3_serieslabel.xlsx",
+    "mask": "4_masklabel.xlsx",
+    "characteristics": "5_characteristics.xlsx",
+}
+
+#: 官方标注表所在目录的环境变量（对应官方 config 的 ``paths.labels_dir``）
+LABELS_DIR_ENV = "GLIOMA_LABELS_DIR"
+
+
+def find_official_labels(root: str | os.PathLike,
+                         labels_dir: str | os.PathLike | None = None) -> dict[str, str]:
+    """定位官方 5 张标注表 → ``{用途: 路径}``（找不到的键不出现）。
+
+    搜索顺序（逐个候选目录试，命中即止）：
+
+    1. 显式传入的 ``labels_dir``（对应官方 config 的 ``paths.labels_dir``）
+    2. 环境变量 ``GLIOMA_LABELS_DIR``
+    3. **本工程目录下的 ``labels/``**（官方默认 ``./labels``）
+    4. 数据根自身、父目录、祖父目录（平台有时把标注放在数据旁边）
+
+    官方把标注放在**工程目录**而不是数据集里 —— 这也是"数据根下找不到金标准"的原因之一。
+    """
+    cands: list[Path] = []
+    if labels_dir:
+        cands.append(Path(labels_dir).expanduser())
+    if os.environ.get(LABELS_DIR_ENV):
+        cands.append(Path(os.environ[LABELS_DIR_ENV]).expanduser())
+    cands.append(Path(__file__).resolve().parents[2] / "labels")      # <工程>/labels
+    base = Path(str(root)).expanduser()
+    try:
+        base = base.resolve()
+    except OSError:
+        base = base.absolute()
+    cands.extend([base, base.parent, base.parent.parent])
+
+    found: dict[str, str] = {}
+    for kind, name in OFFICIAL_LABEL_FILES.items():
+        for folder in cands:
+            candidate = folder / name
+            if candidate.is_file():
+                found[kind] = str(candidate)
+                break
+    return found
+
+
+def _find_col_in_list(header: list[str], keywords: tuple[str, ...]) -> int | None:
+    """在表头列表里找列，返回**列号**：精确 → 前缀 → 包含（按关键词顺序）。"""
+    lower = {str(c).strip().lower(): i for i, c in enumerate(header) if str(c).strip()}
+    for kw in keywords:                                            # ① 精确
+        if kw in lower:
+            return lower[kw]
+    for kw in keywords:                                            # ② 前缀
+        for low, idx in lower.items():
+            if low.startswith(kw):
+                return idx
+    for kw in keywords:                                            # ③ 包含
+        for low, idx in lower.items():
+            if kw in low:
+                return idx
+    return None
+
+
+def read_official_triples(path: str,
+                          id_kws: tuple[str, ...] = ("accessionnumber", "accession", "检查号"),
+                          uid_kws: tuple[str, ...] = ("seriesuid", "series_uid", "序列号"),
+                          value_kws: tuple[str, ...] = ("label",),
+                          ) -> dict[tuple[str, str], list[str]]:
+    """读官方"检查号 + 序列号 + 取值"三类表 → ``{(检查号, 序列号): [取值, ...]}``。
+
+    ``1_abnormal`` / ``3_serieslabel`` / ``4_masklabel`` 都是这个形状
+    （掩膜表同一序列可能有多行 → 取值列表）。取值保持原样大小写，
+    调用方按需 ``.upper()`` / ``.lower()`` 比较。
+    """
+    out: dict[tuple[str, str], list[str]] = {}
+    for rows in _sheet_rows(path):
+        head = _detect_header(rows)
+        if head is None:
+            continue
+        header = [str(c).strip() for c in rows[head]]
+        i_id = _find_col_in_list(header, id_kws)
+        i_uid = _find_col_in_list(header, uid_kws)
+        i_val = _find_col_in_list(header, value_kws)
+        if i_id is None or i_uid is None or i_val is None:
+            continue
+        for row in rows[head + 1:]:
+            def _cell(idx: int) -> str:
+                return str(row[idx]).strip() if idx < len(row) else ""
+            acc, uid, value = _cell(i_id), _cell(i_uid), _cell(i_val)
+            if not acc or not uid or not value:
+                continue
+            for key in {(acc, uid), (acc.casefold(), uid.casefold())}:
+                bucket = out.setdefault(key, [])
+                if value not in bucket:
+                    bucket.append(value)
+    return out
+
+
+def read_serieslabel_table(path: str) -> dict[tuple[str, str], str]:
+    """读 ``3_serieslabel.xlsx`` → ``{(检查号, 序列号): SeriesLabel}``（模态）。"""
+    triples = read_official_triples(
+        path,
+        value_kws=("serieslabel", "series_label", "seriestype", "序列类型", "模态", "序列标签"),
+    )
+    return {k: v[0] for k, v in triples.items() if v}
+
+
+def read_mask_table(path: str) -> dict[tuple[str, str], list[str]]:
+    """读 ``4_masklabel.xlsx`` → ``{(检查号, 序列号): [Maskname, ...]}``。"""
+    return read_official_triples(
+        path,
+        value_kws=("maskname", "mask_name", "mask", "掩膜", "标注文件"),
+    )
+
+
+def read_duplicate_pairs(path: str) -> list[tuple[str, str]]:
+    """读 ``2_duplicate.xlsx`` → ``[(src_img, desc_img), ...]``（重复影像正对）。
+
+    官方把重复金标准放在**标注表**里（两列检查号），而不是 ``duplicate/`` 目录下的
+    csv —— 只扫目录会得到 0 对，重复任务就没有正样本。
+    """
+    pairs: list[tuple[str, str]] = []
+    src_kws = ("src_img", "src", "image1", "检查号1", "studyuid")
+    dst_kws = ("desc_img", "desc", "image2", "检查号2", "studyuid_dup")
+    for rows in _sheet_rows(path):
+        # ⚠️ 不能复用通用表头识别：它要求"检查号列"，而这张表只有 src/desc 两列，
+        # 于是永远返回 None → 重复金标准恒为 0 对（不报错）。
+        head = None
+        for idx, row in enumerate(rows[:20]):
+            header = [str(c).strip() for c in row]
+            if (_find_col_in_list(header, src_kws) is not None
+                    and _find_col_in_list(header, dst_kws) is not None):
+                head = idx
+                break
+        if head is None:
+            continue
+        header = [str(c).strip() for c in rows[head]]
+        i_src = _find_col_in_list(header, src_kws)
+        i_dst = _find_col_in_list(header, dst_kws)
+        if i_src is None or i_dst is None or i_src == i_dst:
+            continue
+        for row in rows[head + 1:]:
+            src = str(row[i_src]).strip() if i_src < len(row) else ""
+            dst = str(row[i_dst]).strip() if i_dst < len(row) else ""
+            if src and dst:
+                pairs.append((src, dst))
+    return pairs
+
+
+def read_abnormal_table(path: str) -> dict[tuple[str, str], str]:
+    """读 ``1_abnormal.xlsx`` → ``{(检查号, 序列号): Label}``。
+
+    ``Label ∈ {true, fake, compositing, duplicate}``：它同时告诉我们两件事 ——
+    这条序列是不是异常影像，以及它的影像在哪个子目录下
+    （``true`` → 数据根；``fake``/``compositing``/``duplicate`` → 同名子目录）。
+    """
+    triples = read_official_triples(path, value_kws=("label", "标签"))
+    return {k: v[0].lower() for k, v in triples.items() if v}
 
 
 def _sheet_rows(path: str) -> list[list[list[str]]]:
@@ -396,8 +575,74 @@ def _find_col(row: dict, keywords: list[str], exclude: list[str] | None = None) 
     return None
 
 
+#: 官方 ``5_characteristics.xlsx`` 的列名 → 我们的规范字段
+#: （值域见天坛参考实现 ``src/tasks/characteristics/schema.py``）
+OFFICIAL_FIELD_COLUMNS = {
+    "Glioma": "TumorProbability",            # No / Yes
+    "WHO_grade": "WHO_Grade",                # 1/2/3/4
+    "Enhancement": "Enhancement",            # false / true
+    "EnhancementPattern": "EnhancementPattern",
+    "Necrosis": "Necrosis",
+    "CysticChange": "CysticChange",
+    "Hemorrhage": "Hemorrhage",
+    "Calcification": "Calcification",
+    "Margin": "Margin",                      # Unclear / Clear
+    "Lobulation": "Lobulation",
+    "Morphology": "Morphology",              # Regular / Irregular
+    "Signal_T2WI": "Signal_T2WI",            # Low / Iso / High
+    "Signal_FLAIR": "Signal_FLAIR",
+    "Location": "Location",                  # 多标签，`|` 分隔
+}
+
+#: 官方列里属于**二分类**的（存成 0/1，与 team 侧 FIELD_ENUMS 一致）
+OFFICIAL_BINARY_COLUMNS = {"Glioma", "Enhancement", "Necrosis", "CysticChange",
+                           "Hemorrhage", "Calcification", "Margin", "Lobulation"}
+
+
+def _official_columns_to_fields(row: dict) -> dict[str, Any]:
+    """按**官方英文列名**直接映射（权威路径，不猜中文关键词）。
+
+    官方 ``5_characteristics.xlsx`` 的 14 列是
+    ``Glioma / WHO_grade / Enhancement / EnhancementPattern / Necrosis /
+    CysticChange / Hemorrhage / Calcification / Margin / Lobulation /
+    Morphology / Signal_T2WI / Signal_FLAIR / Location``，
+    与模拟集的中文列名是两套东西。之前只写中文关键词，官方表自然一条也映射不出来。
+    """
+    lower = {str(k).strip().lower(): k for k in row}
+    out: dict[str, Any] = {}
+    for column, field in OFFICIAL_FIELD_COLUMNS.items():
+        key = lower.get(column.lower())
+        if key is None:
+            continue
+        raw = row.get(key)
+        text = "" if raw is None else str(raw).strip()
+        if text == "" or text.lower() in ("nan", "none", "na/unk"):
+            continue
+        low = text.lower()
+        if column in OFFICIAL_BINARY_COLUMNS:
+            # 兼容三种写法：No/Yes、false/true、0/1；Margin 的 Clear=1
+            if low in ("yes", "true", "1", "clear"):
+                out[field] = 1
+            elif low in ("no", "false", "0", "unclear"):
+                out[field] = 0
+            continue
+        if column == "WHO_grade":
+            out[field] = text.replace(".0", "")                   # Excel 常读成 3.0
+            continue
+        out[field] = text                                          # 枚举/多标签：原样保留
+    return out
+
+
 def structured_from_row(row: dict) -> dict:
-    """金标准一行 → 规范字段（缺失字段不出现在结果里 → 训练时自动 mask 掉）。"""
+    """金标准一行 → 规范字段（缺失字段不出现在结果里 → 训练时自动 mask 掉）。
+
+    **官方英文列名优先**：命中 ``5_characteristics.xlsx`` 的列就直接返回，
+    避免再过一遍中文关键词（两套命名混在一起只会互相干扰）。
+    """
+    official = _official_columns_to_fields(row)
+    if official:
+        return official
+
     out: dict[str, Any] = {}
 
     patho = row.get(_find_col(row, ["病理结果", "pathology", "病理"]) or "", "")
@@ -474,21 +719,38 @@ _WARNED_SERIES_TYPE_DEP = False
 
 
 def read_series_types(root: str | os.PathLike) -> dict[tuple[str, str], str]:
-    """读官方 ``SeriesType.xlsx``：``(检查号, 序列号) → 序列类型``。
+    """读序列类型：``(检查号, 序列号) → 序列类型``（模态的唯一可靠来源）。
 
-    ⚠️ **官方数据下这是模态的唯一来源**。序列目录名是 DICOM UID
-    （``1.2.826.0.1...``），靠"按名字猜关键词"一个都命中不了：探针会把整批
-    序列归到 ``other``，训练侧则直接报 ``无任何可用序列``——而病例数、目录结构
-    看起来完全正常，极易被误判成数据损坏或路径写错。
+    ⚠️ 官方数据的序列目录名是 DICOM UID / 哈希，靠"按名字猜关键词"一个都命中不了：
+    探针会把整批序列归到 ``other``，训练侧直接报 ``无任何可用序列`` ——
+    而病例数、目录结构看起来完全正常，极易被误判成数据损坏或路径写错。
 
-    与提交工程 ``data/metadata.py`` 同一语义：表头别名容错、缺文件返回空表
-    （不是错误）、同一键冲突取值**直接失败**。解析器优先 openpyxl，退化到 pandas。
+    两个来源都读，**官方优先**：
+
+    1. **``3_serieslabel.xlsx``**（官方 ``labels/`` 下的权威来源，列 ``SeriesLabel``
+       ∈ {T1CE, T2, FLAIR}）—— 见天坛参考实现 ``AIRecongition/``
+    2. ``SeriesType.xlsx``（团队 README 里提到的名字，官方数据里通常并没有）
+
+    缺文件不是错误；同一文件内同键冲突取值**直接失败**（规范 §21）。
     """
     global _WARNED_SERIES_TYPE_DEP
 
+    out: dict[tuple[str, str], str] = {}
+
+    # ---- ① 官方 3_serieslabel.xlsx（权威来源）----
+    series_file = find_official_labels(root).get("series")
+    if series_file:
+        for (acc, uid), value in read_serieslabel_table(series_file).items():
+            # 查表方统一用 _norm_key（去空白 + 大小写无关），这里也要归一化后再存，
+            # 否则"表里大写、目录里小写"会静默查不到
+            out[(_norm_key(acc), _norm_key(uid))] = value
+        print(f"[labels] 已读官方序列类型 {os.path.basename(series_file)}："
+              f"{len(out)} 条", flush=True)
+
+    # ---- ② SeriesType.xlsx（兼容旧命名；不存在就跳过，**不能提前 return**）----
     path = os.path.join(str(root), "SeriesType.xlsx")
     if not os.path.isfile(path):
-        return {}
+        return out
 
     rows: list[list] = []
     try:
@@ -510,14 +772,14 @@ def read_series_types(root: str | os.PathLike) -> dict[tuple[str, str], str]:
                 print(f"[probe][告警] 发现 {path} 但既没有 openpyxl 也没有 pandas，"
                       f"序列类型读不到 → UID 命名的序列会全部归到 other。"
                       f"请 pip install openpyxl（{exc}）", flush=True)
-            return {}
+            return out
 
     aliases = {
         "acc": ("accessionnumber", "accession", "检查号", "检查编号", "病例号"),
         "uid": ("seriesinstanceuid", "seriesuid", "序列号", "序列uid"),
         "typ": ("seriestype", "type", "序列类型", "模态", "序列描述"),
     }
-    out: dict[tuple[str, str], str] = {}
+    seen_here: dict[tuple[str, str], str] = {}                     # 只用于检测本文件内的冲突
     idx: dict[str, int] = {}
     for row in rows:
         header = [_norm_key(c) for c in row]
@@ -541,11 +803,12 @@ def read_series_types(root: str | os.PathLike) -> dict[tuple[str, str], str]:
         value = str(typ).strip()
         if not value:
             continue
-        if key in out and out[key] != value:
+        if key in seen_here and seen_here[key] != value:
             raise ValueError(
                 f"SeriesType.xlsx 冲突：检查号={acc!r} 序列={uid!r} "
-                f"同时映射到 {out[key]!r} 与 {value!r}（{path}）")
-        out[key] = value
+                f"同时映射到 {seen_here[key]!r} 与 {value!r}（{path}）")
+        seen_here[key] = value
+        out.setdefault(key, value)                                # 官方表优先，这里只补缺
     return out
 
 

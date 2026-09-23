@@ -1,5 +1,19 @@
+# 提交工程（Glioma_recognition-main）自身运行所需的**轻量**依赖。
+#
+# ⚠️ 不在这里声明 torch：它必须来自**基础镜像**（平台基础镜像
+#    pytorch:*-cuda*-runtime 自带 CUDA 版）。若写进来，在非 CUDA 基础镜像上
+#    会拉一份 CPU 版 torch（2GB+）覆盖掉 CUDA 版 —— 服务起得来但推理慢几十倍。
+#    Dockerfile 里有构建期断言（import torch）做 fail-fast 检查。
+#
+# ⚠️ 本文件**不等于**评测期依赖全集：测评容器的启动命令跑的是
+#    `glioma_track4/scripts/06_platform_serve.sh`（即 glioma_track4 的代码），
+#    它还需要 requests / pyyaml / pandas / scikit-image / SimpleITK 等，
+#    见 glioma_track4/requirements.txt。
 fastapi>=0.115,<1
 uvicorn>=0.30,<1
+pydantic>=2.5,<3
 numpy>=1.26,<3
+scipy>=1.10
+pyyaml>=6.0
 nibabel>=5.2,<6
 openpyxl>=3.1,<4

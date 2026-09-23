@@ -79,12 +79,22 @@ fi
 
 # ---- 依赖与 GPU 自检（仅提示）----
 python3 - <<'PY' || echo "[06] ⚠️ 依赖自检未过：先跑 bash scripts/00_setup_env.sh --mode system"
-import importlib, sys
-miss = [m for m in ("torch", "numpy", "nibabel", "SimpleITK", "skimage", "fastapi", "uvicorn")
-        if importlib.util.find_spec(m) is None]
-import torch
-print(f"[06] torch {torch.__version__} cuda {torch.version.cuda} 可用 {torch.cuda.is_available()}")
-print(f"[06] 缺失依赖: {miss if miss else '无 ✓'}")
+import importlib.util, sys
+# 运行期**真正**需要的包（缺任何一个都会在 /call 或回调时才炸）：
+#   服务框架   fastapi / uvicorn / pydantic
+#   数据管线   numpy / scipy / nibabel / SimpleITK / skimage / pandas / yaml / openpyxl
+#   回调平台   requests
+# 别只留 torch/numpy/fastapi：自检漏掉的包恰恰最可能在「容器起来了、
+# 但这次测评不计分」的时候才暴露（上一版自检就没查 requests/yaml/pandas/scipy）。
+need = ("torch", "numpy", "scipy", "nibabel", "SimpleITK", "skimage", "pandas",
+        "yaml", "requests", "fastapi", "uvicorn", "pydantic", "openpyxl")
+miss = [m for m in need if importlib.util.find_spec(m) is None]
+if miss:
+    print(f"[06] ✗ 缺失依赖: {miss}")
+else:
+    import torch
+    print(f"[06] torch {torch.__version__} cuda {torch.version.cuda} 可用 {torch.cuda.is_available()}")
+    print("[06] 缺失依赖: 无 ✓")
 sys.exit(1 if miss else 0)
 PY
 

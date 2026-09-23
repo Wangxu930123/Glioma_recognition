@@ -3,14 +3,17 @@
 > **版本 v2（2026-09-23）**：修复「数据根填高一层 → 静默扫到 0 例」；两个训练工程的数据根默认值已统一为平台路径。
 > 适用工程：`Glioma_recognition-main`（提交）、`glioma_track4`（数据管线 + 一体化训练）、`glioma_goals`（六目标并行训练）
 
-**四份文档的分工**
+**这份文档放在哪里看**（`glioma_track4/docs/`，四份**不重复**，按需查）
 
-| 文档 | 用途 |
-|---|---|
-| **本文** | 三工程怎么串起来跑、数据长什么样、本次改了什么、怎么验证 |
-| `CLOUD_DESKTOP_RUNBOOK.md` | 云桌面从建实例到出提交物的逐步操作 |
-| `DATASET_ROOT_TROUBLESHOOT.md` | 数据根找不到时的排查 |
-| `PLATFORM_GUIDE.md` | 平台环境、命令与路径速查 |
+| 什么时候看 | 看哪份 | 它独有的内容 |
+|---|---|---|
+| 搞清楚整体怎么跑（默认） | **本文** | 三工程串联、数据契约、本次修复、容器内全链路命令、验证清单 |
+| 第一次上机：点哪里、账号怎么弄 | `PLATFORM_GUIDE.md` | 赛事平台登录/申资源、云桌面客户端安装、创建容器实例、SSH 与克隆（含 Token 兜底）、创建测评容器并发起评测 |
+| 目录要搬迁 / 探针字段为空 / 换数据重建折划分 | `CLOUD_DESKTOP_RUNBOOK.md` | 克隆层级不固定时的搬迁、`SeriesType.xlsx` 与标注表逐项核对、`label_field_counts` 为空的三级定位、**先 01 再 02** 的折划分规矩、报错对照表 |
+| 报 `ValueError: 数据根 ... 指向数据集父目录` | `DATASET_ROOT_TROUBLESHOOT.md` | 数据根逐层定位与判定（单点排查，11KB） |
+
+> 组委会的《赛道四_自建模型组_比赛背景与开发规范.md》《…_系统架构与协作规范.md》是**权威口径**
+> （提交约束、服务接口、权重路径），本文是执行手册；两者冲突时以规范为准（这两份不在本仓库内）。
 
 ---
 
@@ -223,6 +226,11 @@ bash scripts/02_build_dataset.sh              # ③ 折划分（含数据源合�
 python scripts/13_build_cache.py --workers 8  # ④ 预处理缓存（可选，强烈建议）
 ```
 
+> `1_abnormal` 的 `Label` 指错目录时（compositing/duplicate 的行被标成 `true`，官方 `series_path` 就拼不出路径），
+> 在探针前先跑 **`bash scripts/33_fix_abnormal_labels.sh`**：自动接上团队工作区的 `labels/`（`export GLIOMA_LABELS_DIR`）、
+> 用磁盘核对把人工补丁（如 `1_abnormal_wzh.xlsx`）合并回 `1_abnormal.xlsx`（命中率上升才写、自动备份），最后重跑探针。
+> 只想看差别不写文件：加 `--dry-run`。
+
 **探针报告里必须先看这两个数，不正常就别往下走**：
 
 | 字段 | 期望 | 含义 |
@@ -350,7 +358,8 @@ glioma_track4/checkpoints/<tag>/best.pth                 （路线 A）
 | `ValueError: 数据根 ... 指向数据集父目录，其下是平台阶段目录 [...]` | 填到了 `/2026aicompetition/datasets` | 指到具体阶段（如 `.../datasets/training`）。**这是预期行为** |
 | `training/` 下只有 `annotation/` | 实例只挂了标注那份存储 | v2 会自动下钻。若连 `annotation/` 都没有 → 回「存储与数据服务」勾选训练影像数据集或重建实例，**不是代码问题** |
 | 扫出 3255 例但挑不出模态（`无任何可用序列`） | UID 命名认不出模态，缺 `SeriesType.xlsx` | 确认数据根那一层有 `SeriesType.xlsx`；详见 `CLOUD_DESKTOP_RUNBOOK.md` §4 |
-| `label_field_counts = 0` | 结构化金标准表不在数据根及其上级 1~2 层 | 把中文标注表放回 `training/annotation/`，或把数据根定到与它同级的那一层 |
+| `label_field_counts = 0` 或 `official_label_files: {}` | 官方 5 张英文表**不随数据集下发**，它们躺在**团队工作区**里（如 `.../workspace/dcs/goal1and2/Goal1and2/labels/`）；中文合并表只是兜底 | `export GLIOMA_LABELS_DIR=<那个 labels 目录>` 后重跑 `bash scripts/01_probe.sh`，核对 `official_label_files` 变 5 条 |
+| `1_abnormal` 把 compositing/duplicate 的行标成 `true`（`Label` 指错目录 → 官方 `series_path` 拼不出路径） | 人工修补版（如 `1_abnormal_wzh.xlsx`）没合并回 `labels/1_abnormal.xlsx` | **`bash scripts/33_fix_abnormal_labels.sh`** 一条命令搞定（自动定位 → 按 `Label` 拼路径做磁盘核对 → 命中率上升才写回并备份 → 重跑探针）；要手动控制细节则用 `scripts/32_apply_abnormal_patch.py` |
 | `02_build_dataset.sh` 报「清单与数据根不同类」 | 换了数据根却没重跑 `01_probe`（合规闸门） | 先 `bash scripts/01_probe.sh`；从本地切回官方数据先跑 `17_reset_for_official.sh` |
 | `23_pre_submit_check.sh` 卡在「权重未导出」 | 没跑阶段 3 | `bash scripts/09_export_submission.sh` |
 | `glioma_goals` 找不到数据根 | `--data` 与配置默认值都不对 | 优先级：`--data` > `GLIOMA_DATASET_ROOT` > `DATASET_ROOT` > `DATASET_PATH` > 配置默认值（现已是平台路径） |
@@ -365,11 +374,12 @@ glioma_track4/checkpoints/<tag>/best.pth                 （路线 A）
 |---|---|---|
 | `DATASET_ROOT` | `glioma_track4` 数据根（覆盖 `raw.track4`） | `/2026aicompetition/datasets/training` |
 | `GLIOMA_DATASET_ROOT` | `glioma_goals` 数据根（也接受 `DATASET_ROOT` / `DATASET_PATH`） | 各 goal 的 `config.yaml` |
-| `GLIOMA_LABELS_DIR` | 官方标注表目录 | 自动向上找 1~2 层 |
+| `GLIOMA_LABELS_DIR` | 官方 5 张标注表目录 | **平台实测**：表在**团队工作区**（如 `/2026aicompetition/workspace/dcs/goal1and2/Goal1and2/labels`），**不在**数据集挂载里；不设则自动向上找 1~2 层 |
 | `CACHE_DIR` | 预处理缓存（放私有存储） | `<workspace>/cache` |
 | `WORKSPACE` | 平台工作区 | `/2026aicompetition/workspace` |
 | `GLIOMA_CHECKPOINT_ROOT` | 权重导出根 | `$WORKSPACE/checkpoint` |
 | `GLIOMA_FOLDS` | 共用折划分 | `glioma_track4/data/folds.json` |
+| `PY` | python 解释器（容器里常只有 `python3`） | 自动探测：`$PY` → `python3` → `python`（`.sh` 已适配；直接跑 `.py` 用 `python3`） |
 
 ### 8.2 关键路径
 
@@ -405,7 +415,11 @@ glioma_track4/checkpoints/<tag>/best.pth                 （路线 A）
 | `24~26` | 评估划分 / 任务集成 / 插件完整性审计 |
 | `29_locate_dataset_root.py` | 数据根定位（打印候选根与病例数） |
 | `30_inspect_table.py` | 检查标注表结构 |
+| `32_apply_abnormal_patch.py` | 核验并合并 `1_abnormal` 人工补丁（按 `Label` 拼路径做磁盘核对，命中率不升则拒绝写回） |
+| `33_fix_abnormal_labels.sh` | **一条命令修好 `1_abnormal`**：自动定位原表/补丁/病例层 → 磁盘核对命中率 → 落地（自动备份）→ 重跑探针。`--dry-run` 只核验、`--no-probe` 跳过探针 |
 | `99_smoke_test.py` | 端到端自检（合成数据，无需真实数据） |
+
+> 解释器：容器里往往只有 `python3`。`01`~`05`、`33` 这几个 `.sh` 会自动探测（`$PY` → `python3` → `python`）；直接跑 `.py` 时把 `python` 换成 `python3`，或先 `export PY=python3`。
 
 ---
 

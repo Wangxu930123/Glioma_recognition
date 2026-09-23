@@ -2,7 +2,13 @@
 # 构建训练集清单与多折划分（探针已在 01 步产出 manifest；此处只做折划分与统计）
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
-PY="${PY:-python}"
+PY="${PY:-}"
+if [ -z "$PY" ]; then                          # 容器里常常只有 python3
+    for c in python3 python; do
+        if command -v "$c" >/dev/null 2>&1; then PY="$c"; break; fi
+    done
+fi
+[ -n "$PY" ] || { echo "[02] 找不到 python3/python：请 export PY=<解释器路径>" >&2; exit 2; }
 N_FOLDS="${N_FOLDS:-5}"   # 注意：不要用 FOLDS，它与 paths.yaml 的环境变量覆盖同名
 
 "$PY" - <<PY

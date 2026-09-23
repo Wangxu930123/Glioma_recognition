@@ -7,7 +7,13 @@
 #   PRETRAINED=/path/to.pth bash scripts/03_train.sh 0    # 加载预训练权重（合规性自行确认）
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
-PY="${PY:-python}"
+PY="${PY:-}"
+if [ -z "$PY" ]; then                          # 容器里常常只有 python3
+    for c in python3 python; do
+        if command -v "$c" >/dev/null 2>&1; then PY="$c"; break; fi
+    done
+fi
+[ -n "$PY" ] || { echo "[03] 找不到 python3/python：请 export PY=<解释器路径>" >&2; exit 2; }
 TAG_PREFIX="${TAG_PREFIX:-g4}"
 CONFIG="${CONFIG:-train}"
 mkdir -p logs

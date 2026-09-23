@@ -3,7 +3,13 @@
 # 用法：CKPT=checkpoints/g4_fold0/best.pth bash scripts/05_serve.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
-PY="${PY:-python}"
+PY="${PY:-}"
+if [ -z "$PY" ]; then                          # 容器里常常只有 python3
+    for c in python3 python; do
+        if command -v "$c" >/dev/null 2>&1; then PY="$c"; break; fi
+    done
+fi
+[ -n "$PY" ] || { echo "[05] 找不到 python3/python：请 export PY=<解释器路径>" >&2; exit 2; }
 PORT="${PORT:-8000}"
 CKPT="${CKPT:-$(ls -1 checkpoints/g4_fold*/best.pth 2>/dev/null | head -1 || true)}"
 

@@ -408,9 +408,22 @@ def _id_key(value) -> str:
     """把"检查号"归一化成可比较的键：只留字母数字，去前导零，大小写无关。
 
     这样 ``C0E1F8F2-53BA_45BE``、``c0e1f8f253ba45be``、`` 00123 `` 都能对上。
+
+    另修一个 Excel 专属坑：数字型检查号读出来常带小数尾巴（``1234567.0``），
+    若直接去掉非字母数字会拼成 ``12345670`` —— 与目录名 ``1234567``
+    差一位、永远不相等。所以先把结尾的 ``.0`` 摘掉再归一化。
+    本函数**幂等**：对已归一化的键再调用结果不变。
     """
-    text = re.sub(r"[^0-9a-z]+", "", str(value).casefold())
+    text = str(value).strip()
+    if "." in text:
+        text = re.sub(r"\.0+$", "", text)                           # 1234567.0 → 1234567
+    text = re.sub(r"[^0-9a-z]+", "", text.casefold())
     return text.lstrip("0") or text
+
+
+#: 公开别名：检查号归一化是"探针/数据集/脚本"三方共用的口径，
+#: 各写一份必然出现"一处归一化、一处原样"的静默错配（本文件已因此踩过一次）。
+id_key = _id_key
 
 
 def _best_id_column_by_values(rows: list[list[str]], known_keys: set[str],
@@ -421,9 +434,16 @@ def _best_id_column_by_values(rows: list[list[str]], known_keys: set[str],
     这是"不猜列名"的做法：磁盘上已经有哪些检查号是确定的，
     拿它去逐列比对即可 —— 列名写 ``编号``/``AccessionNumber``/``患者ID``
     甚至乱码都不影响。比维护关键词表可靠得多（关键词表每遇到一种新命名就失效一次）。
+
+    ⚠️ ``known_keys`` 允许是**原始目录名**（调用方常直接把 ``os.listdir`` 结果传进来）：
+    这里统一做一次 :func:`_id_key` 归一化再比。此前只有表内取值归一化、
+    调用方若是原样传入，遇到 ``C0E1F8F2-53BA-45BE`` 这种带大写/连字符的哈希
+    检查号就会**一条都对不上**，于是静默退化成"按列名找"→ 整表 0 行。
+    ``_id_key`` 幂等，已归一化的调用方重复传也安全。
     """
     if not rows or not known_keys:
         return None
+    known_keys = {_id_key(k) for k in known_keys}
     width = max(len(r) for r in rows[:max_scan]) if rows[:max_scan] else 0
     best: tuple[float, int, int] | None = None            # (命中率, 命中数, 列号)
     for col in range(width):
@@ -478,6 +498,54 @@ def dump_table(path: str, max_rows: int = 8, max_cols: int = 12,
             lines.append(f"  行{r_idx:>3}: " + " | ".join(cells) + more)
         if len(rows) > max_rows:
             lines.append(f"  ……（还有 {len(rows) - max_rows} 行）")
+    return "\n".join(lines)
+
+
+def _diagnose_id_columns(sheets: list[list[list[str]]], known_keys: set[str],
+                         top: int = 3, max_scan: int = 300) -> str:
+    """解析失败时给出**可执行的**原因：哪一列最像检查号、命中多少行。
+
+    "0 行"有两种成因，处理方式相反：
+    ① 检查号列存在，但取值与磁盘目录名不是同一套编号（要按值映射或换表）；
+    ② 表里根本没有检查号（这表不是字段金标准）。
+    只看 `label_field_counts: {}` 分不清，只能反复猜 —— 所以把命中率打出来。
+    """
+    if not known_keys:
+        return ("  ⚠️ 取不到磁盘上的检查号（数据根下没有病例目录），"
+                "只能按列名识别 —— 请先把数据根指到含检查号目录的那一层。")
+    lines: list[str] = []
+    for s_idx, rows in enumerate(sheets):
+        if not rows:
+            continue
+        width = max(len(r) for r in rows[:max_scan])
+        scored: list[tuple[float, int, int, int]] = []                 # (命中率,命中,非空,列)
+        for col in range(width):
+            hit = total = 0
+            for row in rows[:max_scan]:
+                value = str(row[col]).strip() if col < len(row) else ""
+                if not value:
+                    continue
+                total += 1
+                if _id_key(value) in known_keys:
+                    hit += 1
+            if total >= 3 and hit:
+                scored.append((hit / total, hit, total, col))
+        scored.sort(key=lambda s: (-s[0], -s[1]))
+        if not scored:
+            head = [str(c)[:18] for c in rows[min(1, len(rows) - 1)][:8]]
+            lines.append(f"  sheet{s_idx}: 没有哪一列的取值能对上磁盘检查号"
+                         f"（前几列表头={head}）→ 这表多半不是字段金标准")
+            continue
+        for ratio, hit, total, col in scored[:top]:
+            name = ""
+            for r in rows[:20]:                                        # 该列的表头文字
+                if col < len(r) and str(r[col]).strip() and _id_key(r[col]) not in known_keys:
+                    name = str(r[col]).strip()[:18]
+                    break
+            lines.append(f"  sheet{s_idx}: 第 {col} 列最像检查号（表头 {name!r}）"
+                         f"命中 {hit}/{total} 行（{ratio:.0%}）")
+        lines.append(f"  → 上面命中率若明显低于 30%，说明该表编号与目录名不是同一套；"
+                     f"把 dump 出来的前几行发出来即可确定映射关系")
     return "\n".join(lines)
 
 
@@ -540,14 +608,19 @@ def read_structured_table(path: str, known_ids: set[str] | None = None) -> dict[
             if not value:
                 continue
             stripped = value.lstrip("0") or value
-            for key in {value, stripped, value.casefold(), stripped.casefold()}:
+            # 登记**归一化键**：目录名可能是 `C0E1F8F2-53BA-45BE`，表里是
+            # `c0e1f8f253ba45be`（或反之），只有原始形式会一条都查不到。
+            for key in {value, stripped, value.casefold(), stripped.casefold(),
+                        _id_key(value)}:
                 out[key] = record
 
     if not out and path not in _WARNED_TABLES:
         _WARNED_TABLES.add(path)
+        diag = _diagnose_id_columns(sheets, {_id_key(k) for k in (known_ids or ())})
         print(f"[labels][告警] {os.path.basename(path)} 未解析出任何行。\n"
               f"  已尝试：按取值比对检查号列 → 按列名识别 → 跳过标题行 → 遍历全部工作表。\n"
-              f"  下面把表整个摊开，直接看它长什么样：\n{dump_table(path)}", flush=True)
+              + (diag + "\n" if diag else "")
+              + f"  下面把表整个摊开，直接看它长什么样：\n{dump_table(path)}", flush=True)
     return out
 
 

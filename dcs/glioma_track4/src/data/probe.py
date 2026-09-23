@@ -21,7 +21,7 @@ from collections import Counter
 
 from ..utils.config import data_source_tag, load_paths, resolve
 from .labels import (find_official_labels, find_structured_tables, guess_modality,
-                     has_strict_mask_hint, mask_role_for, norm_key,
+                     has_strict_mask_hint, id_key, mask_role_for, norm_key,
                      read_abnormal_table, read_duplicate_pairs, read_mask_table,
                      read_series_types, read_structured_table, sidecar_desc,
                      structured_from_row)
@@ -342,7 +342,12 @@ def scan_real(root: str, limit_cases: int | None = None,
             continue
         labels = {}
         if struct_tables:
-            for key in (acc, acc.lstrip("0"), acc.zfill(len(acc))):
+            # 查表要覆盖全部等价写法：原样 / 大小写折叠 / 去前导零 / 归一化键。
+            # 只查原样时，目录名 `C0E1F8F2-53BA-45BE` 与表里 `c0e1f8f2-53ba-45be`
+            # 互相看不见 —— 表现为"表解析出 N 行，但每例 labels 全空"，
+            # 报告里 `label_field_counts: {}` 而 `n_structured_rows` 正常，最难查。
+            for key in (acc, acc.casefold(), acc.lstrip("0"),
+                        acc.lstrip("0").casefold(), id_key(acc)):
                 if key in struct_tables:
                     labels = structured_from_row(struct_tables[key])
                     break
@@ -395,7 +400,9 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
     root = resolve_case_root(root)
     # "按取值找检查号列"需要磁盘上真实存在的检查号（列名叫什么都不影响），
     # 这里先轻量列一次目录名，口径与 scan_real 一致（一级子目录、排除 annotation）。
-    known_ids = ({str(e) for e in os.listdir(root)
+    # 目录名统一归一化后再传：表内取值会经 id_key 归一化，两侧不同口径会
+    # 一条都对不上（哈希型检查号 C0E1F8F2-53BA-45BE 就是这么栽的）。
+    known_ids = ({id_key(e) for e in os.listdir(root)
                   if os.path.isdir(os.path.join(root, e)) and e.lower() != "annotation"}
                  if os.path.isdir(root) else set())
     # ★ 官方 5 张标注表（`1_abnormal` / `2_duplicate` / `3_serieslabel` /
@@ -413,8 +420,12 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
     for t in tables:
         try:
             struct.update(read_structured_table(t, known_ids=known_ids))
-        except Exception:                                         # noqa: BLE001
-            pass
+        except Exception as exc:                                  # noqa: BLE001
+            # 读表异常**不能静默**：吞掉之后报告里只剩 `label_field_counts: {}`，
+            # 看起来像"表里没数据"，实际是解析期就失败了（缺 openpyxl / 文件损坏 /
+            # 加密 xlsx）—— 不打印异常就只能靠反复猜。
+            print(f"[probe][告警] 读金标准表失败 {os.path.basename(t)}："
+                  f"{type(exc).__name__}: {exc}", flush=True)
     # 字典里同一行会有多个键（原值 / 去前导零 / 大小写折叠），
     # 直接 len() 会把"行数"报成实际的两倍以上，把诊断带偏 —— 按**唯一记录**计数。
     n_struct_rows = len({id(v) for v in struct.values()})

@@ -3,7 +3,13 @@
 # 用法：bash scripts/01_probe.sh [数据根]        （数据根可省略，默认取 configs/paths.yaml）
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
-PY="${PY:-python}"
+PY="${PY:-}"
+if [ -z "$PY" ]; then                          # 容器里常常只有 python3
+    for c in python3 python; do
+        if command -v "$c" >/dev/null 2>&1; then PY="$c"; break; fi
+    done
+fi
+[ -n "$PY" ] || { echo "[01] 找不到 python3/python：请 export PY=<解释器路径>" >&2; exit 2; }
 ARGS=()
 [[ $# -ge 1 ]] && ARGS+=(--root "$1")
 "$PY" -m src.data.probe "${ARGS[@]}"

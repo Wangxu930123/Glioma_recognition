@@ -298,11 +298,16 @@ def merge_special_cases(cases: list[dict], special: dict, log: list | None = Non
 
 def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -> dict:
     log: list[str] = []
+    # "按取值找检查号列"需要磁盘上真实存在的检查号（列名叫什么都不影响），
+    # 这里先轻量列一次目录名，口径与 scan_real 一致（一级子目录、排除 annotation）。
+    known_ids = ({str(e) for e in os.listdir(root)
+                  if os.path.isdir(os.path.join(root, e)) and e.lower() != "annotation"}
+                 if os.path.isdir(root) else set())
     tables = find_structured_tables(root)
     struct = {}
     for t in tables:
         try:
-            struct.update(read_structured_table(t))
+            struct.update(read_structured_table(t, known_ids=known_ids))
         except Exception:                                         # noqa: BLE001
             pass
     # 序列类型表只读一次，影像与特殊影像两条分支共用（避免"一处读了、一处没读"

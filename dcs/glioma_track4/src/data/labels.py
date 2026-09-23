@@ -225,7 +225,84 @@ def _detect_header(rows: list[list[str]], max_scan: int = 20) -> int | None:
     return best[1] if best else None
 
 
-def read_structured_table(path: str) -> dict[str, dict]:
+def _id_key(value) -> str:
+    """把"检查号"归一化成可比较的键：只留字母数字，去前导零，大小写无关。
+
+    这样 ``C0E1F8F2-53BA_45BE``、``c0e1f8f253ba45be``、`` 00123 `` 都能对上。
+    """
+    text = re.sub(r"[^0-9a-z]+", "", str(value).casefold())
+    return text.lstrip("0") or text
+
+
+def _best_id_column_by_values(rows: list[list[str]], known_keys: set[str],
+                              min_hit: float = 0.3, max_scan: int = 300
+                              ) -> tuple[int, int] | None:
+    """**按取值**找出检查号列：返回 ``(列号, 第一处命中的行号)``。
+
+    这是"不猜列名"的做法：磁盘上已经有哪些检查号是确定的，
+    拿它去逐列比对即可 —— 列名写 ``编号``/``AccessionNumber``/``患者ID``
+    甚至乱码都不影响。比维护关键词表可靠得多（关键词表每遇到一种新命名就失效一次）。
+    """
+    if not rows or not known_keys:
+        return None
+    width = max(len(r) for r in rows[:max_scan]) if rows[:max_scan] else 0
+    best: tuple[float, int, int] | None = None            # (命中率, 命中数, 列号)
+    for col in range(width):
+        hit = total = first_hit = 0
+        for idx, row in enumerate(rows[:max_scan]):
+            value = str(row[col]).strip() if col < len(row) else ""
+            if not value:
+                continue
+            total += 1
+            if _id_key(value) in known_keys:
+                hit += 1
+                if not first_hit:
+                    first_hit = idx
+        if total >= 3 and hit / total >= min_hit:
+            score = (hit / total, hit, col)
+            if best is None or score > best:
+                best = score
+    return (best[2], next(i for i, r in enumerate(rows[:max_scan])
+                          if best[2] < len(r) and _id_key(r[best[2]]) in known_keys)) \
+        if best else None
+
+
+def _header_row_above(rows: list[list[str]], data_row: int) -> int | None:
+    """数据行往上找**最后一个不像数据**的行当表头（跳过空行）。
+
+    官方表的表头行取值不会是检查号，因此"往上第一个不含检查号样式的行"就是表头。
+    """
+    for idx in range(data_row - 1, -1, -1):
+        row = rows[idx]
+        if not any(str(c).strip() for c in row):
+            continue                                          # 空行：跳过继续往上
+        return idx
+    return None
+
+
+def dump_table(path: str, max_rows: int = 8, max_cols: int = 12,
+               cell_width: int = 22) -> str:
+    """把表**整个摊开**成可读文本（工作表名、行列数、前若干行）。
+
+    用途很直接：当解析失败时不要让人猜表长什么样 —— 直接打印出来看。
+    """
+    lines: list[str] = [f"文件：{path}"]
+    sheets = _sheet_rows(path)
+    lines.append(f"工作表数：{len(sheets)}")
+    for s_idx, rows in enumerate(sheets):
+        width = max((len(r) for r in rows), default=0)
+        lines.append(f"\n--- sheet{s_idx}: {len(rows)} 行 × {width} 列 ---")
+        for r_idx, row in enumerate(rows[:max_rows]):
+            cells = [str(c)[:cell_width].ljust(cell_width)
+                     for c in row[:max_cols]]
+            more = " …" if len(row) > max_cols else ""
+            lines.append(f"  行{r_idx:>3}: " + " | ".join(cells) + more)
+        if len(rows) > max_rows:
+            lines.append(f"  ……（还有 {len(rows) - max_rows} 行）")
+    return "\n".join(lines)
+
+
+def read_structured_table(path: str, known_ids: set[str] | None = None) -> dict[str, dict]:
     """读结构化金标准表（csv 或 xlsx）→ {检查号: {列名: 值}}。
 
     三个"看起来应该没问题、实际常常出问题"的地方都做了处理：
@@ -244,21 +321,43 @@ def read_structured_table(path: str) -> dict[str, dict]:
     out: dict[str, dict] = {}
     sheets = _sheet_rows(path)
     for rows in sheets:
-        head = _detect_header(rows)
-        if head is None:
-            continue
-        header = [str(c).strip() for c in rows[head]]
-        id_name = _find_id_column(header)
-        if not id_name:
-            continue
-        for row in rows[head + 1:]:
+        header: list[str] = []
+        data_start: int | None = None
+        id_col: int | None = None
+
+        # ① 首选：**按取值**找检查号列（不依赖列名，见 _best_id_column_by_values）
+        if known_ids:
+            found = _best_id_column_by_values(rows, known_ids)
+            if found is not None:
+                id_col, first_data = found
+                head = _header_row_above(rows, first_data)
+                if head is not None:
+                    header = [str(c).strip() for c in rows[head]]
+                data_start = first_data
+
+        # ② 退化：按列名找（离线单独解析、或表里本来就没有磁盘上的检查号时）
+        if data_start is None:
+            head = _detect_header(rows)
+            if head is None:
+                continue
+            header = [str(c).strip() for c in rows[head]]
+            id_name = _find_id_column(header)
+            if not id_name:
+                continue
+            id_col = header.index(id_name)
+            data_start = head + 1
+
+        for row in rows[data_start:]:
             if not any(str(c).strip() for c in row):
                 continue                                          # 跳过空行
-            record: dict[str, str] = {}
-            for idx, col in enumerate(header):
-                if col:
-                    record[col] = str(row[idx]).strip() if idx < len(row) else ""
-            value = record.get(id_name, "")
+            record: dict[str, str] = {
+                col: (str(row[i]).strip() if i < len(row) else "")
+                for i, col in enumerate(header) if col
+            }
+            if not record:                                        # 表头认不出：用列号占位
+                record = {f"col{i}": (str(row[i]).strip() if i < len(row) else "")
+                          for i in range(len(row))}
+            value = str(row[id_col]).strip() if id_col < len(row) else ""
             if not value:
                 continue
             stripped = value.lstrip("0") or value
@@ -267,12 +366,9 @@ def read_structured_table(path: str) -> dict[str, dict]:
 
     if not out and path not in _WARNED_TABLES:
         _WARNED_TABLES.add(path)
-        preview = [[str(c)[:16] for c in row[:6]]
-                   for row in (sheets[0][:3] if sheets else [])]
-        print(f"[labels][告警] {os.path.basename(path)} 未解析出任何行："
-              f"没找到检查号列（候选关键词 {list(ID_COLUMN_KEYWORDS[:3])} 等）。"
-              f"前 3 行前 6 列={preview}", flush=True)
-    return out
+        print(f"[labels][告警] {os.path.basename(path)} 未解析出任何行。\n"
+              f"  已尝试：按取值比对检查号列 → 按列名识别 → 跳过标题行 → 遍历全部工作表。\n"
+              f"  下面把表整个摊开，直接看它长什么样：\n{dump_table(path)}", flush=True)
     return out
 
 

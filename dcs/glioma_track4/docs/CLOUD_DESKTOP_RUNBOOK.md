@@ -327,6 +327,38 @@ for t in tables:
 PY
 ```
 
+**还是 0 行？直接把表摊开看**（不要猜列名）：
+
+```bash
+cd /2026aicompetition/workspace/dcs/glioma_track4
+
+# ① 把数据根下的候选表全部摊开：工作表名、行列数、前若干行
+python scripts/30_inspect_table.py
+
+# ② 或指定某个文件
+python scripts/30_inspect_table.py \
+  "/2026aicompetition/datasets/training/annotation/脑胶质瘤标注结果-训练集.xlsx"
+
+# ③ 想看更多行/列
+python scripts/30_inspect_table.py --rows 12 --cols 16
+```
+
+输出会直接给出"哪一列是检查号、命中多少行"，例如：
+
+```text
+sheet0: 检查号列 = 第 0 列（表头取值 '记录编号(case)'） …命中 3255 行 / 共 3256 行
+解析结果：3256 个键，样例可映射字段 12 个 ['Enhancement', 'Location', ...]
+```
+
+**解析器现在不依赖列名**：它拿磁盘上真实的检查号目录名去**逐列比对取值**，
+命中率最高的那一列就是检查号列 —— 列名写成 `记录编号(case)`、`编号`、
+`AccessionNumber` 甚至乱码都不影响。此外它还会跳过标题行/空行找真表头、
+遍历全部工作表、给同一条记录登记 `原值 / 去前导零 / 大小写折叠` 多个键。
+
+只有当脚本明确报告"**没有哪一列的取值能对上磁盘上的检查号**"时，
+才是真的卡住：那说明表里的检查号与目录名不是同一套
+（例如表用原始检查号、目录被改名成哈希）。把脚本输出贴出来即可，需要接一层 ID 映射。
+
 找不到表时，直接在数据集里搜一遍：
 
 ```bash

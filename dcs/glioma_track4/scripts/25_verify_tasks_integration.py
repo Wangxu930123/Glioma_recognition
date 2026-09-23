@@ -563,6 +563,29 @@ def main() -> int:
         check("n_structured_rows 按唯一记录计数",
               "len({id(v) for v in struct.values()})" in _p_src)
 
+        # 列名不可靠：**按取值**找检查号列（拿磁盘上的检查号逐列比对，列名叫什么都不影响）
+        check("实现按取值定位检查号列",
+              "_best_id_column_by_values" in _labels_src2)
+        check("探针把磁盘检查号传给解析器",
+              "known_ids=known_ids" in _p_src and "known_ids" in _p_src)
+        check("有『摊开看表』脚本", (_TRACK4 / "scripts/30_inspect_table.py").is_file())
+        _hostile = Path(_tmpl) / "hostile.xlsx"
+        _wb3 = _WB()
+        _ws3 = _wb3.active
+        _ws3.append(["脑胶质瘤标注结果（训练集）"])                 # 标题行
+        _ws3.append([])                                             # 空行
+        _ws3.append(["记录编号(case)", "病理结果", "location_of_lesion",
+                     "lesion_morphology"])                          # 检查号列名"认不出"
+        _ws3.append(["c0e1f8f253ba45be843411ca45073cac",
+                     "脑胶质瘤3级", "右侧基底节区", "规则"])
+        _wb3.save(_hostile)
+        _hostile_root = Path(_tmpl) / "hostile_ds"
+        _tiny_nii(_hostile_root / "c0e1f8f253ba45be843411ca45073cac" / "S1" / "S1.nii.gz")
+        _rep3 = _probe(str(_hostile_root), limit_cases=1)["report"]
+        check("列名认不出时仍能按取值解析出字段",
+              "WHO_Grade" in _rep3["label_field_counts"],
+              f"keys={sorted(_rep3['label_field_counts'])[:4]}")
+
     # ---------------------------------------------------------------- #
     print("\n" + "=" * 66)
     total = len(_PASSED) + len(_FAILED)

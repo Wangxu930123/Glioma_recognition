@@ -57,7 +57,16 @@ def build_volume(study: Study, common_spacing: tuple[float, float, float] = (1.0
     """
     picked = select_series(study, channels)
     if not picked:
-        raise ValueError(f"study {study.accession_number!r} 无任何可用序列")
+        # 带上"看到的是什么序列"：只报一句"无任何可用序列"时，
+        # 无法区分是命名问题（UID/哈希）还是数据缺模态，而这段堆栈
+        # 还常常埋在 torch 的取数内部或 worker 进程里。
+        seen = [(s.series_uid, s.modality) for s in list(study.series)[:6]]
+        raise ValueError(
+            f"study {study.accession_number!r} 无任何可用序列"
+            f"（共 {len(study.series)} 条；uid/描述前几条={seen}）。"
+            f"若 uid 是哈希或 DICOM UID，说明序列类型没读到："
+            f"确认数据根下有 SeriesType.xlsx 或同名 .json sidecar"
+        )
 
     ref_key = next((k for k in _REF_PRIORITY if k in picked), next(iter(picked)))
     ref = picked[ref_key]

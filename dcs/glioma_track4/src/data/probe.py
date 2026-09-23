@@ -323,6 +323,24 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
                 geom_samples.append({"accession": c["accession"], "modality": mod,
                                      **_probe_nifti(meta["path"])})
 
+    # 结构化字段金标准为空时**说清是哪一种空**。
+    # 三种情形在本地看起来都是 `label_field_counts: {}`，但处理方式完全不同：
+    # 没表（数据根偏了一层）/ 有表但认不出检查号列 / 有表有检查号但列名没映射。
+    labels_hint = ""
+    if label_counter:
+        labels_hint = ""
+    elif not tables:
+        labels_hint = ("数据根及其上级 1~2 层都没找到 csv/xlsx 金标准表；"
+                       "若表在别处，请把数据根定到与它同级的那一层")
+    elif not struct:
+        labels_hint = (f"找到 {len(tables)} 个表但一行都没解析出来："
+                       f"表里需要有 检查号/AccessionNumber/PatientId 之类的列"
+                       f"（候选：{', '.join(os.path.basename(t) for t in tables[:3])}）")
+    else:
+        labels_hint = (f"表解析出 {len(struct)} 行，但列名没映射到规范字段；"
+                       f"需要 病理结果 / location_of_lesion / lesion_morphology / "
+                       f"tumor_t2wi_signal_intensity 这类列")
+
     report = {
         "root": os.path.abspath(root),
         "n_cases": len(cases),
@@ -334,6 +352,7 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
         "modality_counts": dict(mod_counter),
         "mask_role_counts": dict(mask_counter),
         "label_field_counts": dict(label_counter),
+        "labels_hint": labels_hint,
         "special": {k: (v if not isinstance(v, list) else f"{len(v)} items")
                     for k, v in special.items()},
         "geometry_samples": geom_samples,
@@ -369,6 +388,14 @@ def main() -> None:
     print(f"\n[probe] manifest -> {out}  病例 {res['report']['n_cases']}")
     if res["report"]["n_cases"] == 0:
         print("[probe] ⚠️ 未找到病例：请确认 --root 指向含'检查号目录'的数据根（其内应有 NIfTI 或 DICOM）")
+    if not res["report"]["label_field_counts"]:
+        # 目标三/目标四的监督信号全在这里；为 0 就意味着分类头学不到东西，
+        # 而训练照样能跑完（loss 只统计有 mask 的样本）——必须显式提醒。
+        print(f"[probe] ⚠️ 结构化字段金标准为空（label_field_counts={{}}）："
+              f"{res['report']['labels_hint']}")
+    if res["report"]["modality_counts"].get("other") and not res["report"]["series_type_rows"]:
+        print("[probe] ⚠️ 有序列落到 other 且没读到 SeriesType.xlsx："
+              "官方数据的模态要靠它，见 docs/DATASET_ROOT_TROUBLESHOOT.md")
 
 
 if __name__ == "__main__":

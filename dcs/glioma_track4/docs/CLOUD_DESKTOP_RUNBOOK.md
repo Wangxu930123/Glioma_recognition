@@ -8,17 +8,102 @@
 > 全文命令都可以直接复制粘贴。凡是形如 `CLONE=...`、`DATASET_ROOT=...` 的赋值，
 > 请先按你机器上的实际路径改一次。
 
-## 0. 全流程速查
+## 0. 全流程照抄（一页版）
 
-```text
-① 克隆 + 把三个工程搬到 /2026aicompetition/workspace/dcs/     → 第 1 节
-② 装依赖                                                      → 第 2 节
-③ 定数据根（含 annotation / SeriesType.xlsx 的那一层）        → 第 3、4 节
-④ 探针确认模态与掩膜都认得出（series_type_rows > 0）          → 第 4 节
-⑤ 重建折划分（必须先 01 再 02）                               → 第 5 节
-⑥ 六折训练（--fold 0）                                        → 第 6 节
-⑦ 推理与提交自检                                              → 第 7 节
+把下面整段按顺序执行。每步注释里的**期望输出**不对时，跳到对应小节排查。
+先按你机器上的实际路径改这两个变量：
+
+- `CLONE`：克隆出来**含三个工程的那一层**（第 1.1 节教你确认）
+- `DSROOT`：数据根（第 3 节给出定法）
+
+```bash
+############ 变量（按实际改）############
+CLONE=/2026aicompetition/workspace/dcs/GliomaRecognition/dcs   # 第 1.1 节确认
+DSROOT=/2026aicompetition/datasets/training/annotation         # 第 3 节确认
+DCS=/2026aicompetition/workspace/dcs
+WS=/2026aicompetition/workspace
+export DATASET_ROOT="$DSROOT"
+export GLIOMA_DATASET_ROOT="$DSROOT"        # 两个工程用的变量名不同，两个都设
+
+############ ① 搬迁（第 1 节）############
+cd "$DCS"
+TS=$(date +%Y%m%d_%H%M%S)
+for p in glioma_goals glioma_track4 Glioma_recognition-main; do
+  [ -d "$p" ] && mv "$p" "bak_${TS}_$p"      # 旧目录改名备份（可能含唯一权重）
+  [ -d "$CLONE/$p" ] && mv "$CLONE/$p" ./
+done
+chmod +x glioma_track4/scripts/*.sh Glioma_recognition-main/start.sh 2>/dev/null
+ls -d */                                     # 期望：三个工程 + bak_*
+
+############ ② 依赖（第 2 节）############
+pip install -r Glioma_recognition-main/requirements.txt
+pip install -r glioma_track4/requirements.txt
+pip install openpyxl                         # 读 SeriesType.xlsx 必需
+
+############ ③ 定数据根（第 3 节）############
+cd "$DCS/glioma_track4"
+python scripts/29_locate_dataset_root.py     # 期望末行给出 DATASET_ROOT=...
+ls "$DATASET_ROOT" | head                    # 期望看到 <检查号> 目录与 SeriesType.xlsx
+
+############ ④ 探针（第 4 节）############
+rm -f data/manifest.json data/folds.json     # 清掉从别处带来的旧清单/旧折划分
+bash scripts/01_probe.sh
+# 期望：n_cases > 0
+#       series_type_rows > 0            ← 模态来源（缺则全报「无任何可用序列」）
+#       modality_counts 含 t1c/flair/t2/t1
+#       mask_role_counts 含 core/peri
+#       label_field_counts 非空、labels_hint 为空   ← 目标三/四的监督信号
+
+############ ⑤ 折划分（第 5 节）############
+bash scripts/02_build_dataset.sh             # 期望先打印「清单来源 / 数据根」
+python scripts/24_verify_eval_split.py       # 期望 0 项 WARN
+
+############ ⑥ 训练冒烟（第 6.1 节）############
+cd "$DCS/glioma_goals"
+python smoke_all_goals.py --datasets-only --data "$DATASET_ROOT" --limit 8   # 期望 6/6
+
+############ ⑦ 六个 Goal 逐折训练（第 6.2 节）############
+for g in goal1_authenticity goal2_stitched goal2_duplicate \
+         goal3_tumor goal4_diagnosis goal5_segmentation; do
+  (cd "$g" && python train.py --tag exp1 --fold 0 --data "$DATASET_ROOT")
+done
+
+############ ⑧ 算法工程多折训练 + 导出提交权重（第 6.3、7.5 节）############
+cd "$DCS/glioma_track4"
+bash scripts/03_train.sh all 4
+bash scripts/16_finalize.sh
+bash scripts/09_export_submission.sh
+bash scripts/09_export_submission.sh --verify         # 期望权重齐备
+
+############ ⑨ 推理与提交自检（第 7 节）############
+cd "$DCS/Glioma_recognition-main"
+python -m pytest tests/ -q                           # 期望全部 passed
+export COMPETITION_PIPELINE_FACTORY=tasks.real_pipeline:build_pipeline
+export COMPETITION_CHECKPOINT_ROOT="$WS/checkpoint"
+python scripts/local_eval.py --dataset "$DATASET_ROOT" \
+       --output "$WS/answer/local-001" --evaluation-id local-001
+python scripts/mock_competition.py --dataset "$DATASET_ROOT" \
+       --workspace "$WS" --timeout 3600               # 期望 5 行 PASS
+
+############ ⑩ 提交前总检查（第 7.6、9 节）############
+cd "$DCS/glioma_track4" && bash scripts/23_pre_submit_check.sh
 ```
+
+**想先走通链路、再花时间正式训练**：跳过 ⑦⑧，改跑第 6.4 节的
+「2 个 epoch 演练」——用 `configs/_smoke_train.yaml`，几十分钟内产出
+可被推理侧正常加载的权重，然后接 ⑨ 验证链路。
+
+> ⚠️ 演练权重**绝不能**留在 `checkpoint/`：`--verify` 只查文件是否齐备，
+> 查不出「这是 2 epoch 的权重」。演练一律用独立 `WORKSPACE`（如 `/tmp/ws_rehearsal`），
+> 正式提交前再按 ⑧ 用正式折重新导出一次。
+
+**工程脚本速查**（本手册假设已按第 1 节搬迁）：
+
+| 工程 | 作用 | 关键入口 |
+|---|---|---|
+| `glioma_track4` | 算法工程：探针 / 折划分 / 训练 / 评估 / 导出权重 | `scripts/01_probe.sh`、`02_build_dataset.sh`、`03_train.sh`、`16_finalize.sh`、`09_export_submission.sh`、`29_locate_dataset_root.py` |
+| `glioma_goals` | 六个 Goal 的独立训练入口 | `smoke_all_goals.py`、`goal*/train.py` |
+| `Glioma_recognition-main` | 提交工程：HTTP 服务 + 推理 + 写答案 + 校验 | `start.sh`、`scripts/local_eval.py`、`scripts/mock_competition.py`、`scripts/validate_output.py` |
 
 **五个工程脚本路径**（本手册假设已按第 1 节搬迁）：
 
@@ -205,6 +290,102 @@ find /2026aicompetition/datasets -maxdepth 4 -name "SeriesType.xlsx"
 官方数据的目录名是 DICOM UID（`1.2.826.0.1...`），任何关键词都命中不了，于是
 "病例数正常、却一例都没有可用序列"。现已支持
 `SeriesType.xlsx → 同名 .json sidecar → 目录名` 三级取值，两条训练路径都已接入。
+
+### 4.1 `label_field_counts: {}` 为空怎么查
+
+这是**结构化字段金标准**（目标三/目标四的监督信号）没读到。三种原因在报告里
+以前都只表现为 `{}`，现在探针会给出 `labels_hint` 说清是哪一种：
+
+| `labels_hint` 内容 | 原因 | 处理 |
+|---|---|---|
+| `数据根及其上级 1~2 层都没找到 csv/xlsx 金标准表` | 表不在数据根附近 | 找到表所在层，把 `DATASET_ROOT` 定到**与表同级**的那层 |
+| `找到 N 个表但一行都没解析出来` | 表里没有可识别的检查号列 | 表需要有 `AccessionNumber` / `检查号` / `PatientId` 之类的列 |
+| `表解析出 N 行，但列名没映射到规范字段` | 列名不匹配 | 需要 `病理结果` / `location_of_lesion` / `lesion_morphology` / `tumor_feature_*` / `tumor_t2wi_signal_intensity` 这类列 |
+
+一条命令看清候选表和命中情况：
+
+```bash
+cd /2026aicompetition/workspace/dcs/glioma_track4
+python - <<'PY'
+import os
+from src.data.labels import find_structured_tables, read_structured_table, structured_from_row
+root = os.environ["DATASET_ROOT"]
+tables = find_structured_tables(root)
+print("数据根:", root)
+print("候选表:", tables or "（无）")
+for t in tables:
+    table = read_structured_table(t)
+    fields = structured_from_row(next(iter(table.values()), {})) if table else {}
+    print(f"  {t}\n    解析行数={len(table)}  可映射字段数={len(fields)}")
+PY
+```
+
+找不到表时，直接在数据集里搜一遍：
+
+```bash
+find /2026aicompetition/datasets -maxdepth 4 \
+     \( -name "*.csv" -o -name "*.xlsx" -o -name "*.xls" \) 2>/dev/null | head -20
+```
+
+> 注意：字段金标准为空时**训练照常跑完**（损失只统计有 mask 的样本），
+> 只是目标三/目标四的分类头学不到东西。所以这一步的检查不能跳。
+
+### 4.2 报「无任何可用序列」时的三级定位
+
+**新版报错会自己说明它看到了什么**，先读这句：
+
+```text
+study 'c0e1f8f253ba45be843411ca45073cac' 无任何可用序列
+（共 2 条序列；uid/描述前几条=[('8f14e45fceea167a...', '8f14e45fceea167a...'), ...]）。
+若 uid 是哈希或 DICOM UID，说明模态要靠数据根下的 SeriesType.xlsx 提供；
+请把数据根定到与它同级的那一层（见 docs/DATASET_ROOT_TROUBLESHOOT.md）
+```
+
+按三级往下查：
+
+| 级别 | 查什么 | 结论 |
+|---|---|---|
+| 1 | `ls "$DATASET_ROOT/SeriesType.xlsx"` | 不存在 → 数据根偏了一层（表在别处） |
+| 2 | 表里的**检查号**能否对上目录名 | 对不上 → 表用原始检查号、目录被改成哈希（需额外映射，把输出贴出来） |
+| 3 | 表里的**序列号**能否对上序列目录/文件名 | 对不上 → 类型表不覆盖这批序列，需要看 sidecar 或其它来源 |
+
+一条命令把三级一起查（用加固后的解析器）：
+
+```bash
+cd /2026aicompetition/workspace/dcs/glioma_track4
+python - <<'PY'
+import os
+from pathlib import Path
+from src.data.labels import read_series_types
+
+root = Path(os.environ["DATASET_ROOT"])
+types = read_series_types(root)
+print("SeriesType.xlsx 映射条数:", len(types))
+if not types:
+    print("→ 数据根下没有 SeriesType.xlsx（或未装 openpyxl）")
+else:
+    accs = {a for a, _ in types}
+    dirs = {p.name for p in root.iterdir() if p.is_dir()}
+    print("表里检查号前 3 个:", sorted(accs)[:3])
+    print("磁盘检查号前 3 个:", sorted(dirs)[:3])
+    print(f"检查号能对上 {len(accs & dirs)} / 磁盘 {len(dirs)} 例")
+    case = next((p for p in root.iterdir() if p.is_dir()), None)
+    if case:                                    # 抽查一个病例的序列 UID 是否在表里
+        print("抽查病例:", case.name)
+        for d in sorted(case.iterdir())[:6]:
+            hit = [v for (a, u), v in types.items() if u == d.name.lower()]
+            print(f"  序列 {d.name[:24]:<26} 表里命中: {hit or '（无）'}")
+PY
+```
+
+另外，数据根下**一条序列都认不出模态**时，`discover_cases`
+会在取数之前先打印一条前置预警（不必等到 DataLoader worker 里才看到崩溃）：
+
+```text
+[data] ⚠️ 没有任何序列能识别出模态：数据根下没有 SeriesType.xlsx，且目录名/文件名都不含模态关键词。
+       继续训练会在取数时报「无任何可用序列」。
+       处理：把数据根定到与 SeriesType.xlsx 同级的那一层
+```
 
 ## 5. 折划分：换数据必须重建（先 01，再 02）
 
@@ -425,6 +606,10 @@ bash scripts/23_pre_submit_check.sh             # 加 --quick 跳过耗时项
 | ⑧ | `config.yaml` 里的其它 Goal 参数不生效 | 参数是写在**副本** `tr` 上，`build_datasets` 读的是 `cfg` | 已修（回写 `cfg["train"]`）；自定义参数时注意同一坑 |
 | ⑨ | `找不到数据集根目录；请用 --data 指定…`（明明 export 了数据根） | 两个工程历史上用不同的变量名：算法工程 `DATASET_ROOT`、研发侧 `GLIOMA_DATASET_ROOT` | 已支持互相兼容（`GLIOMA_DATASET_ROOT` / `DATASET_ROOT` / `DATASET_PATH` 任一均可），建议按 §10 两个都设 |
 | ⑩ | 训练日志出现 `special: 0.0` / `embed: 0.0` | 损失已收敛（小数据集上很快被"背下来"），不是信号断裂 | 首行若为 `special≈0.69`（未训练头初值）即链路正常；缺监督信号时会打印 `[loss][告警]` |
+| ⑪ | `label_field_counts: {}`（探针报告） | 结构化字段金标准没读到；目标三/四的分类头学不到东西，**但训练照常跑完** | 看 `labels_hint` 区分三种原因，按 §4.1 处理 |
+| ⑫ | `discover_cases` 打印「没有任何序列能识别出模态」 | 数据根下没有 `SeriesType.xlsx`，且目录名不含模态关键词 | 按 §4.2 三级定位；把数据根定到与类型表同级那层 |
+| ⑬ | `无任何可用序列`，报错里 uid 是哈希/UUID | 同 ⑫；若表里检查号与目录名对不上，说明需要额外的 ID 映射 | 跑 §4.2 的命令并把输出贴出来 |
+| ⑭ | 提交后分数极低，但权重"齐全" | `checkpoint/` 里是演练（1~2 epoch）权重，`--verify` 查不出来 | 演练一律用独立 `WORKSPACE`；提交前按 §7.5 用正式折重新导出 |
 
 ## 9. 一键自检清单
 

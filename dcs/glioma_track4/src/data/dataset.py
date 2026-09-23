@@ -130,7 +130,15 @@ def build_case_volume(case: dict, cfg: dict, log: list | None = None
     ch_defs = cfg["channels"]
     picked = pick_series(case, cfg)
     if not picked:
-        raise RuntimeError(f"病例 {case['accession']} 无任何可用序列")
+        # 报出"清单里到底有哪些序列键"：键全为 other/空，说明模态没认出来
+        # （官方数据靠数据根下的 SeriesType.xlsx），而不是这张检查真的没影像。
+        imgs = case.get("images") or {}
+        raise RuntimeError(
+            f"病例 {case['accession']} 无任何可用序列"
+            f"（清单里的序列键={sorted(imgs)[:8]}）。"
+            f"若键是 other/空，说明模态未识别：确认数据根下有 SeriesType.xlsx"
+            f"（见 docs/DATASET_ROOT_TROUBLESHOOT.md）"
+        )
 
     # 参考序列优先级：t1c → flair → t2 → t1 → 其它（决定公共网格方向与原点）
     ref_key = next((k for k in ("t1c", "flair", "t2", "t1") if k in picked),

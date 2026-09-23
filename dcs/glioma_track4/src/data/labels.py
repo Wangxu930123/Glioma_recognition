@@ -134,10 +134,42 @@ def to_enum(value: Any, mapping: dict) -> Any:
     return None
 
 
+#: 金标准表里"检查号/病例号"列的关键词（大小写无关；含中文与常见变体）。
+#:
+#: **顺序即优先级**（精确 → 包含两轮，都按此顺序取第一个命中）：
+#: 越具体的检查号命名越靠前，泛化的"记录号/序号"放最后，
+#: 避免一张表里同时存在行列号时把行号当成了检查号。
+ID_COLUMN_KEYWORDS = ("accessionnumber", "accession_number", "accession_no", "accession",
+                      "patientid", "patient_id", "record_uuid", "studyuid",
+                      "study_instance_uid", "study_id", "studyid",
+                      "检查号", "检查编号", "病例号", "患者号", "检查id",
+                      "检查序号", "记录号")
+
+
+def _find_id_column(row: dict) -> str | None:
+    """在表头里定位"检查号"列：**精确 → 包含**两级匹配。
+
+    官方表的表头命名不受我们控制（``AccessionNumber`` / ``检查号`` / ``PatientID``…）。
+    早期实现只按几个固定字面量取值，命名一变就整表取不到行 —— 表现为
+    ``n_structured_rows: 0`` 且 ``label_field_counts: {}``，
+    而表明明就在那儿、内容也齐全，最难查。
+    """
+    lower = {str(k).strip().lower(): k for k in row}
+    for kw in ID_COLUMN_KEYWORDS:
+        if kw in lower:
+            return lower[kw]
+    for kw in ID_COLUMN_KEYWORDS:
+        for key_lower, key in lower.items():
+            if kw in key_lower:
+                return key
+    return None
+
+
 def read_structured_table(path: str) -> dict[str, dict]:
     """读结构化金标准表（csv 或 xlsx）→ {accession_or_patient: {列名: 值}}。
 
-    多键索引：同时尝试 AccessionNumber / PatientId / record_uuid，取能对上的。
+    检查号列按 :data:`ID_COLUMN_KEYWORDS` 自动识别（精确 → 包含），
+    因此 ``AccessionNumber`` / ``检查号`` / ``PatientID`` 等命名都能吃。
     """
     rows: list[dict] = []
     if path.endswith((".xlsx", ".xls")):
@@ -150,13 +182,18 @@ def read_structured_table(path: str) -> dict[str, dict]:
             rows = list(csv.DictReader(f))
 
     out: dict[str, dict] = {}
+    id_col: str | None = None
     for r in rows:
         r = {str(k).strip(): ("" if v is None else str(v).strip()) for k, v in r.items()}
-        for key in ("AccessionNumber", "accessionNumber", "accession_number",
-                    "PatientId", "patient_id", "record_uuid", "PatientID"):
-            if r.get(key):
-                out[r[key]] = r
-                out[r[key].lstrip("0") or r[key]] = r
+        if id_col is None or id_col not in r:                     # 表头可能换行/换表
+            id_col = _find_id_column(r)
+        if not id_col:
+            continue
+        value = r.get(id_col) or ""
+        if not value:
+            continue
+        out[value] = r
+        out[value.lstrip("0") or value] = r
     return out
 
 
@@ -369,11 +406,47 @@ def sidecar_desc(path: str | os.PathLike) -> str | None:
     return None
 
 
-def find_structured_tables(root: str) -> list[str]:
-    """在数据根下找结构化金标准表（csv/xlsx）。"""
-    hits = []
-    for dirpath, _dirs, files in os.walk(root):
-        for fn in files:
-            if fn.endswith((".csv", ".xlsx", ".xls")) and not fn.startswith("~$"):
-                hits.append(os.path.join(dirpath, fn))
-    return sorted(hits)
+#: 不是"结构化金标准"的表（按文件名排除）
+_NON_LABEL_TABLE_KW = ("seriestype", "series_type", "gold", "duplicate", "folds")
+
+
+def find_structured_tables(root: str, max_parents: int = 2) -> list[str]:
+    """在数据根（及其**上级 1~2 层**）找结构化金标准表（csv/xlsx）。
+
+    为什么要向上看：官方数据的层级通常是 ``<数据集根>/<某层>/<检查号>/``，
+    而字段金标准表常常放在**检查号那一层的上一级**。只扫数据根会出现
+    "表明明存在、却一条都没读进来"，报告里只显示 ``{}``，
+    分不清是"没表"还是"数据根定位偏了一层"。
+
+    排除两类同名表：``SeriesType.xlsx``（有专用读取器）与 ``gold*.csv``
+    （重复影像的金标准，是 pair 列表而非字段表）—— 它们会污染"解析出 N 行"
+    这个计数，把诊断信息带偏。
+    """
+    roots: list[str] = [os.path.abspath(root)]
+    parent = roots[0]
+    for _ in range(max(0, int(max_parents))):
+        parent = os.path.dirname(parent)
+        if not parent or parent == os.sep or not os.path.isdir(parent):
+            break
+        roots.append(parent)
+
+    hits: set[str] = set()
+    for idx, base in enumerate(roots):
+        if idx == 0:                                              # 数据根：整棵树
+            for dirpath, _dirs, files in os.walk(base):
+                hits.update(os.path.join(dirpath, fn) for fn in files)
+        else:                                                     # 上级：只看本层
+            try:
+                hits.update(os.path.join(base, fn) for fn in os.listdir(base))
+            except OSError:
+                continue
+
+    out: list[str] = []
+    for path in sorted(hits):
+        fn = os.path.basename(path)
+        if not fn.endswith((".csv", ".xlsx", ".xls")) or fn.startswith("~$"):
+            continue
+        if any(k in fn.lower() for k in _NON_LABEL_TABLE_KW):
+            continue
+        out.append(path)
+    return out

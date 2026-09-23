@@ -473,6 +473,57 @@ def main() -> int:
         check("算法工程：'瘤体' 归为掩膜", list(_c["masks"]) == ["core"])
 
     # ---------------------------------------------------------------- #
+    _section("⑮ 结构化字段金标准：能认表头、能找到上级目录、三种『空』可区分")
+    # 目标三/目标四的监督信号全来自这张表。它出问题时**训练照样跑完**
+    # （loss 只统计有 mask 的样本），只是分类头学不到东西 —— 所以必须能在
+    # 探针阶段就把"没表 / 认不出检查号 / 列名没映射"三种情况分开报出来。
+    _labels_src2 = (_TRACK4 / "src/data/labels.py").read_text(encoding="utf-8")
+    _probe_src3 = (_TRACK4 / "src/data/probe.py").read_text(encoding="utf-8")
+    check("检查号列支持多种命名（含中文）",
+          "ID_COLUMN_KEYWORDS" in _labels_src2 and "检查号" in _labels_src2)
+    check("表搜索覆盖上级目录且排除非字段表",
+          "max_parents" in _labels_src2 and "_NON_LABEL_TABLE_KW" in _labels_src2)
+    check("探针报告输出 labels_hint（区分三种空）",
+          '"labels_hint"' in _probe_src3)
+
+    with tempfile.TemporaryDirectory() as _tmpl:
+        import csv as _csv                                            # noqa: PLC0415
+        from src.data.labels import (find_structured_tables,          # noqa: PLC0415
+                                     read_structured_table,
+                                     structured_from_row)
+        from src.data.probe import probe as _probe                    # noqa: PLC0415
+        _lroot = Path(_tmpl) / "training" / "annotation"
+        _tiny_nii(_lroot / "ACC001" / "S1" / "S1.nii.gz")
+        _lfields = ["病理结果", "glioma_with_label", "location_of_lesion",
+                    "lesion_morphology", "tumor_feature_necrosis"]
+        with open(Path(_tmpl) / "training" / "labels.csv", "w",
+                  encoding="utf-8-sig", newline="") as _f:            # 表在数据根的上一级
+            _w = _csv.writer(_f)
+            _w.writerow(["检查号"] + _lfields)
+            _w.writerow(["ACC001", "脑胶质瘤3级", "是", "右侧基底节区", "规则", "有"])
+        check("上级目录的金标准表被找到",
+              any(h.endswith("labels.csv") for h in find_structured_tables(str(_lroot))))
+        _row = read_structured_table(str(Path(_tmpl) / "training" / "labels.csv")).get("ACC001")
+        _mapped = structured_from_row(_row) if _row else {}
+        check("中文表头『检查号』可取行并映射字段",
+              bool(_mapped.get("WHO_Grade")) and bool(_mapped.get("Location")),
+              f"fields={sorted(_mapped)[:4]}")
+        _rep = _probe(str(_lroot), limit_cases=1)["report"]
+        check("有表时 label_field_counts 非空且无 hint",
+              bool(_rep["label_field_counts"]) and not _rep["labels_hint"])
+
+        _empty = Path(_tmpl) / "empty" / "annotation"
+        _tiny_nii(_empty / "ACC002" / "S1" / "S1.nii.gz")
+        _re = _probe(str(_empty), limit_cases=1)["report"]
+        check("无表时 hint 明确指向『没找到表』",
+              "没找到" in _re["labels_hint"], _re["labels_hint"][:36])
+        with open(_empty / "weird.csv", "w", encoding="utf-8-sig", newline="") as _f2:
+            _csv.writer(_f2).writerow(["甲", "乙"])
+        _re2 = _probe(str(_empty), limit_cases=1)["report"]
+        check("有表无检查号列时 hint 指出认不出检查号",
+              "检查号" in _re2["labels_hint"], _re2["labels_hint"][:36])
+
+    # ---------------------------------------------------------------- #
     print("\n" + "=" * 66)
     total = len(_PASSED) + len(_FAILED)
     print(f"通过 {len(_PASSED)}/{total}")

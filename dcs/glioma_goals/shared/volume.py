@@ -56,7 +56,17 @@ def build_volume(study, common_spacing: tuple[float, float, float] = (1.0, 1.0, 
     """
     picked = select_series(study, channels)
     if not picked:
-        raise ValueError(f"study {study.accession_number!r} 无任何可用序列")
+        # 报错里带上"看到了什么序列"：否则只看到一句"无任何可用序列"，
+        # 既不知道序列叫什么、也不知道是命名问题还是路径问题，
+        # 而这段堆栈还常常埋在 DataLoader worker 里。
+        seen = [(getattr(s, "series_uid", "?"), getattr(s, "modality", ""))
+                for s in list(study.series)[:6]]
+        raise ValueError(
+            f"study {study.accession_number!r} 无任何可用序列"
+            f"（共 {len(study.series)} 条序列；uid/描述前几条={seen}）。"
+            f"若 uid 是哈希或 DICOM UID，说明模态要靠数据根下的 SeriesType.xlsx 提供；"
+            f"请把数据根定到与它同级的那一层（见 docs/DATASET_ROOT_TROUBLESHOOT.md）"
+        )
 
     ref_key = next((k for k in _REF_PRIORITY if k in picked), next(iter(picked)))
     ref = picked[ref_key]

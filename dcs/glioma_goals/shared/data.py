@@ -26,7 +26,7 @@ from pathlib import Path
 
 import numpy as np
 
-from shared.selector import pick_series
+from shared.selector import guess_modality, pick_series
 from shared.volume import CHANNEL_ORDER, build_volume
 
 #: 影像文件后缀
@@ -188,10 +188,17 @@ def _series_desc(path: Path, accession: str, uid: str, series_types: dict) -> st
 
     返回的文本会作为 ``Series`` 的 ``modality`` 交给模态关键词匹配，
     因此它可以是 ``T1CE`` / ``FLAIR`` / ``T1增强`` 这类**任意自然描述**。
+
+    查表时**目录名与文件名都试**：官方数据的组织方式不止一种 ——
+    ``<检查号>/<序列号>/<序列号>.nii.gz``（序列号在目录名上）
+    与 ``<检查号>/<序列号>.nii.gz``（序列号在文件名上）都可能出现，
+    只试目录名会让后者整批认不出模态。
     """
-    value = series_types.get((_norm_key(accession), _norm_key(uid)))
-    if value:
-        return str(value)
+    stem = path.name[:-7] if path.name.lower().endswith(".nii.gz") else path.stem
+    for candidate in (uid, stem):
+        value = series_types.get((_norm_key(accession), _norm_key(candidate)))
+        if value:
+            return str(value)
     value = _sidecar_desc(path)
     if value:
         return value
@@ -262,6 +269,19 @@ def discover_cases(dataset_root: Path, limit: int | None = None) -> list[dict]:
             cases.append(case)
         if limit and len(cases) >= limit:
             break
+
+    # 前置预警：一条序列都认不出模态时，训练会在 DataLoader worker 里抛
+    # 「无任何可用序列」——堆栈落在 torch 的取数内部，看不出根因。
+    # 这里在**发现阶段**就把原因和办法说清楚（抽查前若干例，几乎不会误报）。
+    if cases and not any(
+        guess_modality(s.get("desc") or s.get("uid") or "")
+        for c in cases[:50] for s in c.get("series") or []
+    ):
+        print("[data] ⚠️ 没有任何序列能识别出模态：数据根下没有 SeriesType.xlsx，"
+              "且目录名/文件名都不含模态关键词。\n"
+              "       继续训练会在取数时报「无任何可用序列」。\n"
+              "       处理：把数据根定到与 SeriesType.xlsx 同级的那一层"
+              "（见 docs/DATASET_ROOT_TROUBLESHOOT.md）", flush=True)
     return cases
 
 

@@ -794,18 +794,38 @@ def build_folds(manifest_path: str, n_folds: int = 5, val_ratio: float = 0.2,
         man = json.load(f)
     cases = man["cases"]
     out = resolve(os.path.join(os.path.dirname(manifest_path), "folds.json"))
+    all_accs = {c["accession"] for c in cases}
 
     # ★ 复用已存在的划分（除非 force=True）。
     # trainer 每次启动都会调用本函数；若无条件重写，则"重启任意一个折"就会
     # 静默换掉整套划分 → 正在跑的折用的是旧划分、重启的折用新划分，
     # 交叉验证与 OOF 评估全部失效（且不会报任何错）。
+    #
+    # 但**只有"覆盖当前数据"的旧划分才允许复用**。早期实现只看折数：
+    # 换到官方数据后，磁盘上那份来自本地模拟集的 5 折文件折数正好相符 →
+    # 直接原样返回，于是
+    #   · 02_build_dataset.sh 打印的是**新清单**的病例数（看着像重建过了），
+    #   · 折划分却仍是旧数据集的病例号（零重叠）；
+    #   · 训练端一路提示"与当前数据不匹配"并退回按比例划分，
+    #     六个人各训一折的交叉验证从此不成立。
+    # 现在多一道覆盖性校验，不匹配就重建并把原因说清楚。
     if os.path.exists(out) and not force:
         try:
             with open(out, encoding="utf-8") as f:
                 existing = json.load(f)
             if len(existing) == n_folds:
-                return existing
-            print(f"[folds] 已有划分折数={len(existing)} 与请求 n_folds={n_folds} 不符 → 重建")
+                covered: set[str] = set()
+                for entry in existing.values():
+                    covered |= set((entry or {}).get("val") or [])
+                if covered == all_accs:
+                    return existing
+                print(f"[folds] 已有划分与当前数据**不匹配** → 重建："
+                      f"旧划分覆盖 {len(covered)} 例、当前 {len(all_accs)} 例、"
+                      f"交集仅 {len(covered & all_accs)} 例。"
+                      f"常见原因：folds.json 来自**另一个数据根**"
+                      f"（如换到官方数据后未重建），或数据清单被换过。", flush=True)
+            else:
+                print(f"[folds] 已有划分折数={len(existing)} 与请求 n_folds={n_folds} 不符 → 重建")
         except Exception as exc:                                  # noqa: BLE001
             print(f"[folds] 读取已有划分失败（{exc}）→ 重建")
 
@@ -820,7 +840,6 @@ def build_folds(manifest_path: str, n_folds: int = 5, val_ratio: float = 0.2,
         return [items[i::n_folds] for i in range(n_folds)]
 
     pos_parts, neg_parts = _partition(pos), _partition(neg)
-    all_accs = {c["accession"] for c in cases}
     folds: dict[str, dict] = {}
     for k in range(n_folds):
         val = sorted(set(pos_parts[k]) | set(neg_parts[k]))

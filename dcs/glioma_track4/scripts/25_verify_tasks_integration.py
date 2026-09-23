@@ -25,9 +25,11 @@
 from __future__ import annotations
 
 import inspect
+import json
 import math
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -41,6 +43,13 @@ if not (_MAIN / "tasks").is_dir():
     raise SystemExit(f"找不到提交工程 tasks/：{_MAIN}（用 GLIOMA_MAIN_ROOT 指定）")
 if not (_GOALS / "shared").is_dir():
     raise SystemExit(f"找不到训练工程 shared/：{_GOALS}（用 GLIOMA_GOALS_ROOT 指定）")
+
+# 三棵树都挂上搜索路径：断言里要跨工程 import（如算法工程的 src.data.dataset）。
+# 放在模块顶部而不是各段内部 —— 段内 import 会让该名字在**整个函数**里变成局部变量，
+# 前面先用到的段落会直接 UnboundLocalError。
+for _p in (_TRACK4, _GOALS, _MAIN):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 #: 两条训练路径的引擎（用于源码级断言）
 _GE_ENGINE = _MAIN / "tasks/_common/training/engine.py"      # 提交侧：统一多任务训练
@@ -295,6 +304,56 @@ def main() -> int:
     check("划分来源一致（不会一半用 folds、一半用 ratio）", len(_srcs) == 1,
           f"来源={sorted(_srcs)}")
 
+    # 六折/多折训练要靠入口传折号。这几条也是**防生成器覆盖**：
+    # train.py 由 gen_goals.py 生成，只改生成物的话下次重跑就没了。
+    _trains = {g: (_GOALS / g / "train.py").read_text(encoding="utf-8")
+               for g in ("goal1_authenticity", "goal2_stitched", "goal2_duplicate",
+                         "goal3_tumor", "goal4_diagnosis", "goal5_segmentation")}
+    check("六个 train.py 都支持 --fold",
+          all('"--fold"' in s for s in _trains.values()))
+    check("--fold 回写 cfg['train']（不回写则 build_datasets 读不到，折号被静默忽略）",
+          all('cfg["train"] = tr' in s for s in _trains.values()))
+    check("折号进 tag（否则多折写到同一 runs/<tag>/ 互相覆盖）",
+          all("_fold{a.fold}" in s for s in _trains.values()))
+    check("折号开跑前校验（写错时不再静默退回按比例划分）",
+          all("available_folds(cfg, data_root, HERE)" in s for s in _trains.values()) and
+          "def available_folds" in (_GOALS / "shared/data.py").read_text(encoding="utf-8"))
+    check("gen_goals.py 模板已同步（重跑生成器不会丢 --fold）",
+          '"--fold"' in (_GOALS / "gen_goals.py").read_text(encoding="utf-8"))
+
+    # 折划分**不能跨数据集复用**：原实现只比较折数，换数据根后若折数相同就原样
+    # 返回旧划分 —— 02 打印的是新清单病例数（看着像重建过了），折却是别的数据集的。
+    _folds_src = (_TRACK4 / "src/data/dataset.py").read_text(encoding="utf-8")
+    check("build_folds 复用旧划分前校验覆盖性", "covered == all_accs" in _folds_src)
+    _build_sh = (_TRACK4 / "scripts/02_build_dataset.sh").read_text(encoding="utf-8")
+    check("02_build_dataset 加了数据源闸门（防用旧清单建折）",
+          "assert_data_source(d" in _build_sh)
+
+    with tempfile.TemporaryDirectory() as _tmpf:
+        _mf = Path(_tmpf) / "manifest.json"
+
+        def _write_manifest(prefix: str) -> None:
+            cases = [{"accession": f"{prefix}{i:03d}", "dir": "/x",
+                      "images": {"t1c": {}}, "masks": {},
+                      "labels": {} if i % 4 else {"k": 1}} for i in range(20)]
+            _mf.write_text(json.dumps({"cases": cases, "data_source": "local/x/train"},
+                                      ensure_ascii=False), encoding="utf-8")
+
+        from src.data.dataset import build_folds                    # noqa: PLC0415
+        _write_manifest("C")
+        _f1 = build_folds(str(_mf), n_folds=5)
+        _cov1 = set().union(*[set(e["val"]) for e in _f1.values()])
+        check("折划分覆盖全部病例", _cov1 == {f"C{i:03d}" for i in range(20)})
+        _mt = (_mf.parent / "folds.json").stat().st_mtime_ns
+        check("覆盖当前数据时复用（重启某一折不会换掉整套划分）",
+              build_folds(str(_mf), n_folds=5) == _f1 and
+              (_mf.parent / "folds.json").stat().st_mtime_ns == _mt)
+        _write_manifest("D")
+        _f2 = build_folds(str(_mf), n_folds=5)
+        _cov2 = set().union(*[set(e["val"]) for e in _f2.values()])
+        check("换成另一份数据（同折数）时重建", _cov2 == {f"D{i:03d}" for i in range(20)},
+              f"交集 {len(_cov2 & _cov1)}")
+
     # ---------------------------------------------------------------- #
     _section("⑬ 平台五目录布局：解析正确、误用当场可见")
     # 平台挂载 /2026aicompetition/datasets/{training, evaluation_first,
@@ -302,8 +361,6 @@ def main() -> int:
     # **其中一个阶段目录**；停在上一层、或把 annotation/ 当病例，都不会报错，
     # 只会安静地跑出与检查集完全对不上的结果 —— 所以这里做**行为级**验证，
     # 而不只是扫源码。
-    import tempfile
-
     import nibabel as _nib
     import numpy as _np
 

@@ -18,6 +18,14 @@ from typing import Any
 #: 数据集根目录（所有 Goal 共享**只读**的数据；可用环境变量覆盖）
 ENV_DATASET = "GLIOMA_DATASET_ROOT"
 
+#: 数据根环境变量的**兼容别名**（按顺序取第一个存在的）。
+#:
+#: 算法工程 ``glioma_track4`` 用的是 ``DATASET_ROOT``，本工程历史上用
+#: ``GLIOMA_DATASET_ROOT``。两个工程常常在同一个 shell 里交替跑，只认一个名字会
+#: 让人"明明 export 了却没生效"，然后退到 ``../data``（可能根本不存在，
+#: 也可能存在但装的是别的数据集——后者更危险）。
+ENV_DATASET_ALIASES = (ENV_DATASET, "DATASET_ROOT", "DATASET_PATH")
+
 #: 各 Goal 的缓存根（必须彼此隔离：缓存写入冲突会静默产生半截文件）
 ENV_CACHE = "GLIOMA_CACHE_ROOT"
 
@@ -30,14 +38,17 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
 
 
 def dataset_root(cli_value: str | None = None) -> Path:
-    """数据根目录：CLI > 环境变量 > 相对路径 ../data。"""
-    for cand in (cli_value, os.environ.get(ENV_DATASET), "../data"):
+    """数据根目录：CLI > 环境变量（见 :data:`ENV_DATASET_ALIASES`）> ``../data``。"""
+    for cand in (cli_value,
+                 *(os.environ.get(name) for name in ENV_DATASET_ALIASES),
+                 "../data"):
         if cand:
             p = Path(cand).expanduser()
             if p.exists():
                 return p.resolve()
     raise FileNotFoundError(
-        f"找不到数据集根目录；请用 --data 指定，或设置 {ENV_DATASET}")
+        "找不到数据集根目录；请用 --data 指定，或设置 "
+        + " / ".join(ENV_DATASET_ALIASES))
 
 
 @dataclass

@@ -290,6 +290,28 @@ def split_cases(cases: list[dict], val_ratio: float, seed: int):
             [c for i, c in enumerate(cases) if i in val_idx])
 
 
+def available_folds(cfg: dict, data_root, goal_dir) -> tuple[Path | None, list[str]]:
+    """返回 ``(折划分文件, 可用折号列表)``；没有 ``folds.json`` 时返回 ``(None, [])``。
+
+    单独暴露它，是为了让训练入口能在**开跑前**校验 ``--fold N``：
+    折号写错时 :func:`split_train_val` 只会打印一行提示并**退回按比例划分**，
+    于是"六个 Goal 用同一折"这个前提被悄悄破坏 —— 指标不可比、权重也无法合并，
+    而训练日志、损失曲线一切正常。
+
+    （只读文件、不改任何东西；供命令行入口做参数校验用。）
+    """
+    for path in _candidate_folds(cfg, data_root, goal_dir):
+        try:
+            if not Path(path).is_file():
+                continue
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict) and data:
+            return Path(path), sorted(str(k) for k in data)
+    return None, []
+
+
 def split_train_val(cases: list[dict], cfg: dict, data_root, goal_dir,
                     seed: int = 42) -> tuple[list[dict], list[dict], str]:
     """决定 train/val 划分，返回 ``(train_cases, val_cases, source)``。
@@ -336,8 +358,13 @@ def split_train_val(cases: list[dict], cfg: dict, data_root, goal_dir,
             print(f"[data] 验证集 = 统一折划分 {p}（fold={fold}）"
                   f" train={len(trc)} val={len(vac)}", flush=True)
             return trc, vac, "folds"
-        print(f"[data] {p} 的 fold={fold} 与当前数据不匹配"
-              f"（train={len(trc)} val={len(vac)}），改用 val_ratio 划分", flush=True)
+        print(f"[data] ⚠️ {p} 的 fold={fold} 与当前数据不匹配"
+              f"（train={len(trc)} val={len(vac)} —— 病例号对不上）→ 退回 val_ratio 划分。"
+              f"最常见原因：该折划分来自**另一个数据根**（如从本地验证集切到官方数据后"
+              f"没重建）。请在算法工程目录按当前数据重建："
+              f"bash scripts/01_probe.sh && bash scripts/02_build_dataset.sh"
+              f"（换数据根后必须先跑 01，否则 02 会把旧清单的折当成本数据的折）",
+              flush=True)
         break
 
     val_ratio = float(tr.get("val_ratio", 0.2))

@@ -146,54 +146,133 @@ ID_COLUMN_KEYWORDS = ("accessionnumber", "accession_number", "accession_no", "ac
                       "检查序号", "记录号")
 
 
-def _find_id_column(row: dict) -> str | None:
-    """在表头里定位"检查号"列：**精确 → 包含**两级匹配。
+#: 只按**精确相等**匹配的短列名。
+#:
+#: 不能并进上面的"包含"匹配：``id`` 会命中 ``SeriesUid``，
+#: 于是整表按**序列号**建索引 —— 检查号永远对不上、字段全空，
+#: 而且它看起来"解析成功了"（有行数、无字段），比认不出更难查。
+ID_COLUMN_EXACT = ("id", "编号", "序号", "流水号")
 
-    官方表的表头命名不受我们控制（``AccessionNumber`` / ``检查号`` / ``PatientID``…）。
-    早期实现只按几个固定字面量取值，命名一变就整表取不到行 —— 表现为
-    ``n_structured_rows: 0`` 且 ``label_field_counts: {}``，
-    而表明明就在那儿、内容也齐全，最难查。
+#: 判定"这行是表头"用的字段线索（命中越多越像表头）
+FIELD_HINTS = ("病理", "glioma", "location", "lesion", "morpholog", "tumor",
+               "signal", "enhan", "坏死", "囊变", "出血", "钙化", "强化", "水肿")
+
+#: 已告警过的表（避免每次探测/训练都刷屏）
+_WARNED_TABLES: set[str] = set()
+
+
+def _find_id_column(header) -> str | None:
+    """在**表头单元格序列**里定位"检查号"列，返回命中的列名（原样）。
+
+    入参是表头**各单元格的值**（不是整行、也不是 dict）。这里踩过一次坑：
+    传 ``dict(enumerate(row))`` 时键变成了下标，于是"列名"永远匹配不上，
+    所有表都解析出 0 行 —— 连本来正常的小写 csv 也一起失效。
+
+    两轮匹配：① 精确（含 ``id``/``编号`` 这类短名）→ ② 包含
+    （**只用长关键词**，避免 ``id`` 命中 ``SeriesUid`` 而错把序列号当检查号）。
     """
-    lower = {str(k).strip().lower(): k for k in row}
-    for kw in ID_COLUMN_KEYWORDS:
+    cells = [str(c).strip() for c in header if str(c).strip()]
+    lower = {c.lower(): c for c in cells}
+    for kw in ID_COLUMN_KEYWORDS + ID_COLUMN_EXACT:                # ① 精确
         if kw in lower:
             return lower[kw]
-    for kw in ID_COLUMN_KEYWORDS:
+    for kw in ID_COLUMN_KEYWORDS:                                  # ② 包含（不用短名）
         for key_lower, key in lower.items():
             if kw in key_lower:
                 return key
     return None
 
 
-def read_structured_table(path: str) -> dict[str, dict]:
-    """读结构化金标准表（csv 或 xlsx）→ {accession_or_patient: {列名: 值}}。
+def _sheet_rows(path: str) -> list[list[list[str]]]:
+    """把 csv/xlsx 读成"若干张表、每张是原始行"（**不做任何表头假设**）。
 
-    检查号列按 :data:`ID_COLUMN_KEYWORDS` 自动识别（精确 → 包含），
-    因此 ``AccessionNumber`` / ``检查号`` / ``PatientID`` 等命名都能吃。
+    为什么不直接用 ``pandas.read_excel`` 的默认行为：它把**第一行**当表头、
+    且**只读第一个 sheet**。中文标注表的常见排版是
+
+        A1: 脑胶质瘤标注结果（训练集）      ← 标题
+        A2: （空行 / 填表说明）
+        A3: 检查号 | 病理结果 | …           ← 真正的表头
+
+    默认行为下列名会变成"标题/Unnamed"，检查号列认不出来，整表 0 行。
     """
-    rows: list[dict] = []
     if path.endswith((".xlsx", ".xls")):
         import pandas as pd
-        df = pd.read_excel(path, dtype=str)
-        rows = df.fillna("").to_dict("records")
-    else:
-        import csv
-        with open(path, encoding="utf-8-sig", newline="") as f:
-            rows = list(csv.DictReader(f))
+        sheets = pd.read_excel(path, sheet_name=None, header=None, dtype=str)
+        return [[["" if v is None else str(v).strip() for v in row]
+                 for row in frame.fillna("").values.tolist()]
+                for frame in sheets.values()]
+    import csv
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        return [[[str(c).strip() for c in row] for row in csv.reader(f)]]
 
+
+def _detect_header(rows: list[list[str]], max_scan: int = 20) -> int | None:
+    """在前若干行里找**真正的表头行**：必须含检查号列，字段线索越多越优先。
+
+    只看第一行是这个数据最常见的失效点（标题行占了第一行）；
+    而"必须含检查号列"这条同时挡住了把说明行、数据行误判成表头。
+    """
+    best: tuple[int, int] | None = None                            # (线索数, 行号)
+    for idx, row in enumerate(rows[:max_scan]):
+        if not any(str(c).strip() for c in row):
+            continue                                               # 空行
+        if _find_id_column(row) is None:
+            continue
+        hits = sum(1 for c in row
+                   if any(k in str(c).lower() for k in FIELD_HINTS))
+        if best is None or hits > best[0]:
+            best = (hits, idx)
+    return best[1] if best else None
+
+
+def read_structured_table(path: str) -> dict[str, dict]:
+    """读结构化金标准表（csv 或 xlsx）→ {检查号: {列名: 值}}。
+
+    三个"看起来应该没问题、实际常常出问题"的地方都做了处理：
+
+    1. **标题行/空行**：中文标注表的排版通常是
+       ``标题行 → 空行/说明 → 真正的表头``，而 ``pandas.read_excel``
+       默认把第一行当表头 —— 列名成了"标题/Unnamed"，检查号列认不出来，
+       整表解析出 **0 行**。这里改为自己在前若干行里找表头行。
+    2. **多工作表**：默认只读第一个 sheet；这里遍历全部 sheet。
+    3. **检查号大小写**：目录名是小写哈希、表里可能是大写，
+       因此大小写折叠后的键也一并登记。
+
+    一行都没解析出来时会打印告警（含表头预览），
+    而不是只给上层返回一个空字典。
+    """
     out: dict[str, dict] = {}
-    id_col: str | None = None
-    for r in rows:
-        r = {str(k).strip(): ("" if v is None else str(v).strip()) for k, v in r.items()}
-        if id_col is None or id_col not in r:                     # 表头可能换行/换表
-            id_col = _find_id_column(r)
-        if not id_col:
+    sheets = _sheet_rows(path)
+    for rows in sheets:
+        head = _detect_header(rows)
+        if head is None:
             continue
-        value = r.get(id_col) or ""
-        if not value:
+        header = [str(c).strip() for c in rows[head]]
+        id_name = _find_id_column(header)
+        if not id_name:
             continue
-        out[value] = r
-        out[value.lstrip("0") or value] = r
+        for row in rows[head + 1:]:
+            if not any(str(c).strip() for c in row):
+                continue                                          # 跳过空行
+            record: dict[str, str] = {}
+            for idx, col in enumerate(header):
+                if col:
+                    record[col] = str(row[idx]).strip() if idx < len(row) else ""
+            value = record.get(id_name, "")
+            if not value:
+                continue
+            stripped = value.lstrip("0") or value
+            for key in {value, stripped, value.casefold(), stripped.casefold()}:
+                out[key] = record
+
+    if not out and path not in _WARNED_TABLES:
+        _WARNED_TABLES.add(path)
+        preview = [[str(c)[:16] for c in row[:6]]
+                   for row in (sheets[0][:3] if sheets else [])]
+        print(f"[labels][告警] {os.path.basename(path)} 未解析出任何行："
+              f"没找到检查号列（候选关键词 {list(ID_COLUMN_KEYWORDS[:3])} 等）。"
+              f"前 3 行前 6 列={preview}", flush=True)
+    return out
     return out
 
 

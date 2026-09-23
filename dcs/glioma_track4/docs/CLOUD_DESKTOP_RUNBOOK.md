@@ -299,8 +299,15 @@ find /2026aicompetition/datasets -maxdepth 4 -name "SeriesType.xlsx"
 | `labels_hint` 内容 | 原因 | 处理 |
 |---|---|---|
 | `数据根及其上级 1~2 层都没找到 csv/xlsx 金标准表` | 表不在数据根附近 | 找到表所在层，把 `DATASET_ROOT` 定到**与表同级**的那层 |
-| `找到 N 个表但一行都没解析出来` | 表里没有可识别的检查号列 | 表需要有 `AccessionNumber` / `检查号` / `PatientId` 之类的列 |
-| `表解析出 N 行，但列名没映射到规范字段` | 列名不匹配 | 需要 `病理结果` / `location_of_lesion` / `lesion_morphology` / `tumor_feature_*` / `tumor_t2wi_signal_intensity` 这类列 |
+| `找到 N 个表但一行都没解析出来` | **表头没定位到**（标题行/空行占了第一行，或数据在别的 sheet，或检查号列名不认识） | 解析器已自动跳过前若干行、遍历所有 sheet、认多种检查号列名；若仍失败，告警里会打印 **前 3 行前 6 列**，按预览补关键词或告知处理方 |
+| `表解析出 N 行，但列名没映射到规范字段` | 表头找到了，但字段列名不匹配 | 需要 `病理结果` / `location_of_lesion` / `lesion_morphology` / `tumor_feature_*` / `tumor_t2wi_signal_intensity` 这类列 |
+
+> **最常见的坑**：中文标注表几乎都是
+> `A1 标题 → A2 空行/说明 → A3 真表头`，而 `pandas.read_excel` 默认把第一行当表头、
+> 且只读第一个 sheet —— 于是列名成了"标题/Unnamed"，检查号列认不出来，整表 **0 行**，
+> 而文件本身完全正常。现在解析器会**在前 20 行里找真表头**（要求该行含检查号列、
+> 且字段线索最多），并**遍历全部工作表**；同一行还会登记
+> `原值 / 去前导零 / 大小写折叠` 多个键，避免"表里大写哈希、目录里小写"这类对不上。
 
 一条命令看清候选表和命中情况：
 
@@ -329,6 +336,18 @@ find /2026aicompetition/datasets -maxdepth 4 \
 
 > 注意：字段金标准为空时**训练照常跑完**（损失只统计有 mask 的样本），
 > 只是目标三/目标四的分类头学不到东西。所以这一步的检查不能跳。
+
+**修好金标准后，折划分必须重建一次**：`build_folds` 是按"有无掩码/金标准"
+分层切折的（正负样本各轮流发牌）。金标准为空时**所有病例都被当成负样本**，
+切出来的折虽然仍互斥，却**没有按正样本分层** —— 正样本会随机落在一两个折里。
+
+```bash
+cd /2026aicompetition/workspace/dcs/glioma_track4
+rm -f data/folds.json            # 强制重建（否则覆盖性校验会通过、直接复用旧折）
+bash scripts/01_probe.sh         # 期望 label_field_counts 非空
+bash scripts/02_build_dataset.sh # 看「含标注/掩码 N」这个 N 是否合理
+python scripts/24_verify_eval_split.py   # 期望 0 项 WARN
+```
 
 ### 4.2 报「无任何可用序列」时的三级定位
 

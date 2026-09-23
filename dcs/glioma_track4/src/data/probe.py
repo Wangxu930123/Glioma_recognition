@@ -307,6 +307,10 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
             pass
     # 序列类型表只读一次，影像与特殊影像两条分支共用（避免"一处读了、一处没读"
     # 导致两边口径不一致）
+    # 字典里同一行会有多个键（原值 / 去前导零 / 大小写折叠），
+    # 直接 len() 会把"行数"报成实际的两倍以上，把诊断带偏 —— 按**唯一记录**计数。
+    n_struct_rows = len({id(v) for v in struct.values()})
+
     series_types = read_series_types(root)
     special = scan_special(root)
     cases = scan_real(root, limit_cases, struct, log, series_types)
@@ -337,7 +341,7 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
                        f"表里需要有 检查号/AccessionNumber/PatientId 之类的列"
                        f"（候选：{', '.join(os.path.basename(t) for t in tables[:3])}）")
     else:
-        labels_hint = (f"表解析出 {len(struct)} 行，但列名没映射到规范字段；"
+        labels_hint = (f"表解析出 {n_struct_rows} 行，但列名没映射到规范字段；"
                        f"需要 病理结果 / location_of_lesion / lesion_morphology / "
                        f"tumor_t2wi_signal_intensity 这类列")
 
@@ -345,7 +349,7 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
         "root": os.path.abspath(root),
         "n_cases": len(cases),
         "structured_tables": tables,
-        "n_structured_rows": len(struct),
+        "n_structured_rows": n_struct_rows,
         # 序列类型表命中数：0 且在官方数据上 → 模态/掩膜必然认不出，
         # 先解决这个再谈训练（"病例数正常但全 other"就是这个原因）
         "series_type_rows": len(series_types),

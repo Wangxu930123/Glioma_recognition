@@ -523,6 +523,46 @@ def main() -> int:
         check("有表无检查号列时 hint 指出认不出检查号",
               "检查号" in _re2["labels_hint"], _re2["labels_hint"][:36])
 
+        # 官方标注表的排版：标题行 → 空行 → 真表头。
+        # 早期实现把第一行当表头（pandas 默认行为），列名变成"标题/Unnamed"，
+        # 检查号列认不出 → 整表 0 行 → label_field_counts 空，而表看着完全正常。
+        from openpyxl import Workbook as _WB                          # noqa: PLC0415
+        from src.data.labels import read_structured_table as _rst     # noqa: PLC0415
+        _rt = Path(_tmpl) / "labels2"
+        _rt.mkdir()
+        _hp = _rt / "脑胶质瘤标注结果-训练集.xlsx"
+        _wb = _WB()
+        _ws = _wb.active
+        _ws.append(["脑胶质瘤标注结果（训练集）"])          # 标题行
+        _ws.append([])                                      # 空行
+        _ws.append(["检查号", "病理结果", "location_of_lesion", "lesion_morphology"])
+        _ws.append(["c0e1f8f253ba45be843411ca45073cac", "脑胶质瘤3级",
+                    "右侧基底节区", "规则"])
+        _wb.save(_hp)
+        _tb = _rst(str(_hp))
+        _key = "c0e1f8f253ba45be843411ca45073cac"
+        check("标题行/空行不影响表头识别（官方排版）",
+              str((_tb.get(_key) or {}).get("病理结果", "")) == "脑胶质瘤3级",
+              f"键数={len(_tb)}")
+        # 表里大写、磁盘小写 → 大小写折叠后仍能对上
+        _tb_up = _rst(str(_hp))
+        check("大小写折叠键可用", _key.upper() in {k.upper() for k in _tb_up} and
+              "3" == str(structured_from_row(_tb_up[_key]).get("WHO_Grade")))
+        # 数据在第二个工作表
+        _hp2 = _rt / "multi.xlsx"
+        _wb2 = _WB()
+        _wb2.active.title = "说明"
+        _wb2.active.append(["本表为说明页"])
+        _ws2 = _wb2.create_sheet("data")
+        _ws2.append(["AccessionNumber", "病理结果"])
+        _ws2.append(["ACC0001", "脑胶质瘤3级"])
+        _wb2.save(_hp2)
+        check("数据在第二个工作表也能读到", bool(_rst(str(_hp2)).get("ACC0001")))
+        # 计数用唯一记录数（同一行会有多个别名键，直接 len() 会翻倍）
+        _p_src = (_TRACK4 / "src/data/probe.py").read_text(encoding="utf-8")
+        check("n_structured_rows 按唯一记录计数",
+              "len({id(v) for v in struct.values()})" in _p_src)
+
     # ---------------------------------------------------------------- #
     print("\n" + "=" * 66)
     total = len(_PASSED) + len(_FAILED)

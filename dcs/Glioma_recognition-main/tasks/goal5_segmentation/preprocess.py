@@ -60,11 +60,14 @@ def build_volume(study: Study, cfg: Goal5Config) -> PreparedVolume:
         # 与 tasks/_common/volume.py 保持同一口径：报错要能自证"看到了什么序列"，
         # 否则只能看到一句"无任何可用序列"，无法判断是命名问题还是数据缺模态。
         seen = [(s.series_uid, s.modality) for s in list(study.series)[:6]]
+        from data.modality_fallback import describe_sources
+
         raise ValueError(
             f"study {study.accession_number!r} 无任何可用序列"
             f"（共 {len(study.series)} 条；uid/描述前几条={seen}）。"
             f"若 uid 是哈希或 DICOM UID，说明序列类型没读到："
             f"确认数据根下有 SeriesType.xlsx 或同名 .json sidecar"
+            f"（已自动尝试转模态识别：{describe_sources()}）"
         )
 
     # 1) 选参考网格：优先 1mm 附近的模态，且必须在实际存在的序列中选择

@@ -3,7 +3,11 @@
 规范要求把"序列选择"从 Loader 中独立出来（§5、§26），因为它是**任务相关**的：
 Goal5 需要 T1 增强与 FLAIR/T2，Goal2 duplicate 需要全部序列做指纹。
 
-本模块只做"从已有 Series 中挑选"，**不读盘、不重采样、不做几何变换**。
+本模块只做"从已有 Series 中挑选"，**常规路径不读盘**、不重采样、不做几何变换。
+
+唯一例外是 :func:`select` 里的**兜底判断**：一个好序列都挑不出来时（上层即将抛
+「无任何可用序列」或降级推理），转模态识别重挑一次（:mod:`data.modality_fallback`）。
+挑得到时这一步完全不发生——行为与开销与改动前一致。
 """
 from __future__ import annotations
 
@@ -44,11 +48,8 @@ def _key_of(series: Series) -> str | None:
     return guess_modality(series.modality) or guess_modality(series.series_uid)
 
 
-def select(study: Study, wanted: Iterable[str]) -> dict[str, Series]:
-    """按优先级返回 ``{模态: Series}``；同一模态取体素最多的那一个。
-
-    体素最多通常意味着覆盖最完整（少切片/局部序列会被排除）。
-    """
+def _select_picked(study: Study, wanted: tuple[str, ...]) -> dict[str, Series]:
+    """纯挑选：只读 ``study.series`` 里已有的描述，不碰磁盘。"""
     out: dict[str, Series] = {}
     for s in study.series:
         key = _key_of(s)
@@ -58,6 +59,29 @@ def select(study: Study, wanted: Iterable[str]) -> dict[str, Series]:
         if cur is None or s.image.size > cur.image.size:
             out[key] = s
     return out
+
+
+def select(study: Study, wanted: Iterable[str]) -> dict[str, Series]:
+    """按优先级返回 ``{模态: Series}``；同一模态取体素最多的那一个。
+
+    体素最多通常意味着覆盖最完整（少切片/局部序列会被排除）。
+
+    **兜底判断（只在"要报错"时生效）**：一个好序列都挑不出来，说明上层马上要抛
+    「无任何可用序列」（规范 §9.1 不可降级）或被迫降级推理——此时自动转模态识别：
+    用官方 ``3_serieslabel.xlsx`` 给认不出模态的序列重贴描述后再挑一次
+    （:func:`data.modality_fallback.recover_study`，含工作区搜索与 UID 回退）。
+    重挑仍为空 → 返回空，让上层按**原逻辑**报错；**挑到了就继续**。
+
+    挑得到序列时整个兜底不触发：不读盘、零额外开销，行为与改动前一致
+    （除 ``wanted`` 会被物化成 tuple——顺带修掉"传生成器时只对第一条序列生效"的隐患）。
+    """
+    wanted = tuple(wanted)
+    out = _select_picked(study, wanted)
+    if out or not wanted:
+        return out
+    from data.modality_fallback import recover_study
+
+    return _select_picked(recover_study(study), wanted)
 
 
 def select_first(study: Study, wanted: Iterable[str]) -> Series | None:

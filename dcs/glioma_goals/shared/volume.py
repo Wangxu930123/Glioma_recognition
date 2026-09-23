@@ -47,6 +47,47 @@ def zscore(vol: np.ndarray, clip: tuple[float, float] = (0.5, 99.5)) -> np.ndarr
     return ((x - m) / (s if s > 1e-6 else 1.0)).astype(np.float32)
 
 
+def _no_usable_series_message(study) -> str:
+    """「无任何可用序列」的报错原文：带上"看到了什么" + 模态来源自检。
+
+    只报一句"无任何可用序列"时，既不知道序列叫什么、也不知道是**表没接上**
+    还是**表里本来就没有 T1CE/T2/FLAIR**，而这段堆栈还常常埋在 DataLoader
+    worker 里（看不出是路径问题）。因此把两类信息都拼进报错：
+
+    - 每条序列的 ``uid`` / ``描述``，并标注描述的性质：
+      ``未解析（描述退化成目录名/UID）`` = 类型表与 sidecar 都没给值；
+      ``描述里没有模态关键词`` = 拿到了值（表/sidecar）但不是目标模态（如取值
+      ``其他``）——后者说明该病例确实没有目标序列，不是路径问题；
+    - 官方 ``labels/3_serieslabel.xlsx`` 到底找没找到
+      （:func:`shared.official_labels.describe_modality_sources`）。
+    """
+    from shared.official_labels import describe_modality_sources
+    from shared.selector import guess_modality
+
+    seen = []
+    for s in list(study.series)[:6]:
+        uid = str(getattr(s, "series_uid", "?") or "?")
+        desc = str(getattr(s, "modality", "") or "")
+        if not desc or desc == uid:
+            note = "未解析（描述退化成目录名/UID）"
+        elif guess_modality(desc) is None:
+            note = "描述里没有模态关键词"
+        else:
+            note = ""
+        seen.append((uid, desc, note) if note else (uid, desc))
+    return (
+        f"study {study.accession_number!r} 无任何可用序列"
+        f"（共 {len(study.series)} 条序列；uid/描述前几条={seen}）。"
+        f"模态来源自检：{describe_modality_sources(getattr(study, 'data_root', None))}。"
+        f"按顺序试：① 定位并接上官方表 —— find $WORKSPACE -name 3_serieslabel.xlsx，"
+        f"再 export GLIOMA_LABELS_DIR=<它所在目录>（或软链到 <工程>/labels），重跑训练；"
+        f"② 若自检显示表已找到、描述也不是 UID，说明表里这几条序列的标注本身不是 "
+        f"T1CE/T2/FLAIR（如 ''其他''）——属于该病例确实没有目标模态，不是路径问题；"
+        f"③ 详见 glioma_track4/docs/DATASET_ROOT_TROUBLESHOOT.md"
+        f"「病例数正常、却报无任何可用序列」"
+    )
+
+
 def build_volume(study, common_spacing: tuple[float, float, float] = (1.0, 1.0, 1.0),
                  channels: tuple[str, ...] = CHANNEL_ORDER) -> PreparedVolume:
     """把 ``Study`` 归一化到公共网格，返回多通道体积。
@@ -56,17 +97,10 @@ def build_volume(study, common_spacing: tuple[float, float, float] = (1.0, 1.0, 
     """
     picked = select_series(study, channels)
     if not picked:
-        # 报错里带上"看到了什么序列"：否则只看到一句"无任何可用序列"，
-        # 既不知道序列叫什么、也不知道是命名问题还是路径问题，
-        # 而这段堆栈还常常埋在 DataLoader worker 里。
-        seen = [(getattr(s, "series_uid", "?"), getattr(s, "modality", ""))
-                for s in list(study.series)[:6]]
-        raise ValueError(
-            f"study {study.accession_number!r} 无任何可用序列"
-            f"（共 {len(study.series)} 条序列；uid/描述前几条={seen}）。"
-            f"若 uid 是哈希或 DICOM UID，说明模态要靠数据根下的 SeriesType.xlsx 提供；"
-            f"请把数据根定到与它同级的那一层（见 docs/DATASET_ROOT_TROUBLESHOOT.md）"
-        )
+        # 报错自带"看到了什么序列 + 模态来源自检 + 两条可粘贴命令"：
+        # 否则只看到一句"无任何可用序列"，既不知道序列叫什么、也不知道是
+        # 命名问题、路径问题还是标注本身没有目标模态（详见该辅助函数）。
+        raise ValueError(_no_usable_series_message(study))
 
     ref_key = next((k for k in _REF_PRIORITY if k in picked), next(iter(picked)))
     ref = picked[ref_key]

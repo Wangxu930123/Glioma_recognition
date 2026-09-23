@@ -94,12 +94,19 @@ def _norm_key(value) -> str:
 
 
 def read_series_types(root: Path) -> dict[tuple[str, str], str]:
-    """读官方 ``SeriesType.xlsx``：``(检查号, 序列号) → 序列类型``。
+    """读官方 ``3_serieslabel.xlsx``（兼容旧名 ``SeriesType.xlsx``）：
+    ``(检查号, 序列号) → 序列类型``。
 
     ⚠️ **官方数据下这是模态的唯一来源**。序列目录名是 DICOM UID
-    （``1.2.826.0.1...``），任何"按名字猜模态"的关键词都命中不了，
+    （``2.25.135...``），任何"按名字猜模态"的关键词都命中不了，
     于是出现"扫出几千例、却一例都没有可用序列"——但病例计数看起来完全正常，
     很容易被误判成数据损坏或路径写错。
+
+    表**不随数据集下发**，定位见 :func:`shared.official_labels.find_official_labels`：
+    显式/环境变量 → ``<工程>/labels`` → **``$WORKSPACE`` 下 3 层** → 数据根/父/祖父
+    （团队工作区那份在 ``<workspace>/dcs/*/*/labels``，靠自动搜做到零配置）。
+    表里检查号列与磁盘目录名对不上**不再是问题**：查表走两级口径
+    （精确键 → SeriesUid 单键回退，见 :func:`shared.official_labels.lookup_series_type`）。
 
     与提交工程 ``data/metadata.py: read_series_types`` 保持同一语义：
     表头别名容错、缺文件返回空表（不是错误）、同一键冲突取值**直接失败**。
@@ -198,7 +205,8 @@ def _sidecar_desc(path: Path) -> str | None:
     return None
 
 
-def _series_desc(path: Path, accession: str, uid: str, series_types: dict) -> str:
+def _series_desc(path: Path, accession: str, uid: str, series_types: dict,
+                 uid_index: dict | None = None) -> str:
     """序列类型的**取用优先级**：类型表 → sidecar → 目录名。
 
     返回的文本会作为 ``Series`` 的 ``modality`` 交给模态关键词匹配，
@@ -208,12 +216,17 @@ def _series_desc(path: Path, accession: str, uid: str, series_types: dict) -> st
     ``<检查号>/<序列号>/<序列号>.nii.gz``（序列号在目录名上）
     与 ``<检查号>/<序列号>.nii.gz``（序列号在文件名上）都可能出现，
     只试目录名会让后者整批认不出模态。
+
+    查表走两级（:func:`shared.official_labels.lookup_series_type`）：先
+    ``(检查号, 序列号)`` 精确键，查不到再按 **SeriesUid 单键回退** ——
+    表里的检查号列与磁盘目录名口径不一致时（匿名化/哈希），精确键会整批落空。
     """
+    from shared.official_labels import lookup_series_type
+
     stem = path.name[:-7] if path.name.lower().endswith(".nii.gz") else path.stem
-    for candidate in (uid, stem):
-        value = series_types.get((_norm_key(accession), _norm_key(candidate)))
-        if value:
-            return str(value)
+    value = lookup_series_type(series_types, accession, (uid, stem), uid_index)
+    if value:
+        return str(value)
     value = _sidecar_desc(path)
     if value:
         return value
@@ -335,7 +348,11 @@ def discover_cases(dataset_root: Path, limit: int | None = None) -> list[dict]:
     """
     root = resolve_case_root(Path(dataset_root))   # 填高一层（如 .../training）时自动下钻
     assert_case_root(root)
+    from shared.official_labels import build_uid_index
+
     series_types = read_series_types(root)
+    # 表里的检查号列与磁盘目录名对不上时，靠它按 SeriesUid 单键回退（见 _series_desc）
+    uid_index = build_uid_index(series_types)
     ctx = _official_context(root)
     cases: list[dict] = []
 
@@ -349,7 +366,7 @@ def discover_cases(dataset_root: Path, limit: int | None = None) -> list[dict]:
             if not f.is_file() or not f.name.lower().endswith(NIFTI_SUFFIXES):
                 continue
             uid = f.parent.name
-            desc = _series_desc(f, acc_dir.name, uid, series_types)
+            desc = _series_desc(f, acc_dir.name, uid, series_types, uid_index)
             # 官方掩膜表：文件名任意（core.nii.gz…），关键词认不出，必须查表
             if f.name in (table_masks.get(_norm_key(uid)) or []):
                 role = _mask_role(f.name, desc) or "core"
@@ -365,7 +382,7 @@ def discover_cases(dataset_root: Path, limit: int | None = None) -> list[dict]:
         if not series:
             return None
         case = {"accession": acc_dir.name, "dir": str(acc_dir),
-                "series": series, "source": source}
+                "series": series, "source": source, "root": str(root)}
         if masks:
             case["masks"] = masks
         rec = ctx["labels"].get(acc_dir.name) or ctx["labels"].get(acc_key)
@@ -429,10 +446,15 @@ def discover_cases(dataset_root: Path, limit: int | None = None) -> list[dict]:
         guess_modality(s.get("desc") or s.get("uid") or "")
         for c in cases[:50] for s in c.get("series") or []
     ):
-        print("[data] ⚠️ 没有任何序列能识别出模态：数据根下没有官方 "
-              "3_serieslabel.xlsx，且目录名/文件名都不含模态关键词。\n"
+        from shared.official_labels import describe_modality_sources
+
+        print("[data] ⚠️ 没有任何序列能识别出模态（前 50 例逐条试过：目录名/文件名不含关键词，"
+              "类型表也没给出 T1CE/T2/FLAIR 这类取值）。\n"
+              f"       自检：{describe_modality_sources(root)}\n"
               "       继续训练会在取数时报「无任何可用序列」。\n"
-              "       处理：把官方 labels/ 放到 <工程>/labels/ 或设 GLIOMA_LABELS_DIR",
+              "       处理：先 find $WORKSPACE -name 3_serieslabel.xlsx 定位；表若本来就在，"
+              "说明清单/标注有问题（把自检行与报错原文一起贴出来）；确实缺表就 "
+              "export GLIOMA_LABELS_DIR=<它所在目录>（或软链到 <工程>/labels）",
               flush=True)
     return cases
 
@@ -623,7 +645,8 @@ def load_case(case: dict, common_spacing=(1.0, 1.0, 1.0), cache_dir: Path | None
         img = _load_with_affine(s["path"])
         series.append({**s, "image": img[0], "affine": img[1]})
 
-    prepared = build_volume(_AsStudy(case["accession"], series), common_spacing)
+    prepared = build_volume(_AsStudy(case["accession"], series,
+                                     data_root=case.get("root")), common_spacing)
     vol = prepared.volume
 
     masks: dict[str, np.ndarray] = {}
@@ -660,9 +683,12 @@ def _load_with_affine(path: str):
 class _AsStudy:
     """把轻量 dict 适配成 ``build_volume`` 期望的接口（避免共享库绑定团队类）。"""
 
-    def __init__(self, accession: str, series: list[dict]) -> None:
+    def __init__(self, accession: str, series: list[dict],
+                 data_root: str | None = None) -> None:
         self.accession_number = accession
         self.series = [_AsSeries(s) for s in series]
+        # 供 build_volume 的报错自检定位官方标注表（表不在数据集里，见 DATASET_ROOT 文档）
+        self.data_root = data_root
 
 
 class _AsSeries:

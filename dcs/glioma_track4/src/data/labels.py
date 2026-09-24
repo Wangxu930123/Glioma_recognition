@@ -185,21 +185,26 @@ def _find_id_column(header) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
-# 官方标注表（天坛医院参考实现 `AIRecongition/` 的约定）
+# 天坛参考实现 `AIRecongition/` 的 5 张表（⚠️ **不是赛道四数据集的内容**）
 # --------------------------------------------------------------------------- #
-#: 官方标注表文件名 → 用途
+#: 参考实现标注表文件名 → 用途
+#:
+#: ⚠️ **这 5 张表与赛道四数据集没有一点关系**（属工作区里另一个目标的产物）：
+#: 赛道四的数据信息就是数据集自带的 ``SeriesType.xlsx``（见
+#: :data:`SERIES_TYPE_TABLE`）与训练集的 ``脑胶质瘤标注结果-训练集.xlsx``（字段金标准）。
+#: 下面这套仍保留读取，**只为兼容**：表在附近时能用上就用，读不到属正常、不是配置问题。
 #:
 #: | 文件 | 关键列 | 用途 |
 #: |---|---|---|
 #: | ``1_abnormal.xlsx`` | AccessionNumber, SeriesUid, **Label** ∈ {true,fake,compositing,duplicate} | 目标一/二的正样本（**逐序列**） |
 #: | ``2_duplicate.xlsx`` | src_img, desc_img | 重复影像 pair |
-#: | ``3_serieslabel.xlsx`` | AccessionNumber, SeriesUid, **SeriesLabel** ∈ {T1CE,T2,FLAIR} | **模态的唯一来源** |
+#: | ``3_serieslabel.xlsx`` | AccessionNumber, SeriesUid, **SeriesLabel** ∈ {T1CE,T2,FLAIR} | 模态（**兼容兜底**；权威是数据集里的 ``SeriesType.xlsx``） |
 #: | ``4_masklabel.xlsx`` | AccessionNumber, SeriesUid, **Maskname** | 掩膜文件名（任意名，关键词认不出） |
-#: | ``5_characteristics.xlsx`` | AccessionNumber + 14 个英文列 | 结构化字段金标准 |
+#: | ``5_characteristics.xlsx`` | AccessionNumber + 14 个英文列 | 结构化字段金标准（**兼容**；数据集里那份是中文表头的 ``脑胶质瘤标注结果-训练集.xlsx``） |
 #:
-#: 这套约定是**唯一权威**。在此之前我们按 ``SeriesType.xlsx`` / 中文列名去猜，
-#: 于是出现"病例数正常、一例都挑不出模态""字段金标准为空"——
-#: 表一直都在，只是文件名和列名都不是我们猜的那套。
+#: 这套约定是**唯一权威**。在此之前我们按中文列名去猜，于是出现
+#: "病例数正常、一例都挑不出模态""字段金标准为空"——表一直都在，
+#: 只是文件名和列名都不是我们猜的那套。
 OFFICIAL_LABEL_FILES = {
     "abnormal": "1_abnormal.xlsx",
     "duplicate": "2_duplicate.xlsx",
@@ -207,6 +212,25 @@ OFFICIAL_LABEL_FILES = {
     "mask": "4_masklabel.xlsx",
     "characteristics": "5_characteristics.xlsx",
 }
+
+#: 序列类型表在**赛道四数据集里**的文件名（**权威**）。
+#:
+#: 它的位置与影像同层：``<阶段>/annotation/SeriesType.xlsx``，
+#: 三个阶段的**数据里都有**（``training`` / ``verification`` 训练与验证集已下发，
+#: ``evaluation_*`` 评测集在正式测试时**随测试数据一起下发**）。
+#: 列：``AccessionNumber`` + ``SeriesUid`` + ``SeriesType``；
+#: 取值共 **5 类**：``T1`` / ``T1CE（增强）`` / ``T2-Flair`` / ``T2WI`` / ``其他``。
+SERIES_TYPE_TABLE = "SeriesType.xlsx"
+
+#: 团队工作区里那份**名字不同、来源也不同**的表（``<workspace>/dcs/*/*/labels/``）。
+#:
+#: ⚠️ 它**不是赛道四数据集的内容**（是工作区里另一个目标的产物），只是列结构与
+#: 上表同构、取值写法更粗（``T1CE``/``T2``/``FLAIR``），所以保留为**兜底**：
+#: 数据集那份读不到时才用它。顺序不能反 —— 详见 :func:`read_series_types`。
+SERIES_TYPE_TABLE_LEGACY = "3_serieslabel.xlsx"
+
+#: 两个命名的**查找顺序**（前者权威）：自检文案与探针日志都按这个顺序打印。
+SERIES_TYPE_FILENAMES = (SERIES_TYPE_TABLE, SERIES_TYPE_TABLE_LEGACY)
 
 #: 官方标注表所在目录的环境变量（对应官方 config 的 ``paths.labels_dir``）
 LABELS_DIR_ENV = "GLIOMA_LABELS_DIR"
@@ -269,21 +293,55 @@ def workspace_labels_dirs(max_depth: int = 3) -> list[Path]:
     return sorted(set(hits), key=score, reverse=True)
 
 
-def find_official_labels(root: str | os.PathLike | None = None,
-                         labels_dir: str | os.PathLike | None = None) -> dict[str, str]:
-    """定位官方 5 张标注表 → ``{用途: 路径}``（找不到的键不出现）。
+#: 候选目录里**值得下钻一层**的子目录名（大小写无关）：标注/结果类容器。
+#:
+#: 为什么不无脑扫全部子目录：平台数据根下有 **3000+ 病例目录**（32 位哈希），
+#: 逐个 stat 既慢，又会在备份/缓存目录里撞到同名旧表。而"标注放在哪个容器目录"
+#: 其实是个有限集合 —— 平台那份在 ``training/annotation/``（英文）
+#: 或下载后的 ``标注结果/``（中文），下面这些名字把两种情况都覆盖了。
+_LABEL_SUBDIR_NAMES = frozenset({
+    "labels", "label", "annotation", "annotations", "标注结果", "标注", "结果",
+    "gold", "groundtruth", "ground_truth", "gt", "meta", "metadata", "results",
+})
 
-    搜索顺序（逐个候选目录试，命中即止）：
+#: 往下钻几层。2 层是为了覆盖"数据根填高一层（``training/``）**且**
+#: 表还在容器子目录里（``annotation/标注结果/``）"这种叠加情况。
+_LABEL_SUBDIR_DEPTH = 2
+
+
+def _subdir_candidates(base: Path) -> list[Path]:
+    """``base`` 下"像标注容器"的一级子目录（读不了就返回空，不抛）。
+
+    先按名字过滤再 ``is_dir()``：数据根下可能有 3000+ 病例目录，
+    对每个条目都 stat 一次会白花几十毫秒（这里只在名字命中时才 stat）。
+    """
+    try:
+        entries = sorted(base.iterdir())
+    except OSError:
+        return []
+    return [p for p in entries
+            if p.name.lower() in _LABEL_SUBDIR_NAMES and p.is_dir()]
+
+
+def label_search_dirs(root: str | os.PathLike | None = None,
+                      labels_dir: str | os.PathLike | None = None) -> list[Path]:
+    """标注表候选目录（**顺序即优先级**，命中即止）。
 
     1. 显式传入的 ``labels_dir``（对应官方 config 的 ``paths.labels_dir``）
     2. 环境变量 ``GLIOMA_LABELS_DIR``
     3. **本工程目录下的 ``labels/``**（官方默认 ``./labels``）
     4. ``$WORKSPACE`` 下名为 ``labels`` 的目录（**团队工作区里那份**；平台不随数据集下发，
        见 :func:`workspace_labels_dirs`。容器里靠这一步做到零配置）
-    5. 数据根自身、父目录、祖父目录（平台有时把标注放在数据旁边）
+    5. 数据根自身、父目录、祖父目录 —— 平台把 ``SeriesType.xlsx`` 放在**病例目录那一层**
+       （``training/annotation/``），第 5 条就是为它准备的；传进来的若是**病例目录**，
+       父/祖父两级正好覆盖到 ``annotation/``
+    6. 上述每个目录下"像标注容器"的一级子目录（见 :data:`_LABEL_SUBDIR_NAMES`）——
+       防止表藏在 ``annotation/`` 的下一层（下载解压后常见的 ``标注结果/``）
 
-    官方把标注放在**工程目录**而不是数据集里 —— 这也是"数据根下找不到金标准"的原因之一。
-    ``root=None`` 时只搜 1~4（用于报错时做"表到底在不在"的自检）。
+    抽成独立函数是因为序列类型表（模态来源）与其它表**可能不在一起**：
+    赛道四数据集自带 ``SeriesType.xlsx``（与病例目录同层），而工作区那份
+    ``3_serieslabel.xlsx`` 在 ``labels/`` 下；两套搜索必须同一口径，否则又出现
+    "表在磁盘上、代码却只看了一个目录"。
     """
     cands: list[Path] = []
     if labels_dir:
@@ -300,6 +358,50 @@ def find_official_labels(root: str | os.PathLike | None = None,
             base = base.absolute()
         cands.extend([base, base.parent, base.parent.parent])
 
+    # 去重（保留优先级顺序）后，再为每个目录补上"值得下钻的子目录"（逐层展开，见
+    # :data:`_LABEL_SUBDIR_DEPTH`）。用广度优先是为了保持"先浅后深"的优先级：
+    # 数据根那一层永远排在自己的子目录前面。
+    out: list[Path] = []
+    seen: set[str] = set()
+    for folder in cands:
+        frontier = [folder]
+        for _ in range(_LABEL_SUBDIR_DEPTH + 1):
+            nxt: list[Path] = []
+            for cand in frontier:
+                key = str(cand)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(cand)
+                nxt.extend(_subdir_candidates(cand))
+            frontier = nxt
+    return out
+
+
+def find_named_table(filename: str, root: str | os.PathLike | None = None,
+                     labels_dir: str | os.PathLike | None = None) -> str | None:
+    """在候选目录里按**文件名**找一张表 → 路径（找不到返回 ``None``）。
+
+    为什么不复用 :func:`find_official_labels`：它只认那 5 个固定名字
+    （``3_serieslabel.xlsx`` 等），而赛道四数据集里那张叫 ``SeriesType.xlsx`` ——
+    列结构同构、名字不同，必须在**同一批候选目录**里分别找，才能既认数据集又兼容工作区。
+    """
+    for folder in label_search_dirs(root, labels_dir):
+        candidate = folder / filename
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def find_official_labels(root: str | os.PathLike | None = None,
+                         labels_dir: str | os.PathLike | None = None) -> dict[str, str]:
+    """定位官方 5 张标注表 → ``{用途: 路径}``（找不到的键不出现）。
+
+    搜索顺序见 :func:`label_search_dirs`。官方把标注放在**工程目录**而不是数据集里 ——
+    这也是"数据根下找不到金标准"的原因之一。``root=None`` 时只搜 1~4
+    （用于报错时做"表到底在不在"的自检）。
+    """
+    cands = label_search_dirs(root, labels_dir)
     found: dict[str, str] = {}
     for kind, name in OFFICIAL_LABEL_FILES.items():
         for folder in cands:
@@ -876,15 +978,19 @@ def lookup_series_type(series_types: dict | None, accession: str = "",
 def describe_modality_sources(root: str | os.PathLike | None = None) -> str:
     """一句话自检"模态来源现在什么状态"（专供报错文案，省掉一轮来回排查）。
 
-    形如 ``标注表 3_serieslabel.xlsx=<路径或"未找到">；体素判别模型 <路径>=存在/缺失``。
-    两种来源都不可用时，任何模态相关报错都会附带它 —— 用户立刻能分清是
-    "表没接上"还是"体素模型没装"，不必猜。
+    形如 ``类型表 SeriesType.xlsx=<路径>；类型表 3_serieslabel.xlsx=<路径或"未找到">；
+    体素判别模型 <路径>=存在/缺失``。两种来源都不可用时，任何模态相关报错都会附带它
+    —— 用户立刻能分清是"表没接上"还是"体素模型没装"，不必猜。
+
+    ``root`` 传**病例目录**也行：候选目录含数据根/父/祖父，正好覆盖到
+    ``training/annotation/``（``SeriesType.xlsx`` 与病例目录同层）。
     """
-    labels = find_official_labels(root)
-    series = labels.get("series")
-    table_desc = (f"标注表 3_serieslabel.xlsx={series}" if series
-                  else "标注表 3_serieslabel.xlsx=未找到（已搜 $GLIOMA_LABELS_DIR、"
-                       "<工程>/labels、$WORKSPACE 下 3 层、数据根/父/祖父）")
+    found = [(name, find_named_table(name, root)) for name in SERIES_TYPE_FILENAMES]
+    table_desc = "；".join(f"类型表 {name}={path}" for name, path in found if path)
+    if not table_desc:
+        table_desc = ("类型表 SeriesType.xlsx / 3_serieslabel.xlsx=均未找到（已搜 "
+                      "$GLIOMA_LABELS_DIR、<工程>/labels、$WORKSPACE 下 3 层、数据根/父/祖父；"
+                      "平台数据里这张表与病例目录同层，叫 SeriesType.xlsx）")
     try:
         from .modality_model import DEFAULT_MODEL_PATH
         model_desc = (f"体素判别模型 {DEFAULT_MODEL_PATH}="
@@ -915,18 +1021,30 @@ def has_strict_mask_hint(text: str) -> bool:
 _WARNED_SERIES_TYPE_DEP = False
 
 
-def read_series_types(root: str | os.PathLike) -> dict[tuple[str, str], str]:
+def read_series_types(root: str | os.PathLike,
+                      labels_dir: str | os.PathLike | None = None
+                      ) -> dict[tuple[str, str], str]:
     """读序列类型：``(检查号, 序列号) → 序列类型``（模态的唯一可靠来源）。
 
-    ⚠️ 官方数据的序列目录名是 DICOM UID / 哈希，靠"按名字猜关键词"一个都命中不了：
+    ⚠️ 数据里的序列目录名是 DICOM UID / 哈希，靠"按名字猜关键词"一个都命中不了：
     探针会把整批序列归到 ``other``，训练侧直接报 ``无任何可用序列`` ——
     而病例数、目录结构看起来完全正常，极易被误判成数据损坏或路径写错。
 
-    两个来源都读，**官方优先**：
+    两个来源都读，**数据集那份优先**（同名表放在哪都能找到，见 :func:`label_search_dirs`）：
 
-    1. **``3_serieslabel.xlsx``**（官方 ``labels/`` 下的权威来源，列 ``SeriesLabel``
-       ∈ {T1CE, T2, FLAIR}）—— 见天坛参考实现 ``AIRecongition/``
-    2. ``SeriesType.xlsx``（团队 README 里提到的名字，官方数据里通常并没有）
+    1. **``SeriesType.xlsx``（权威，就在数据集里）** ——
+       ``<阶段>/annotation/SeriesType.xlsx``，与病例目录同层；
+       ``training`` / ``verification`` 已下发，``evaluation_*`` 评测期**随测试数据一起下发**。
+       列 ``SeriesType ∈ {T1, T1CE（增强）, T2-Flair, T2WI, 其他}``。
+       它不只在数据根那一层 —— 数据根指成**某一病例目录**或**填高一层**时也要能找到，
+       所以统一按候选目录搜（数据根/父/祖父 + 像标注容器的子目录）。
+    2. **``3_serieslabel.xlsx``（兜底）** —— 团队工作区 ``labels/`` 下那份，
+       ``SeriesLabel ∈ {T1CE,T2,FLAIR}``。它**不是赛道四数据集的内容**，只是列结构同构，
+       仅在①读不到时补缺（``setdefault``），**绝不覆盖**①的取值。
+
+    顺序为什么不能反：工作区那份与数据集无关，若它恰好也覆盖同一批检查号、取值却更粗
+    （例如只写 ``T2`` 而数据集写 ``T2WI`` 或 ``T2-Flair``），反过来会**静默覆盖**权威取值 ——
+    表现是"模态看着都认出来了，通道里却是错的对比度"，比直接报错难查得多。
 
     缺文件不是错误；同一文件内同键冲突取值**直接失败**（规范 §21）。
     """
@@ -934,20 +1052,10 @@ def read_series_types(root: str | os.PathLike) -> dict[tuple[str, str], str]:
 
     out: dict[tuple[str, str], str] = {}
 
-    # ---- ① 官方 3_serieslabel.xlsx（权威来源）----
-    series_file = find_official_labels(root).get("series")
-    if series_file:
-        for (acc, uid), value in read_serieslabel_table(series_file).items():
-            # 查表方统一用 _norm_key（去空白 + 大小写无关），这里也要归一化后再存，
-            # 否则"表里大写、目录里小写"会静默查不到
-            out[(_norm_key(acc), _norm_key(uid))] = value
-        print(f"[labels] 已读官方序列类型 {os.path.basename(series_file)}："
-              f"{len(out)} 条", flush=True)
-
-    # ---- ② SeriesType.xlsx（兼容旧命名；不存在就跳过，**不能提前 return**）----
-    path = os.path.join(str(root), "SeriesType.xlsx")
-    if not os.path.isfile(path):
-        return out
+    # ---- ① SeriesType.xlsx（**赛道四数据集里的就是这张**，权威取值）----
+    path = find_named_table(SERIES_TYPE_TABLE, root, labels_dir)
+    if not path:
+        return _read_legacy_series_types(out, root, labels_dir)
 
     rows: list[list] = []
     try:
@@ -969,7 +1077,7 @@ def read_series_types(root: str | os.PathLike) -> dict[tuple[str, str], str]:
                 print(f"[probe][告警] 发现 {path} 但既没有 openpyxl 也没有 pandas，"
                       f"序列类型读不到 → UID 命名的序列会全部归到 other。"
                       f"请 pip install openpyxl（{exc}）", flush=True)
-            return out
+            return _read_legacy_series_types(out, root, labels_dir)
 
     aliases = {
         "acc": ("accessionnumber", "accession", "检查号", "检查编号", "病例号"),
@@ -1005,8 +1113,59 @@ def read_series_types(root: str | os.PathLike) -> dict[tuple[str, str], str]:
                 f"SeriesType.xlsx 冲突：检查号={acc!r} 序列={uid!r} "
                 f"同时映射到 {seen_here[key]!r} 与 {value!r}（{path}）")
         seen_here[key] = value
-        out.setdefault(key, value)                                # 官方表优先，这里只补缺
+        out[key] = value                                          # 数据集那份 = 权威取值
+    if seen_here:
+        print(f"[labels] 已读序列类型表 {os.path.basename(path)}：{len(seen_here)} 条"
+              f"（{path}）", flush=True)
+    return _read_legacy_series_types(out, root, labels_dir)
+
+
+def _read_legacy_series_types(out: dict[tuple[str, str], str],
+                              root: str | os.PathLike,
+                              labels_dir: str | os.PathLike | None
+                              ) -> dict[tuple[str, str], str]:
+    """补读团队工作区那份 ``3_serieslabel.xlsx``：**只补缺，不覆盖** ``out``。
+
+    它**不是赛道四数据集的内容**（属工作区里另一个目标的产物），列结构恰好同构，
+    所以留作兜底；一旦数据集的 ``SeriesType.xlsx`` 给了同一个 ``(检查号, 序列号)``
+    的取值，就以数据集为准（``key not in out`` 判断）。
+    """
+    legacy = find_named_table(SERIES_TYPE_TABLE_LEGACY, root, labels_dir)
+    if not legacy:
+        return out
+    added = 0
+    for (acc, uid), value in read_serieslabel_table(legacy).items():
+        # 查表方统一用 _norm_key（去空白 + 大小写无关），这里也要归一化后再存，
+        # 否则"表里大写、目录里小写"会静默查不到
+        key = (_norm_key(acc), _norm_key(uid))
+        if key not in out:
+            out[key] = value
+            added += 1
+    if added:
+        print(f"[labels] 已读兼容类型表 {os.path.basename(legacy)}："
+              f"{added} 条（{legacy}；数据集里的 SeriesType.xlsx 优先）", flush=True)
     return out
+
+
+#: 类型表里**明确表示"不是目标模态"**的取值。
+#:
+#: 平台下发的 ``SeriesType.xlsx`` 给**每一路**序列都标了类型，不属于
+#: T1 / T2-Flair / T1CE（增强）的写成 ``其他``。这是**权威结论**，不能再当成
+#: "没认出来"丢给体素模型猜：模型只认识 t1c/t2/flair/t1 四类，把一路 DWI/ADC
+#: 判成 ``t2``（置信度往往还不低）会往通道里灌错对比度 —— 比留一个空通道更有害；
+#: 顺带还白跑一次模型、也把 ``unknown_series_total`` 这个诊断指标带偏。
+EXPLICIT_OTHER_VALUES = frozenset({
+    "其他", "其它", "其他序列", "非目标", "other", "others", "none", "na", "n/a", "无",
+})
+
+
+def is_explicit_other(text: Any) -> bool:
+    """该序列类型是否**明确写着"其他"**（而不是"没写/没认出来"）。
+
+    只认**全等**，不做包含匹配：``其他肿瘤或病变`` 是病灶/病理取值（见
+    :data:`NON_GLIOMA`），不是"序列类型=其他"，混在一起会把真正的影像丢掉。
+    """
+    return _norm_key(text) in EXPLICIT_OTHER_VALUES
 
 
 def nifti_stem(filename: str) -> str:
@@ -1042,7 +1201,14 @@ def sidecar_desc(path: str | os.PathLike) -> str | None:
 
 
 #: 不是"结构化金标准"的表（按文件名排除）
-_NON_LABEL_TABLE_KW = ("seriestype", "series_type", "gold", "duplicate", "folds")
+#: 非"字段金标准表"的文件名关键词（见 :func:`find_structured_tables`）。
+#: 两个序列类型表的命名（``SeriesType`` / ``3_serieslabel``）都在其中：
+#: 后者的列是 ``AccessionNumber/SeriesUid/SeriesLabel``，一行字段都映射不出来，
+#: 混进来只会让"解析出 N 行 / 有表但没解析出"这两句诊断互相矛盾。
+_NON_LABEL_TABLE_KW = ("seriestype", "series_type",          # 模态表（平台 + 团队两命名）
+                       "serieslabel", "series_label",        # 模态表（3_serieslabel.xlsx）
+                       "masklabel", "mask_label",            # 掩膜名表（4_masklabel.xlsx）
+                       "gold", "duplicate", "folds")
 
 
 def find_structured_tables(root: str, max_parents: int = 2) -> list[str]:
@@ -1053,9 +1219,12 @@ def find_structured_tables(root: str, max_parents: int = 2) -> list[str]:
     "表明明存在、却一条都没读进来"，报告里只显示 ``{}``，
     分不清是"没表"还是"数据根定位偏了一层"。
 
-    排除两类同名表：``SeriesType.xlsx``（有专用读取器）与 ``gold*.csv``
-    （重复影像的金标准，是 pair 列表而非字段表）—— 它们会污染"解析出 N 行"
-    这个计数，把诊断信息带偏。
+    排除另有专用读取器的表（见 :data:`_NON_LABEL_TABLE_KW`）：序列类型表
+    （``SeriesType.xlsx`` / ``3_serieslabel.xlsx``）、掩膜名表（``4_masklabel.xlsx``）、
+    重复影像金标准（``gold*.csv`` / ``2_duplicate.xlsx``）—— 它们都不是字段金标准，
+    混进来会污染"解析出 N 行"这个计数，把诊断信息带偏。
+
+    唯一**保留**的官方表是 ``5_characteristics.xlsx``（14 个英文列的字段金标准）。
     """
     roots: list[str] = [os.path.abspath(root)]
     parent = roots[0]

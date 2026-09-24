@@ -111,11 +111,13 @@ def _modality_model():
 def classify_unknown(case: dict, cfg: dict, log: list | None = None) -> dict[str, dict]:
     """把"认不出模态"的序列交给统计模型判别 → ``{通道名: meta}``。
 
-    **为什么必须有这条路**：官方训练集给了 ``3_serieslabel.xlsx``，评测集不给；
-    评测集的序列目录名是 DICOM UID，任何关键词都命中不了。此时若不判模态：
-    训练侧表现为"无任何可用序列"直接崩，推理侧更隐蔽 ——
-    ``inference/pipeline.py`` 要先知道"哪个序列是 T1C"才能把掩码写回它的空间，
-    认不出就写不回去，提交上去的掩码空间是错的（评测端直接判错）。
+    **为什么必须有这条路（兜底，不是默认）**：模态的权威来源是数据信息
+    ``<阶段>/annotation/SeriesType.xlsx``（评测集在正式测试时才随测试数据下发）。
+    表还没到手、或表里恰好没有这个检查号时，序列目录名是 DICOM UID、任何关键词
+    都命中不了。此时若不判模态：训练侧表现为"无任何可用序列"直接崩，
+    推理侧更隐蔽 —— ``inference/pipeline.py`` 要先知道"哪个序列是 T1C"
+    才能把掩码写回它的空间，认不出就写不回去，提交上去的掩码空间是错的
+    （评测端直接判错）。**表里明写 ``其他`` 的序列不走这里**（那是权威排除）。
 
     依赖 ``case["unknown_series"]``（``data.probe`` 产出，已剔除能靠名字认出的序列）。
     """
@@ -226,7 +228,8 @@ def build_case_volume(case: dict, cfg: dict, log: list | None = None
     picked = pick_series(case, cfg, log)
     if not picked:
         # 报出"清单里到底有哪些序列键"：键全为 other/空，说明模态没认出来
-        # （官方数据靠 labels/3_serieslabel.xlsx），而不是这张检查真的没影像。
+        # （官方数据靠序列类型表：平台下发的 SeriesType.xlsx / 团队那份 3_serieslabel.xlsx），
+        # 而不是这张检查真的没影像。
         # 顺带自检两种模态来源的可用性，并给出可直接粘贴的两条命令 —— 见
         # docs/DATASET_ROOT_TROUBLESHOOT.md「病例数正常、却报无任何可用序列」。
         imgs = case.get("images") or {}
@@ -235,10 +238,11 @@ def build_case_volume(case: dict, cfg: dict, log: list | None = None
             f"（清单里的序列键={sorted(imgs)[:8]}；"
             f"未知序列 {len(case.get('unknown_series') or [])} 路）。"
             f"模态来源自检：{describe_modality_sources(case.get('dir'))}。"
-            f"按顺序试：① export GLIOMA_LABELS_DIR=<含 3_serieslabel.xlsx 的目录>"
-            f"（或 ln -s 到 <工程>/labels），然后重跑 bash scripts/01_probe.sh 与 "
+            f"按顺序试：① export GLIOMA_LABELS_DIR=<含类型表 SeriesType.xlsx / "
+            f"3_serieslabel.xlsx 的目录>（或 ln -s 到 <工程>/labels），平台数据的表就在 "
+            f"annotation/ 下、与病例目录同层；然后重跑 bash scripts/01_probe.sh 与 "
             f"bash scripts/02_build_dataset.sh；"
-            f"② 没有标注表时训练体素判别模型："
+            f"② 没有类型表时训练体素判别模型："
             f"python3 scripts/31_train_modality_model.py --root <数据根>"
             f"（产出 data/modality_model.json）；"
             f"③ 详见 docs/DATASET_ROOT_TROUBLESHOOT.md「病例数正常、却报无任何可用序列」"

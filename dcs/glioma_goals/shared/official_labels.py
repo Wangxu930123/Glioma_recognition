@@ -8,6 +8,7 @@
 | ``1_abnormal.xlsx`` | AccessionNumber, SeriesUid, **Label** ∈ {true,fake,compositing,duplicate} | 目标一（真实性）/ 目标二-A（拼接）的正样本，**逐序列** |
 | ``2_duplicate.xlsx`` | src_img, desc_img | 目标二-B（重复影像）的正对 |
 | ``3_serieslabel.xlsx`` | AccessionNumber, SeriesUid, **SeriesLabel** ∈ {T1CE,T2,FLAIR} | **模态的唯一来源** |
+| ``SeriesType.xlsx`` | AccessionNumber, SeriesUid, **SeriesType** ∈ {T1, T1CE（增强）, T2-Flair, T2WI, 其他} | **赛道四数据集自带的数据信息**：与病例目录同层（``<阶段>/annotation/``），训练/验证集都有、评测集随测试数据下发；取值里的 ``其他`` 是权威排除（不是模态）。与 5 张表**无关**，只是列结构同构 |
 | ``4_masklabel.xlsx`` | AccessionNumber, SeriesUid, **Maskname** | 掩膜文件名（任意名，关键词认不出） |
 | ``5_characteristics.xlsx`` | AccessionNumber + 14 个英文列 | 目标三/四的结构化字段金标准 |
 
@@ -121,16 +122,60 @@ def find_official_labels(root: str | os.PathLike | None = None,
                          labels_dir: str | os.PathLike | None = None) -> dict[str, str]:
     """定位官方 5 张标注表 → ``{用途: 路径}``（找不到的键不出现）。
 
-    搜索顺序（逐个候选目录试，命中即止）：
+    搜索顺序见 :func:`label_search_dirs`（逐个候选目录试，命中即止）。
+    ``root=None`` 时只搜 1~4（用于报错时做"表到底在不在"的自检）。
+    """
+    found: dict[str, str] = {}
+    for kind, name in OFFICIAL_LABEL_FILES.items():
+        hit = find_named_table(name, root, labels_dir)
+        if hit:
+            found[kind] = hit
+    return found
+
+
+#: 候选目录里**值得下钻一层**的子目录名（大小写无关）：标注/结果类容器。
+#:
+#: 为什么不无脑扫全部子目录：平台数据根下有 **3000+ 病例目录**（32 位哈希），
+#: 逐个 stat 既慢，又会在备份/缓存目录里撞到同名旧表。而"标注放在哪个容器目录"
+#: 是个有限集合：平台那份在 ``training/annotation/``（英文）或下载后的
+#: ``标注结果/``（中文），下面这些名字把两种情况都覆盖了。
+_LABEL_SUBDIR_NAMES = frozenset({
+    "labels", "label", "annotation", "annotations", "标注结果", "标注", "结果",
+    "gold", "groundtruth", "ground_truth", "gt", "meta", "metadata", "results",
+})
+
+#: 往下钻几层。2 层是为了覆盖"数据根填高一层（``training/``）**且**
+#: 表还在容器子目录里（``annotation/标注结果/``）"这种叠加情况。
+_LABEL_SUBDIR_DEPTH = 2
+
+
+def _subdir_candidates(base: Path) -> list[Path]:
+    """``base`` 下"像标注容器"的一级子目录（读不了就返回空，不抛）。
+
+    先按名字过滤再 ``is_dir()``：数据根下可能有 3000+ 病例目录，
+    对每个条目都 stat 一次会白花几十毫秒（这里只在名字命中时才 stat）。
+    """
+    try:
+        entries = sorted(base.iterdir())
+    except OSError:
+        return []
+    return [p for p in entries
+            if p.name.lower() in _LABEL_SUBDIR_NAMES and p.is_dir()]
+
+
+def label_search_dirs(root: str | os.PathLike | None = None,
+                      labels_dir: str | os.PathLike | None = None) -> list[Path]:
+    """标注表候选目录（**顺序即优先级**，命中即止）。
 
     1. 显式传入的 ``labels_dir``（对应官方 config 的 ``paths.labels_dir``）
     2. 环境变量 ``GLIOMA_LABELS_DIR``
     3. **本工程目录下的 ``labels/``**（官方默认 ``./labels``）
     4. ``$WORKSPACE`` 下名为 ``labels`` 的目录（**团队工作区里那份**；平台不随数据集
        下发，见 :func:`workspace_labels_dirs`。容器里靠这一步做到零配置）
-    5. 数据根自身、父目录、祖父目录（平台有时把标注放在数据旁边）
-
-    ``root=None`` 时只搜 1~4（用于报错时做"表到底在不在"的自检）。
+    5. 数据根自身、父目录、祖父目录 —— 平台把 ``SeriesType.xlsx`` 放在**病例目录那一层**
+       （``training/annotation/``）；传进来的若是**病例目录**，父/祖父正好覆盖到它
+    6. 上述目录下"像标注容器"的一级子目录（见 :data:`_LABEL_SUBDIR_NAMES`）——
+       防住"表藏在数据根下一层（如 ``标注结果/``）"这种情况
     """
     cands: list[Path] = []
     if labels_dir:
@@ -147,14 +192,36 @@ def find_official_labels(root: str | os.PathLike | None = None,
             base = base.absolute()
         cands.extend([base, base.parent, base.parent.parent])
 
-    found: dict[str, str] = {}
-    for kind, name in OFFICIAL_LABEL_FILES.items():
-        for folder in cands:
-            candidate = folder / name
-            if candidate.is_file():
-                found[kind] = str(candidate)
-                break
-    return found
+    out: list[Path] = []
+    seen: set[str] = set()
+    for folder in cands:
+        frontier = [folder]
+        for _ in range(_LABEL_SUBDIR_DEPTH + 1):
+            nxt: list[Path] = []
+            for cand in frontier:
+                key = str(cand)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(cand)
+                nxt.extend(_subdir_candidates(cand))
+            frontier = nxt
+    return out
+
+
+def find_named_table(filename: str, root: str | os.PathLike | None = None,
+                     labels_dir: str | os.PathLike | None = None) -> str | None:
+    """在候选目录里按**文件名**找一张表 → 路径（找不到返回 ``None``）。
+
+    与 :func:`find_official_labels` 同一批候选目录，区别只在"名字由调用方给"：
+    序列类型表在**平台**上叫 ``SeriesType.xlsx``、在团队工作区里叫
+    ``3_serieslabel.xlsx``，同一张表两个命名 → 必须分别找。
+    """
+    for folder in label_search_dirs(root, labels_dir):
+        candidate = folder / filename
+        if candidate.is_file():
+            return str(candidate)
+    return None
 
 
 def build_uid_index(series_types: dict | None) -> dict[str, str]:
@@ -201,19 +268,19 @@ def lookup_series_type(series_types: dict | None, accession: str = "",
 def describe_modality_sources(root: str | os.PathLike | None = None) -> str:
     """一句话自检"模态来源现在什么状态"（专供报错文案，省掉一轮来回排查）。
 
-    形如 ``标注表 3_serieslabel.xlsx=<路径或"未找到">；旧名 SeriesType.xlsx <路径>=存在/缺失``。
+    形如 ``类型表 SeriesType.xlsx=<路径>；类型表 3_serieslabel.xlsx=<路径或"未找到">``。
     报错带上它，用户立刻能分清是"表没接上"还是"表接到了但标注本身不含目标模态"。
+    ``root`` 传**病例目录**也行：候选目录含数据根/父/祖父，正好覆盖到
+    ``training/annotation/``。
     """
-    labels = find_official_labels(root)
-    series = labels.get("series")
-    table_desc = (f"标注表 3_serieslabel.xlsx={series}" if series
-                  else "标注表 3_serieslabel.xlsx=未找到（已搜 $GLIOMA_LABELS_DIR、"
-                       "<工程>/labels、$WORKSPACE 下 3 层、数据根/父/祖父）")
-    if root is None:
-        return table_desc
-    legacy = Path(str(root)).expanduser() / "SeriesType.xlsx"
-    return (f"{table_desc}；旧名 SeriesType.xlsx {legacy}="
-            f"{'存在' if legacy.is_file() else '缺失'}")
+    found = [(name, find_named_table(name, root))
+             for name in ("SeriesType.xlsx", "3_serieslabel.xlsx")]
+    table_desc = "；".join(f"类型表 {name}={path}" for name, path in found if path)
+    if not table_desc:
+        table_desc = ("类型表 SeriesType.xlsx / 3_serieslabel.xlsx=均未找到（已搜 "
+                      "$GLIOMA_LABELS_DIR、<工程>/labels、$WORKSPACE 下 3 层、数据根/父/祖父；"
+                      "平台数据里这张表与病例目录同层，叫 SeriesType.xlsx）")
+    return table_desc
 
 
 # --------------------------------------------------------------------------- #

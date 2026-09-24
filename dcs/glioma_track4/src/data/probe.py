@@ -20,11 +20,12 @@ import os
 from collections import Counter
 
 from ..utils.config import data_source_tag, load_paths, resolve
-from .labels import (build_uid_index, find_official_labels, find_structured_tables,
-                     guess_modality, has_strict_mask_hint, id_key, lookup_series_type,
-                     mask_role_for, read_abnormal_table, read_duplicate_pairs,
-                     read_mask_table, read_series_types, read_structured_table,
-                     sidecar_desc, structured_from_row)
+from .labels import (build_uid_index, find_named_table, find_official_labels,
+                     find_structured_tables,
+                     guess_modality, has_strict_mask_hint, id_key, is_explicit_other,
+                     lookup_series_type, mask_role_for, read_abnormal_table,
+                     read_duplicate_pairs, read_mask_table, read_series_types,
+                     read_structured_table, sidecar_desc, structured_from_row)
 
 IMG_EXT = (".nii.gz", ".nii")
 SKIP_NAME_KW = ("dicomdir", "license", "readme", "vht", ".mhd")
@@ -211,7 +212,9 @@ def _collect_nifti(cdir: str, accession: str = "",
     - mask_entries: ``[(role, modality, path, series_uid), ...]``（同一角色可多条 → 取并集）
     - unknown: **认不出模态的序列全表**（``[{...}]``）
 
-    ``unknown`` 为什么必须单独返回：评测集没有 ``3_serieslabel.xlsx``，
+    ``unknown`` 为什么必须单独返回：数据的模态来自数据信息 ``SeriesType.xlsx``
+    （评测集在正式测试时才随测试数据下发；表没到手或表里没有这个检查号时
+    就一条都认不出来），
     序列目录名是 DICOM UID，关键词一个都命中不了 —— 此时唯一的出路是
     **读体素用统计模型判模态**（``data.modality_model``）。而原先的实现
     只把**第一个**认不出的序列塞进 ``images["other"]``、其余直接丢弃，
@@ -263,7 +266,13 @@ def _collect_nifti(cdir: str, accession: str = "",
                 key = mod or "other"
                 if key not in images:
                     images[key] = dict(meta)          # 兼容旧语义：仍是"第一个"
-                if mod is None:
+                if mod is None and is_explicit_other(desc):
+                    # 类型表**明确写了"其他"**（如平台 SeriesType.xlsx 的 其他）：
+                    # 这是权威结论"它不是 T1/T2/FLAIR/T1CE 中的任何一个"，
+                    # 不是"没认出来"。丢给体素模型猜只会把 DWI/ADC 判成 t2
+                    # 填进通道（比空通道更有害），所以标记后不进 unknown。
+                    images[key]["declared_other"] = True
+                elif mod is None:
                     # 认不出模态的序列**全部保留**（见 docstring：评测期要靠模型回头判）
                     unknown.append({**meta, "reason": desc or stem or sdir})
     return images, masks, unknown
@@ -297,9 +306,10 @@ def scan_real(root: str, limit_cases: int | None = None,
               mask_by_acc: dict | None = None) -> list[dict]:
     """扫描真实影像：一级目录 = 检查号；其下收集影像（NIfTI/DICOM）与掩码。
 
-    ``SeriesType.xlsx``（若存在于数据根）会一次性读入并用于识别**模态与掩膜**：
-    官方数据的序列目录名与文件名都是 UID，只靠关键词会得到"整批 other、
-    掩膜全无"，而目录结构看起来完全正常。
+    平台下发的 ``training/annotation/SeriesType.xlsx``（与病例目录**同层**）
+    会被一次性读入并用于识别**模态与掩膜**：官方数据的序列目录名与文件名都是
+    UID（``2.25.*``），只靠关键词会得到"整批 other、掩膜全无"，
+    而病例数与目录结构看起来完全正常。
     """
     cases: list[dict] = []
     root = resolve_case_root(root)                 # 填高一层（如 .../training）时自动下钻
@@ -309,8 +319,9 @@ def scan_real(root: str, limit_cases: int | None = None,
     if series_types is None:
         series_types = read_series_types(root)
     if series_types:
-        print(f"[probe] 已读取序列类型映射：{len(series_types)} 条"
-              f"（来源：官方 3_serieslabel.xlsx 优先，其次 SeriesType.xlsx）", flush=True)
+        print(f"[probe] 已读取序列类型映射：{len(series_types)} 条（来源："
+              f"{'SeriesType.xlsx' if find_named_table('SeriesType.xlsx', root) else '3_serieslabel.xlsx'}）",
+              flush=True)
     # UID 单键回退索引：一次建好、全病例复用（表可能上万行，别放进每病例的循环里）
     uid_index = build_uid_index(series_types)
     entries = sorted(e for e in os.listdir(root)
@@ -408,9 +419,12 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
     known_ids = ({id_key(e) for e in os.listdir(root)
                   if os.path.isdir(os.path.join(root, e)) and e.lower() != "annotation"}
                  if os.path.isdir(root) else set())
-    # ★ 官方 5 张标注表（`1_abnormal` / `2_duplicate` / `3_serieslabel` /
-    #   `4_masklabel` / `5_characteristics`）是**权威来源**：模态、掩膜、
-    #   字段金标准都在这里，而不是靠目录名或关键词能猜出来的。
+    # 天坛参考实现那 5 张表（`1_abnormal` / `2_duplicate` / `3_serieslabel` /
+    # `4_masklabel` / `5_characteristics`）**不是赛道四数据集的内容**，只在附近
+    # 有（如团队工作区 labels/）时顺手用上：字段金标准、掩膜名表都在这里，
+    # 靠目录名或关键词猜不出来。数据集自带的模态信息在 `SeriesType.xlsx`
+    # （上面 read_series_types 已读），字段金标准在
+    # `annotation/脑胶质瘤标注结果-训练集.xlsx`（下面 find_structured_tables 会找到）。
     label_files = find_official_labels(root)
     if label_files:
         print("[probe] 官方标注表：" + ", ".join(
@@ -461,7 +475,7 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
 
     mod_counter, mask_counter, label_counter = Counter(), Counter(), Counter()
     geom_samples = []
-    n_unknown_series = n_unknown_cases = 0
+    n_unknown_series = n_unknown_cases = n_declared_other = 0
     for c in cases:
         mod_counter.update(c["images"].keys())
         mask_counter.update(c["masks"].keys())
@@ -472,6 +486,10 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
         n_u = len(c.get("unknown_series") or [])
         n_unknown_series += n_u
         n_unknown_cases += int(n_u > 0)
+        # 被类型表**明确标为"其他"**的病例数。它与"认不出"必须分开统计：
+        # 前者是权威结论（该排除），后者才需要模型兜底；混在一起会让人
+        # 以为"表没接上"，然后跑去重配 labels_dir 白折腾。
+        n_declared_other += int(bool((c["images"].get("other") or {}).get("declared_other")))
         if len(geom_samples) < sample_geometry:
             for mod, meta in list(c["images"].items())[:1]:
                 geom_samples.append({"accession": c["accession"], "modality": mod,
@@ -515,6 +533,9 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
         # 此时全靠 data/modality_model.json 兜底（见 DATASET_ROOT_TROUBLESHOOT.md）
         "unknown_series_total": n_unknown_series,
         "cases_with_unknown_series": n_unknown_cases,
+        # 类型表里写着"其他"的病例数（`SeriesType.xlsx` 常见）：**不是**缺表信号，
+        # 这些序列不参与模态判别（见 labels.EXPLICIT_OTHER_VALUES）
+        "cases_with_declared_other_series": n_declared_other,
         "mask_role_counts": dict(mask_counter),
         "label_field_counts": dict(label_counter),
         "labels_hint": labels_hint,
@@ -559,10 +580,18 @@ def main() -> None:
         print(f"[probe] ⚠️ 结构化字段金标准为空（label_field_counts={{}}）："
               f"{res['report']['labels_hint']}")
     if res["report"]["modality_counts"].get("other") and not res["report"]["series_type_rows"]:
-        print("[probe] ⚠️ 有序列落到 other 且没读到 3_serieslabel.xlsx（官方权威来源）："
-              "先 export GLIOMA_LABELS_DIR=<含该表的目录>（或 ln -s 到 <工程>/labels）"
+        # 序列类型表在数据里（platform）或工作区（团队那份）都能被找到，所以走到这里
+        # 就是"两处都没有"—— 而不是我们没看那几个目录。
+        print("[probe] ⚠️ 有序列落到 other 且没读到任何序列类型表"
+              "（SeriesType.xlsx / 3_serieslabel.xlsx）："
+              "先确认数据根指向的是含 annotation/ 的那一层（表与病例目录同层），"
+              "或 export GLIOMA_LABELS_DIR=<含该表的目录>（/ ln -s 到 <工程>/labels）"
               "再重跑本探针；表也没有时走体素判别兜底（见下一条）。"
               "排查步骤：docs/DATASET_ROOT_TROUBLESHOOT.md")
+    if res["report"].get("cases_with_declared_other_series"):
+        print(f"[probe] ℹ️ {res['report']['cases_with_declared_other_series']} 例含被类型表标为"
+              f"『其他』的序列（不属于 T1/T2-FLAIR/T1CE），已排除、不交给体素模型猜；"
+              f"这是正常现象，不必去补标注表")
     if res["report"].get("unknown_series_total"):
         # 评测集没有标注表 → 关键词必然全失效。这条路是**预期**的，
         # 关键是别让它静默：说清有多少路要走模型判别、模型在不在。

@@ -7,7 +7,8 @@
 用法：
     export COMPETITION_PIPELINE_FACTORY=tasks.glioma.pipeline:build_pipeline
 
-详细说明见 ``docs/INTEGRATION_WITH_TEAM.md``。
+契约细节见 ``integration/common.py`` 顶部注释与 ``integration/tasks.py``；
+整体运行方式见 ``docs/MASTER_GUIDE.md``。
 """
 
 from .factory import build_pipeline

@@ -94,17 +94,27 @@ def _norm_key(value) -> str:
 
 
 def read_series_types(root: Path) -> dict[tuple[str, str], str]:
-    """读官方 ``3_serieslabel.xlsx``（兼容旧名 ``SeriesType.xlsx``）：
+    """读序列类型表（``3_serieslabel.xlsx`` / ``SeriesType.xlsx`` 两个命名）：
     ``(检查号, 序列号) → 序列类型``。
 
-    ⚠️ **官方数据下这是模态的唯一来源**。序列目录名是 DICOM UID
+    ⚠️ **数据里这是模态的唯一来源**。序列目录名是 DICOM UID
     （``2.25.135...``），任何"按名字猜模态"的关键词都命中不了，
     于是出现"扫出几千例、却一例都没有可用序列"——但病例计数看起来完全正常，
     很容易被误判成数据损坏或路径写错。
 
-    表**不随数据集下发**，定位见 :func:`shared.official_labels.find_official_labels`：
-    显式/环境变量 → ``<工程>/labels`` → **``$WORKSPACE`` 下 3 层** → 数据根/父/祖父
-    （团队工作区那份在 ``<workspace>/dcs/*/*/labels``，靠自动搜做到零配置）。
+    **两个命名、两个来源，数据集那份优先**（列都是 检查号 + 序列号 + 类型）：
+
+    * ``SeriesType.xlsx`` —— **赛道四数据集的内容**：``<阶段>/annotation/`` 下、
+      与病例目录同层（表头实测就是 ``AccessionNumber`` / ``SeriesUid`` /
+      ``SeriesType``；取值 **5 类**：``T1`` / ``T1CE（增强）`` / ``T2-Flair`` /
+      ``T2WI`` / ``其他``）。训练集、验证集都有，**评测集随测试数据一起下发**；
+    * ``3_serieslabel.xlsx`` —— 团队工作区 ``labels/``（**不是数据集的内容**，
+      属另一个目标的产物；仅作兜底、不覆盖数据集取值）。
+
+    定位见 :func:`shared.official_labels.label_search_dirs`：显式/环境变量 →
+    ``<工程>/labels`` → **``$WORKSPACE`` 下 3 层** → 数据根/父/祖父 →
+    这些目录下像标注容器的一级子目录（``annotation`` / ``标注结果`` …）。
+    只认其中一个名字、或只认数据根那一层，都会在另一半环境里翻车。
     表里检查号列与磁盘目录名对不上**不再是问题**：查表走两级口径
     （精确键 → SeriesUid 单键回退，见 :func:`shared.official_labels.lookup_series_type`）。
 
@@ -116,23 +126,21 @@ def read_series_types(root: Path) -> dict[tuple[str, str], str]:
     """
     global _WARNED_NO_OPENPYXL
 
-    # ---- ① 官方 `3_serieslabel.xlsx`（权威来源，列 `SeriesLabel`）----
-    # 官方数据的模态**只能**从这里得到；`SeriesType.xlsx` 是我们早期按团队 README
-    # 猜的名字，官方数据集里并没有它。
-    from shared.official_labels import find_official_labels, read_series_labels
+    from shared.official_labels import (find_named_table, find_official_labels,
+                                        read_series_labels)
 
     out: dict[tuple[str, str], str] = {}
-    series_file = find_official_labels(root).get("series")
-    if series_file:
-        for (acc, uid), value in read_series_labels(series_file).items():
-            out[(_norm_key(acc), _norm_key(uid))] = value
-        print(f"[data] 已读官方序列类型 {Path(series_file).name}：{len(out)} 条",
-              flush=True)
 
-    # ---- ② `SeriesType.xlsx`（兼容旧命名；不存在就跳过，**不能提前 return**）----
-    path = Path(root) / "SeriesType.xlsx"
-    if not path.is_file():
-        return out
+    # ---- ① `SeriesType.xlsx`（**赛道四数据集里的就是这张**，权威取值）----
+    # 位置与影像同层：`<阶段>/annotation/SeriesType.xlsx`（训练/验证集已下发，
+    # 评测集在正式测试时随测试数据一起下发）。早期这里写的是
+    # `Path(root) / "SeriesType.xlsx"`：只认数据根那一层，于是数据根指成
+    # annotation/ 的上一层（或表被放进容器子目录）时，表就在磁盘上却读不到 ——
+    # 现在与官方表走同一批候选目录（数据根/父/祖父 + 像标注容器的子目录）。
+    hit = find_named_table("SeriesType.xlsx", root)
+    path = Path(hit) if hit else None
+    if path is None:
+        return _read_legacy_series_types(out, root)
     try:
         from openpyxl import load_workbook
     except ImportError:                                           # pragma: no cover
@@ -141,7 +149,7 @@ def read_series_types(root: Path) -> dict[tuple[str, str], str]:
             print(f"[data][告警] 发现 {path} 但未安装 openpyxl，序列类型读不到 → "
                   f"UID 命名的序列会全部认不出模态。请先 pip install openpyxl",
                   flush=True)
-        return {}
+        return _read_legacy_series_types(out, root)
 
     aliases = {
         "acc": ("accessionnumber", "accession", "检查号", "检查编号", "病例号"),
@@ -180,9 +188,38 @@ def read_series_types(root: Path) -> dict[tuple[str, str], str]:
                         f"SeriesType.xlsx 冲突：检查号={acc!r} 序列={uid!r} "
                         f"同时映射到 {seen_here[key]!r} 与 {value!r}（{path}）")
                 seen_here[key] = value
-                out.setdefault(key, value)                        # 官方表优先，这里只补缺
+                out[key] = value                                  # 数据集那份 = 权威取值
     finally:
         workbook.close()
+    if seen_here:
+        print(f"[data] 已读序列类型表 {path.name}：{len(seen_here)} 条（{path}）", flush=True)
+    return _read_legacy_series_types(out, root)
+
+
+def _read_legacy_series_types(out: dict[tuple[str, str], str],
+                              root: Path) -> dict[tuple[str, str], str]:
+    """补读工作区那份 ``3_serieslabel.xlsx``：**只补缺，不覆盖** ``out``。
+
+    它**不是赛道四数据集的内容**（属工作区里另一个目标的产物），列结构恰好同构
+    （``SeriesLabel ∈ {T1CE,T2,FLAIR}``），所以留作兜底；数据集里的
+    ``SeriesType.xlsx`` 一旦给出同一个 ``(检查号, 序列号)``，就以数据集为准。
+    顺序反了会**静默覆盖**权威取值（工作区那份取值更粗，如只写 ``T2``，
+    而数据集分 ``T2WI``/``T2-Flair``），表现是"模态看着都认出来了、通道里却是错的对比度"。
+    """
+    from shared.official_labels import find_official_labels, read_series_labels
+
+    series_file = find_official_labels(root).get("series")
+    if not series_file:
+        return out
+    added = 0
+    for (acc, uid), value in read_series_labels(series_file).items():
+        key = (_norm_key(acc), _norm_key(uid))
+        if key not in out:
+            out[key] = value
+            added += 1
+    if added:
+        print(f"[data] 已读兼容类型表 {Path(series_file).name}：{added} 条"
+              f"（{series_file}；数据集里的 SeriesType.xlsx 优先）", flush=True)
     return out
 
 

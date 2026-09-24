@@ -3,8 +3,14 @@
 > 严格对齐《赛事开发规范（赛道四）V1.0》《公共数据集格式说明》
 > 《云电脑平台使用指南V1.0》《训推平台使用指南V1.0》《赛事管理平台使用指南V2.0》。
 >
-> 本工程的**审核结论、缺陷清单与升级说明**见 [`docs/REVIEW_AND_UPGRADE.md`](docs/REVIEW_AND_UPGRADE.md)；
-> 逐条合规自检见 [`docs/SPEC_CHECKLIST.md`](docs/SPEC_CHECKLIST.md)。
+> 文档索引（`docs/` 下四份，**不重复**，按需查）：
+>
+> | 什么时候看 | 看哪份 |
+> |---|---|
+> | 搞清楚整体怎么跑（默认） | [`docs/MASTER_GUIDE.md`](docs/MASTER_GUIDE.md) |
+> | 第一次上机：点哪里、账号怎么弄 | [`docs/PLATFORM_GUIDE.md`](docs/PLATFORM_GUIDE.md) |
+> | 目录要搬迁 / 探针字段为空 / 换数据重建折划分 | [`docs/CLOUD_DESKTOP_RUNBOOK.md`](docs/CLOUD_DESKTOP_RUNBOOK.md) |
+> | 报 `ValueError: 数据根 ... 指向数据集父目录` | [`docs/DATASET_ROOT_TROUBLESHOOT.md`](docs/DATASET_ROOT_TROUBLESHOOT.md) |
 
 ---
 
@@ -118,8 +124,10 @@ python scripts/20_bridge_selftest.py --n 3
 export COMPETITION_PIPELINE_FACTORY=tasks.glioma.pipeline:build_pipeline
 ```
 
-详见 [`docs/INTEGRATION_WITH_TEAM.md`](docs/INTEGRATION_WITH_TEAM.md)（含 6 个已处理的
-契约陷阱与 5 项待确认风险）。
+桥接契约（`StudyTask` / `DatasetTask` 的职责边界、core/flair 命中同一序列等 6 个陷阱）
+写在代码里：[`integration/common.py`](integration/common.py) 顶部的契约注释 +
+[`integration/tasks.py`](integration/tasks.py) 的逐处实现说明；
+整体运行方式见 [`docs/MASTER_GUIDE.md`](docs/MASTER_GUIDE.md)。
 
 ---
 
@@ -148,7 +156,18 @@ export COMPETITION_PIPELINE_FACTORY=tasks.glioma.pipeline:build_pipeline
 └── verification/        ← 验证集
 ```
 
-**数据根填阶段目录即可**：`DATASET_ROOT=/2026aicompetition/datasets/training`。
+每个阶段目录下的**数据路径**与**数据信息路径**（以训练集实测为例）：
+
+```text
+/2026aicompetition/datasets/training/annotation/
+├── SeriesType.xlsx                                   ★ 数据信息：序列类型（模态）
+├── 脑胶质瘤标注结果-训练集.xlsx                        ★ 数据信息：结构化字段金标准（训练集才有）
+├── <32位检查号>/<2.25.* 序列UID>/<序列UID>.nii.gz      ★ 影像数据
+└── {fake, compositing, duplicate}/<检查号>/...
+```
+
+**数据根填阶段目录即可**：`DATASET_ROOT=/2026aicompetition/datasets/training`（会自动下钻到
+`annotation/`；也可直接填 `.../training/annotation`）。
 平台实测影像在 `training/annotation/` 下，代码会**自动下钻**并打印 `[probe][告警]`
 （也可直接填 `.../training/annotation`）；填 `/2026aicompetition/datasets` 这类
 多阶段父目录才会被 `ValueError` 拦住。
@@ -170,12 +189,31 @@ ValueError: 数据根 /2026aicompetition/datasets 指向数据集父目录，
 > 扫描时会被跳过，只有 `annotation/{fake,Composition}` 中的病例会作为
 > 特殊影像正样本补进清单。
 
-**模态与掩膜来自官方标注表 `labels/3_serieslabel.xlsx`。** 官方数据的序列目录名/文件名是
-DICOM UID，靠关键词猜不出模态；这张表**不在数据集里**，在团队工作区（如
-`<workspace>/dcs/goal1and2/Goal1and2/labels/`），探针会自动搜 `$WORKSPACE` 下 3 层
-（也可 `export GLIOMA_LABELS_DIR=<labels 目录>` 或软链到 `<工程>/labels`）。
-探针报告里的 `series_type_rows` 应大于 0、`modality_counts` 应出现 t1c/flair/t2/t1，
+**模态与掩膜来自数据信息 `SeriesType.xlsx`**（检查号 + 序列号 + 类型三列）。
+数据的序列目录名/文件名是 DICOM UID，靠关键词猜不出模态：
+
+| | 路径 |
+|---|---|
+| **影像数据** | `<阶段>/annotation/<32位检查号>/<2.25.* 序列UID>/<序列UID>.nii.gz` |
+| **数据信息（序列类型）** | `<阶段>/annotation/SeriesType.xlsx`（**与病例目录同层**） |
+| 列 / 取值 | `AccessionNumber` + `SeriesUid` + `SeriesType` ∈ {`T1`, `T1CE（增强）`, `T2-Flair`, `T2WI`, `其他`} |
+| 取值 → 通道 | `T1`→t1、`T1CE（增强）`→t1c、`T2-Flair`→flair、`T2WI`→t2、`其他`→**排除** |
+
+训练集、验证集（`verification/`）的数据里都有这张表；**评测集的 `SeriesType.xlsx`
+在正式测试时与测试数据一起下发**，路径由 `input.dataset_path` 给出。
+探针按候选目录搜索（`$GLIOMA_LABELS_DIR` → `<工程>/labels` → `$WORKSPACE` 下 3 层 →
+数据根/父/祖父 → 像标注容器的子目录），所以数据根填 `.../training`、
+`.../training/annotation` 或某一病例目录都能命中。
+报告里 `series_type_rows` 应大于 0、`modality_counts` 应出现 t1c/flair/t2/t1，
 否则表现为"病例数正常、却报 `无任何可用序列`"或整批归到 `other`。
+
+> 表里的 `SeriesType=其他` 是**权威排除**（该序列不属于 T1/T1CE/T2-Flair/T2WI），
+> 探针直接跳过、**不交给体素判别模型猜**，报告字段 `cases_with_declared_other_series`
+> 就是它的计数（非 0 属正常）。
+>
+> **`3_serieslabel.xlsx` 不是本赛道数据集的内容**（属工作区里另一个目标的产物），
+> 只在数据集的 `SeriesType.xlsx` 读不到时作为兜底使用，且**只补缺、不覆盖** ——
+> 顺序反了会静默把 `T2WI`/`T2-Flair` 覆盖成粗粒度的 `T2`。
 
 > 遇到数据根/模态相关的问题，先按 `docs/DATASET_ROOT_TROUBLESHOOT.md` 排查：
 > 定位数据根 → `python scripts/29_locate_dataset_root.py`。

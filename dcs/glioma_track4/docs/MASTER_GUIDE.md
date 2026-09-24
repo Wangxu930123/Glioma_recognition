@@ -108,25 +108,45 @@ labels_dir:      ./labels          # 5 张标注表所在目录，可用配置�
 | 现象 | 说明 |
 |---|---|
 | `training/` 下**只有** `annotation/` | 影像不直接在 `training/` 里，第一次很容易指错一层 |
-| 模态表是 `labels/3_serieslabel.xlsx`（旧名 `SeriesType.xlsx`） | 它**不在数据集里**，在团队工作区（如 `.../workspace/dcs/goal1and2/Goal1and2/labels/`）。读不到 → 模态全是 `other` → 取数时报「无任何可用序列」。现已自动搜 `$WORKSPACE` 下 3 层，通常零配置 |
+| **数据信息 `SeriesType.xlsx` 与病例目录同层**（`annotation/` 下） | 它**不是**数据根的下一层、也不在团队工作区；表里 `SeriesType` 是模态的唯一可靠来源。以前只认工作区那份 `3_serieslabel.xlsx`、且只在少数目录里找，于是"表明明在磁盘上却读不到" → 模态全是 `other` → 取数时报「无任何可用序列」。现已统一按候选目录（`$GLIOMA_LABELS_DIR` → `<工程>/labels` → `$WORKSPACE` 下 3 层 → 数据根/父/祖父 → 像标注容器的子目录）优先搜数据集里的 `SeriesType.xlsx` |
 
-### 2.3 目录树（平台）
+### 2.3 数据路径与数据信息路径（平台实测）
+
+**★ 数据路径（影像）**：`<阶段>/annotation/<32位检查号>/<2.25.* 序列UID>/<序列UID>.nii.gz`
+**★ 数据信息路径**：`<阶段>/annotation/SeriesType.xlsx`（与病例目录**同层**）
 
 ```text
 /2026aicompetition/datasets/
-├── training/
-│   └── annotation/                       ← annotation_root，数据根填这一层最稳
-│       ├── <检查号>/<序列UID>/<序列UID>.nii.gz
+├── training/                             ← 训练集（数据根填这一层，或直接填 annotation/）
+│   └── annotation/                       ← annotation_root，最稳
+│       ├── SeriesType.xlsx               ★ 数据信息：序列类型（T1 / T1CE（增强）/ T2-Flair / T2WI / 其他）
+│       ├── 脑胶质瘤标注结果-训练集.xlsx    ★ 数据信息：结构化字段金标准（训练集才有）
+│       ├── <32位检查号>/<2.25.* 序列UID>/<序列UID>.nii.gz     ★ 影像数据
 │       └── {fake,compositing,duplicate}/<检查号>/...
-├── evaluation_first/                     ← 评测阶段，平台通过请求体把路径传进来
-├── evaluation_second/
+├── verification/                         ← 验证集（结构与 training 同）
+│   └── annotation/
+│       ├── SeriesType.xlsx               ★ 数据信息（验证集也有）
+│       └── <32位检查号>/<2.25.* 序列UID>/<序列UID>.nii.gz
+├── evaluation_first/                     ← 评测阶段：平台通过请求体 input.dataset_path 传入
+├── evaluation_second/                    ←   （SeriesType.xlsx 随测试数据一起下发，路径规则同上）
 └── evaluation_finals/
 ```
 
-> **标注表不在这棵树里**（这一层实测没有 xlsx）：`3_serieslabel.xlsx`（模态权威来源）、
-> `1_abnormal.xlsx` 等 5 张表都在**团队工作区**的 `labels/`（如
-> `/2026aicompetition/workspace/dcs/goal1and2/Goal1and2/labels/`）。探针会自动搜 `$WORKSPACE`
-> 下 3 层，通常零配置；也可 `export GLIOMA_LABELS_DIR=<labels 目录>` 或软链到 `<工程>/labels`。
+| 用途 | 路径（以 `training` 为例） |
+|---|---|
+| **影像数据** | `/2026aicompetition/datasets/training/annotation/<32位检查号>/<2.25.* 序列UID>/<序列UID>.nii.gz` |
+| **数据信息（序列类型/模态）** | `/2026aicompetition/datasets/training/annotation/SeriesType.xlsx` |
+| 数据信息的列 / 取值 | 列 `AccessionNumber` + `SeriesUid` + `SeriesType`；取值 **5 类**：`T1`、`T1CE（增强）`、`T2-Flair`、`T2WI`、`其他` |
+| 取值 → 通道键 | `T1`→`t1`，`T1CE（增强）`→`t1c`，`T2-Flair`→`flair`，`T2WI`→`t2`，`其他`→**排除**（不是模态，不交给体素模型猜） |
+| 评测集 | 同样有 `SeriesType.xlsx`，**正式测试时与测试数据一起下发**；路径由 `input.dataset_path` 给出，不需要猜 |
+
+> ⚠️ **`1_abnormal.xlsx` / `2_duplicate.xlsx` / `3_serieslabel.xlsx` / `4_masklabel.xlsx` /
+> `5_characteristics.xlsx` 这 5 张表与赛道四数据集没有关系**（属工作区里另一个目标的产物）。
+> 赛道四的数据信息就是数据集自带的 `SeriesType.xlsx`（加上训练集的
+> `脑胶质瘤标注结果-训练集.xlsx` 字段金标准）。
+> 代码保留对 `3_serieslabel.xlsx` 的查找**只为兼容兜底**：仅在数据集的 `SeriesType.xlsx`
+> 读不到时才用，且**只补缺、不覆盖** —— 顺序反了会静默把 `T2WI` / `T2-Flair` 覆盖成
+> 粗粒度的 `T2`，表现是"模态看着都认出来了、通道里却是错的对比度"。
 > 详见 `DATASET_ROOT_TROUBLESHOOT.md`「病例数正常、却报无任何可用序列」。
 
 > `evaluation_*` 的路径**不需要猜**：平台在 `/call` 请求里以 `input.dataset_path` 传入，提交工程直接用。
@@ -235,15 +255,18 @@ python scripts/13_build_cache.py --workers 8  # ④ 预处理缓存（可选，�
 > 用磁盘核对把人工补丁（如 `1_abnormal_wzh.xlsx`）合并回 `1_abnormal.xlsx`（命中率上升才写、自动备份），最后重跑探针。
 > 只想看差别不写文件：加 `--dry-run`。
 >
-> 另外，`labels/3_serieslabel.xlsx` 现在**会自动在 `$WORKSPACE` 下 3 层内搜索**（覆盖 `<workspace>/dcs/*/*/labels`，跳过 `cache`/`logs`），
-> 通常**零配置**就能读到；表里"检查号"列与磁盘病例目录名不一致时，自动按 `SeriesUid` 单键回退。排查见 `docs/DATASET_ROOT_TROUBLESHOOT.md`。
+> 数据信息 `annotation/SeriesType.xlsx` 与影像同层，**探针自动读、零配置**；
+> 工作区那份 `labels/3_serieslabel.xlsx`（与数据集无关）会自动在 `$WORKSPACE` 下 3 层内搜索
+> （覆盖 `<workspace>/dcs/*/*/labels`，跳过 `cache`/`logs`），但**只在数据里那份读不到时才用**。
+> 表里"检查号"列与磁盘病例目录名不一致时，自动按 `SeriesUid` 单键回退。
+> 排查见 `docs/DATASET_ROOT_TROUBLESHOOT.md`。
 
 **探针报告里必须先看这两个数，不正常就别往下走**：
 
 | 字段 | 期望 | 含义 |
 |---|---|---|
-| `series_type_rows` | **> 0** | 读到了 `labels/3_serieslabel.xlsx`；为 0 = 表没接上（会自动搜 `$WORKSPACE` 下 3 层，找不到就 `export GLIOMA_LABELS_DIR=<labels 目录>` 再重跑探针） |
-| `modality_counts` | 出现 `t1c` / `flair` / `t2` / `t1` | 模态识别正常；只有 `other` = 全是 UID 命名、没读到类型表 |
+| `series_type_rows` | **> 0** | 读到了数据信息 `<阶段>/annotation/SeriesType.xlsx`（兜底 `labels/3_serieslabel.xlsx`）；为 0 = 都没找到（会自动搜数据根/父/祖父 + `$WORKSPACE` 下 3 层，找不到就 `export GLIOMA_LABELS_DIR=<含表的目录>` 再重跑探针） |
+| `modality_counts` | 出现 `t1c` / `flair` / `t2` / `t1` | 模态识别正常；只有 `other` = 全是 UID 命名、没读到数据信息表 |
 
 ### 阶段 2 · 训练（二选一）
 
@@ -364,8 +387,8 @@ glioma_track4/checkpoints/<tag>/best.pth                 （路线 A）
 | 探针 / 训练扫到 **0 例** | 数据根填高了一层 | v2 已自动下钻并告警；若告警说钻错地方，用 `DATASET_ROOT` 显式指定。先跑 `python scripts/29_locate_dataset_root.py` |
 | `ValueError: 数据根 ... 指向数据集父目录，其下是平台阶段目录 [...]` | 填到了 `/2026aicompetition/datasets` | 指到具体阶段（如 `.../datasets/training`）。**这是预期行为** |
 | `training/` 下只有 `annotation/` | 实例只挂了标注那份存储 | v2 会自动下钻。若连 `annotation/` 都没有 → 回「存储与数据服务」勾选训练影像数据集或重建实例，**不是代码问题** |
-| 扫出 3255 例但挑不出模态（`无任何可用序列`） | UID 命名认不出模态，没读到 `labels/3_serieslabel.xlsx` | 报错**已自带自检**（表在哪 / 体素模型在不在）。默认自动搜 `$WORKSPACE` 下 3 层；找不到就 `export GLIOMA_LABELS_DIR=<labels 目录>` 后重跑 `bash scripts/01_probe.sh` + `bash scripts/02_build_dataset.sh`。详见 `docs/DATASET_ROOT_TROUBLESHOOT.md`「病例数正常、却报无任何可用序列」 |
-| `label_field_counts = 0` 或 `official_label_files: {}` | 官方 5 张英文表**不随数据集下发**，它们躺在**团队工作区**里（如 `.../workspace/dcs/goal1and2/Goal1and2/labels/`）；中文合并表只是兜底 | `export GLIOMA_LABELS_DIR=<那个 labels 目录>` 后重跑 `bash scripts/01_probe.sh`，核对 `official_label_files` 变 5 条 |
+| 扫出 3255 例但挑不出模态（`无任何可用序列`） | UID 命名认不出模态，没读到数据信息 `<阶段>/annotation/SeriesType.xlsx` | 报错**已自带自检**（表在哪 / 体素模型在不在）。先确认数据里那张表在（它**与病例目录同层**）；表在非常规位置才需 `export GLIOMA_LABELS_DIR=<含表的目录>` 后重跑 `bash scripts/01_probe.sh` + `bash scripts/02_build_dataset.sh`。详见 `docs/DATASET_ROOT_TROUBLESHOOT.md`「病例数正常、却报无任何可用序列」 |
+| `label_field_counts = 0` 或 `official_label_files: {}` | 天坛参考实现那 5 张英文表**与赛道四数据集无关**、也不随数据集下发（它们躺在**团队工作区**里，如 `.../workspace/dcs/goal1and2/Goal1and2/labels/`）；数据集自带的是中文表头的 `annotation/脑胶质瘤标注结果-训练集.xlsx` | 先看 `label_field_counts`（中文表已覆盖）；确实要用英文表就 `export GLIOMA_LABELS_DIR=<那个 labels 目录>` 后重跑 `bash scripts/01_probe.sh` |
 | `1_abnormal` 把 compositing/duplicate 的行标成 `true`（`Label` 指错目录 → 官方 `series_path` 拼不出路径） | 人工修补版（如 `1_abnormal_wzh.xlsx`）没合并回 `labels/1_abnormal.xlsx` | **`bash scripts/33_fix_abnormal_labels.sh`** 一条命令搞定（自动定位 → 按 `Label` 拼路径做磁盘核对 → 命中率上升才写回并备份 → 重跑探针）；要手动控制细节则用 `scripts/32_apply_abnormal_patch.py` |
 | `02_build_dataset.sh` 报「清单与数据根不同类」 | 换了数据根却没重跑 `01_probe`（合规闸门） | 先 `bash scripts/01_probe.sh`；从本地切回官方数据先跑 `17_reset_for_official.sh` |
 | `23_pre_submit_check.sh` 卡在「权重未导出」 | 没跑阶段 3 | `bash scripts/09_export_submission.sh` |

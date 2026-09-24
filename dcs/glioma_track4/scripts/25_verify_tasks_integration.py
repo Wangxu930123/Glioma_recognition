@@ -473,6 +473,94 @@ def main() -> int:
         check("算法工程：'瘤体' 归为掩膜", list(_c["masks"]) == ["core"])
 
     # ---------------------------------------------------------------- #
+    _section("⑭b 数据信息表的位置（就在数据里）与 5 类取值")
+    # 三件事都只在真数据上暴露，而且**都不报错**：
+    #   ①表在磁盘上、代码只看了一个目录 → 模态整批 other（"病例数正常却无可用序列"）；
+    #   ②表里写着"其他"的序列被当成"没认出来"丢给体素模型猜 → 猜成 t2 填进通道；
+    #   ③工作区那份兼容表（3_serieslabel.xlsx，**非本赛道数据集内容**）盖住数据集取值
+    #     → T2WI 被压成粗粒度 T2、"其他"变成假 FLAIR。
+    # 平台实测：``training|verification/annotation/<32位哈希>/<2.25.* UID>/…``，
+    # 数据信息 = ``annotation/SeriesType.xlsx``（与病例目录同层），
+    # 列 ``AccessionNumber | SeriesUid | SeriesType``，
+    # 取值 **5 类** ``T1`` / ``T1CE（增强）`` / ``T2-Flair`` / ``T2WI`` / ``其他``。
+    with tempfile.TemporaryDirectory() as _tmp3:
+        from openpyxl import Workbook as _WB3                        # noqa: PLC0415
+        _env3 = os.environ.pop("GLIOMA_LABELS_DIR", None)             # 只考"数据里的表"
+        try:
+            _r3 = Path(_tmp3) / "training" / "annotation"
+            _acc3 = "0123456789abcdef0123456789abcdef"
+            _u3 = {"f": "2.25.269762814043436410034313793283011056280",
+                   "t": "2.25.257414435963002133586449291469922441625",
+                   "o": "2.25.188710768307220594477022935900342121667",
+                   "t1": "2.25.32473739323338211927101306278476129810",
+                   "w": "2.25.108049500374765452498127781990506666343"}
+            for _u in _u3.values():
+                _tiny_nii(_r3 / _acc3 / _u / f"{_u}.nii.gz")
+            _wb3 = _WB3()
+            _ws3 = _wb3.active
+            _ws3.append(["AccessionNumber", "SeriesUid", "SeriesType"])
+            _ws3.append([_acc3, _u3["f"], "T2-Flair"])
+            _ws3.append([_acc3, _u3["t"], "T1CE（增强）"])
+            _ws3.append([_acc3, _u3["t1"], "T1"])
+            _ws3.append([_acc3, _u3["w"], "T2WI"])
+            _ws3.append([_acc3, _u3["o"], "其他"])
+            (_r3 / "标注结果").mkdir()                                # 表藏在容器子目录里
+            _wb3.save(_r3 / "标注结果" / "SeriesType.xlsx")
+
+            # 再放一份**工作区那份的兼容表**进同一层，且刻意写得"更粗/更错"：
+            # ①T2WI → 粗粒度 "T2"（会静默覆盖权威取值）
+            # ②其他 → "FLAIR"（会把"权威排除"变成一路假 flair 灌进通道）
+            # 数据集那份必须赢；顺序反了这两条 check 会立刻红。
+            _wb3b = _WB3()
+            _ws3b = _wb3b.active
+            _ws3b.append(["AccessionNumber", "SeriesUid", "SeriesLabel"])
+            _ws3b.append([_acc3, _u3["w"], "T2"])
+            _ws3b.append([_acc3, _u3["o"], "FLAIR"])
+            _wb3b.save(_r3 / "3_serieslabel.xlsx")
+
+            if str(_TRACK4) not in sys.path:
+                sys.path.insert(0, str(_TRACK4))
+            from src.data.labels import (find_named_table, guess_modality,   # noqa: PLC0415
+                                         read_series_types as _t4rst3)
+            from src.data.probe import scan_real as _scan3                 # noqa: PLC0415
+            from shared.data import read_series_types as _rst3             # noqa: PLC0415
+
+            check("数据信息取值都能归一化（T1CE（增强）/ T2-Flair / T2WI / T1）",
+                  (guess_modality("T1CE（增强）"), guess_modality("T2-Flair"),
+                   guess_modality("T2WI"), guess_modality("T1"))
+                  == ("t1c", "flair", "t2", "t1"))
+            check("表藏在子目录（标注结果/）也能找到：数据根=病例目录那一层",
+                  bool(find_named_table("SeriesType.xlsx", _r3)))
+            check("表藏在子目录也能找到：数据根=某一序列目录（父/祖父回退）",
+                  bool(find_named_table("SeriesType.xlsx", _r3 / _acc3 / _u3["f"])))
+            check("数据根填高一层（.../training）也能找到（annotation/ 下钻）",
+                  bool(find_named_table("SeriesType.xlsx", Path(_tmp3) / "training")))
+
+            _t4 = _t4rst3(_r3)
+            check("数据集那份权威：5 条都在，兼容表不覆盖（T2WI 不被压成 T2）",
+                  _t4.get((_acc3, _u3["w"])) == "T2WI" and len(_t4) == 5,
+                  f"n={len(_t4)} t2wi={_t4.get((_acc3, _u3['w']))!r}")
+            check("数据集那份权威：『其他』不被兼容表改写成 FLAIR",
+                  _t4.get((_acc3, _u3["o"])) == "其他")
+            _g3 = _rst3(_r3)
+            check("研发侧同样以数据集那份为准（5 条，未被覆盖）",
+                  len(_g3) == 5 and _g3.get((_acc3, _u3["o"])) == "其他",
+                  f"n={len(_g3)} other={_g3.get((_acc3, _u3['o']))!r}")
+
+            _c3 = _scan3(str(_r3))[0]
+            check("5 类取值 → 通道键（T1/T1CE/T2-Flair/T2WI 各一路，其他单列）",
+                  sorted(_c3["images"]) == ["flair", "other", "t1", "t1c", "t2"],
+                  f"images={sorted(_c3['images'])}")
+            check("『其他』序列不进 unknown（不再交给体素模型猜）",
+                  not (_c3.get("unknown_series") or []),
+                  f"unknown={_c3.get('unknown_series')}")
+            check("『其他』被显式标记（报告里可区分「缺表」与「权威排除」）",
+                  (_c3["images"].get("other") or {}).get("declared_other") is True)
+        finally:
+            if _env3 is not None:
+                os.environ["GLIOMA_LABELS_DIR"] = _env3
+
+    # ---------------------------------------------------------------- #
     _section("⑮ 结构化字段金标准：能认表头、能找到上级目录、三种『空』可区分")
     # 目标三/目标四的监督信号全来自这张表。它出问题时**训练照样跑完**
     # （loss 只统计有 mask 的样本），只是分类头学不到东西 —— 所以必须能在
@@ -845,6 +933,27 @@ def main() -> int:
                     check("端到端：多通道体数据可构建", False, f"{type(_exc).__name__}: {_exc}")
     elif _model is not None:
         check("找到可用于验证的留出病例", False, str(_case_dir))
+
+    # ---------------------------------------------------------------- #
+    _section("⑲ 文档里标出的「数据路径 / 数据信息路径」")
+    # 交付文档必须让人一眼看到：影像在哪、数据信息在哪。这是**文档契约**——
+    # 改了目录结构却忘了改文档、或又把工作区那 5 张表说成"本赛道的数据信息"，这里会红。
+    _doc_expect = [
+        ("README.md", "annotation/SeriesType.xlsx", "数据信息路径"),
+        ("README.md", "2.25.* 序列UID", "影像数据路径"),
+        ("docs/MASTER_GUIDE.md", "★ 数据路径（影像）", "数据路径显式标注"),
+        ("docs/MASTER_GUIDE.md", "★ 数据信息路径", "数据信息路径显式标注"),
+        ("docs/MASTER_GUIDE.md", "脑胶质瘤标注结果-训练集.xlsx", "字段金标准表名"),
+        ("docs/CLOUD_DESKTOP_RUNBOOK.md", "annotation/SeriesType.xlsx", "数据信息路径"),
+        ("docs/DATASET_ROOT_TROUBLESHOOT.md", "★ 数据信息：", "数据信息路径"),
+    ]
+    for _rel, _needle, _what in _doc_expect:
+        _p = _TRACK4 / _rel
+        _txt = _p.read_text(encoding="utf-8") if _p.is_file() else ""
+        check(f"{_rel} 标出{_what}（含 {_needle!r}）", _needle in _txt)
+    _mg = (_TRACK4 / "docs/MASTER_GUIDE.md").read_text(encoding="utf-8")
+    check("文档明确那 5 张表与赛道四数据集无关（别再去配它们的路径）",
+          "与赛道四数据集没有关系" in _mg)
 
     # ---------------------------------------------------------------- #
     print("\n" + "=" * 66)

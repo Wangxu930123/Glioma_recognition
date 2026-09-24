@@ -14,8 +14,30 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any
+
+
+def _fold(text: Any) -> str:
+    """列名 / 枚举取值 / 文件名的归一化：**全角→半角 + 去空白 + 大小写无关**。
+
+    同一列表头在不同版本、不同人手里会写成
+    ``AccessionNumber`` / ``ACCESSIONNUMBER`` / ``accession_number`` /
+    ``ＡｃｃｅｓｓｉｏｎＮｕｍｂｅｒ``（中文输入法打出的全角）/ ``Accession Number``（多个空格）——
+    人工看是同一列，**精确比较**却是五个不同字符串。一旦掉进"包含匹配"轮，
+    同一张表里的 ``StudyUid`` 就可能被别的关键词先命中：整表按错列建索引、
+    行键形如 ``1.2.3.xxxx``，与磁盘检查号一条都对不上（静默丢行，见
+    :data:`ID_COLUMN_KEYWORDS` 的说明）。所以列名匹配统一先过这里。
+
+    NFKC 把全角字母/数字/标点折成半角（``Ｔ１`` → ``T1``、``ＮＡ／ＵＮＫ`` → ``NA/UNK``），
+    对中文是恒等变换，不影响中文列名。
+
+    与 :func:`_norm_key` 的分工：``_norm_key`` 用于**取值键**（检查号 / 序列号），
+    只去空白 + casefold；本函数额外做 NFKC，用于列名、枚举取值、文件名的比较。
+    """
+    s = unicodedata.normalize("NFKC", str(text if text is not None else ""))
+    return re.sub(r"\s+", "", s).casefold()
 
 # ---- 位置：中文 → 英文枚举（规范 15 类）----
 LOCATION_MAP = {
@@ -74,20 +96,27 @@ MODALITY_KEYWORDS = {
 
 
 def guess_modality(text: str) -> str | None:
-    """从文件名/序列描述猜模态；先判 t1c/flair/dwi（它们也含 t1/t2 子串）。"""
-    low = (text or "").lower()
+    """从文件名/序列描述猜模态；先判 t1c/flair/dwi（它们也含 t1/t2 子串）。
+
+    关键词比对**大小写 / 全角 / 空格无关**（见 :func:`_fold`）：``T1CE（增强）``、
+    ``t1ce``、``Ｔ１ＣＥ（增强）``（全角）是同一件事，`T1 CE` 也按 ``t1ce`` 认。
+    漏认的表现是"这一路模态丢了"：掩膜会被归到错误的任务空间，
+    而且不报错、只是结果偏。
+    """
+    low = _fold(text)
     for key in ("t1c", "flair", "dwi", "adc", "swi", "t2", "t1"):
         for kw in MODALITY_KEYWORDS[key]:
-            if kw in low:
+            if _fold(kw) in low:
                 return key
     return None
 
 
 def guess_mask_role(text: str) -> str | None:
-    name = text or ""
+    """只看勾画名猜掩膜角色（**大小写/全角无关**；更稳的判定见 :func:`mask_role_for`）。"""
+    name = _fold(text)
     for role in ("core", "peri", "abn"):
         for kw in MASK_ROLE_KEYWORDS[role]:
-            if kw in name:
+            if _fold(kw) in name:
                 return role
     return None
 
@@ -105,8 +134,8 @@ def mask_role_for(filename: str, modality: str | None = None) -> str | None:
     """
     import re
 
-    name = (filename or "")
-    low = name.lower()
+    name = unicodedata.normalize("NFKC", filename or "")           # 全角→半角，中文不受影响
+    low = name.casefold()
     has = lambda kws: any(k in name for k in kws)                   # noqa: E731
     tok = lambda kws: any(re.search(rf"(^|[^a-z0-9]){re.escape(k)}([^a-z0-9]|$)", low) # noqa: E731
                           for k in kws)
@@ -126,14 +155,21 @@ def mask_role_for(filename: str, modality: str | None = None) -> str | None:
 
 
 def to_enum(value: Any, mapping: dict) -> Any:
-    """宽松匹配：先精确，再包含匹配（处理 "有/清"、"2高" 之类）。"""
+    """宽松匹配：先精确，再包含匹配（处理 "有/清"、"2高" 之类）；大小写/全角无关。
+
+    两轮都按 :func:`_fold` 归一后比较：映射里写着 ``NA/UNK``，表里写 ``na/unk``、
+    ``Na/Unk`` 或全角 ``ＮＡ／ＵＮＫ``，在人工看来是同一件事，
+    精确比较却会漏 —— 漏掉的表现是"字段没读到"，
+    下游把它当"这一例没有金标准"，分母悄悄变小（见 :func:`structured_from_row`）。
+    """
     if value is None:
         return None
-    s = str(value).strip()
-    if s in mapping:
-        return mapping[s]
+    s = _fold(value)
     for k, v in mapping.items():
-        if k and k in s:
+        if _fold(k) == s:                                          # ① 精确（含映射里的空串键）
+            return v
+    for k, v in mapping.items():
+        if k and _fold(k) in s:                                    # ② 包含
             return v
     return None
 
@@ -144,10 +180,14 @@ def to_enum(value: Any, mapping: dict) -> Any:
 #: 越具体的检查号命名越靠前，泛化的"记录号/序号"放最后，
 #: 避免一张表里同时存在行列号时把行号当成了检查号。
 #:
-#: ⚠️ ``accessionumber``（少一个 n）是**数据集真实表头里的拼写**，必须按精确命中列出来：
-#: 只留 ``accessionnumber`` 时它进不了精确轮，而同一行的 ``StudyUid`` 能精确命中 ——
+#: ⚠️ 各表的列名统一是 ``AccessionNumber``，它**必须排在最前**：
+#: 只写后面那些变体时它进不了精确轮，而同一行的 ``StudyUid`` 能精确命中 ——
 #: 于是整张检查级别 sheet 按 **StudyUid** 建索引（键形如 ``1.2.3.xxxx``），
 #: 与磁盘上的检查号目录名一条都对不上，序列级/ROI级子行也全部挂不上（静默丢行）。
+#:
+#: 后面的 ``accession_number`` / ``accessionumber``（少一个 n）/ ``accessionno`` …
+#: 是**改版与历史排版**的兜底（官方表里的列名被改过若干次拼写），
+#: 归一化后都是 ``accessionnumber`` 前缀，留着只增不减兼容面、不影响正常命中。
 ID_COLUMN_KEYWORDS = ("accessionnumber", "accession_number", "accession_no",
                       "accessionumber", "accession_num", "accessionno", "accession",
                       "patientid", "patient_id", "record_uuid", "studyuid",
@@ -232,9 +272,9 @@ def _sheet_level(name: str) -> str:
     **不是**"按检查号合并"：:func:`_sheet_plan` 会按表头列回退判级
     （ROI 名 → 序列号 → 检查号）。这里只负责"表名这一条线索"。
     """
-    low = str(name or "").strip().casefold()
+    low = _fold(name)                                              # 大小写/全角无关
     for kw, level in _SHEET_LEVEL_RULES:
-        if kw in low:
+        if _fold(kw) in low:
             return level
     return "unknown"
 
@@ -248,16 +288,23 @@ def _find_id_column(header) -> str | None:
 
     两轮匹配：① 精确（含 ``id``/``编号`` 这类短名）→ ② 包含
     （**只用长关键词**，避免 ``id`` 命中 ``SeriesUid`` 而错把序列号当检查号）。
+
+    列名比较**大小写 / 全角 / 空格无关**（见 :func:`_fold`）：
+    ``AccessionNumber``、``ACCESSIONNUMBER``、``ＡｃｃｅｓｓｉｏｎＮｕｍｂｅｒ``
+    是同一列，任一写法都要能落到"精确"轮 ——
+    漏进"包含"轮就可能被同表的 ``StudyUid`` 抢走行键。
     """
     cells = [str(c).strip() for c in header if str(c).strip()]
-    lower = {c.lower(): c for c in cells}
+    table = {_fold(c): c for c in cells}
     for kw in ID_COLUMN_KEYWORDS + ID_COLUMN_EXACT:                # ① 精确
-        if kw in lower:
-            return lower[kw]
+        key = _fold(kw)
+        if key in table:
+            return table[key]
     for kw in ID_COLUMN_KEYWORDS:                                  # ② 包含（不用短名）
-        for key_lower, key in lower.items():
-            if kw in key_lower:
-                return key
+        key = _fold(kw)
+        for key_lower, name in table.items():
+            if key in key_lower:
+                return name
     return None
 
 
@@ -458,6 +505,31 @@ def label_search_dirs(root: str | os.PathLike | None = None,
     return out
 
 
+def _find_file(folder: Path, filename: str) -> str | None:
+    """在**单个目录内**按文件名找文件，**大小写 / 全角 / 空格无关** → 路径。
+
+    为什么不直接 ``(folder / filename).is_file()``：那是**精确字符串**比较。
+    Linux 文件系统区分大小写，平台解压、人工改名或从 Windows 拷过来之后
+    出现 ``seriestype.xlsx`` / ``SERIESTYPE.XLSX`` / ``ＳｅｒｉｅｓＴｙｐｅ.xlsx`` 时，
+    精确比较会**直接判为"表不存在"** —— 而这类失败是静默的：
+    一路降级成"没有模态表/没有字段金标准"，不报错、只是数字变小。
+
+    先试精确（绝大多数情况一次命中、不扫目录），再退回大小写无关扫描。
+    """
+    direct = folder / filename
+    if direct.is_file():
+        return str(direct)
+    want = _fold(filename)
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if entry.is_file() and _fold(entry.name) == want:
+            return str(entry)
+    return None
+
+
 def find_named_table(filename: str, root: str | os.PathLike | None = None,
                      labels_dir: str | os.PathLike | None = None) -> str | None:
     """在候选目录里按**文件名**找一张表 → 路径（找不到返回 ``None``）。
@@ -465,11 +537,14 @@ def find_named_table(filename: str, root: str | os.PathLike | None = None,
     为什么不复用 :func:`find_official_labels`：它只认工作区那几张固定名字的表
     （``1_abnormal.xlsx`` 等），而赛道四数据集里那张叫 ``SeriesType.xlsx`` ——
     名字不同，必须在**同一批候选目录**里分别找，才能既认数据集又兼容工作区。
+
+    文件名比较走 :func:`_find_file`：``SeriesType.xlsx`` / ``seriestype.xlsx`` /
+    ``SERIESTYPE.XLSX`` 都算命中。
     """
     for folder in label_search_dirs(root, labels_dir):
-        candidate = folder / filename
-        if candidate.is_file():
-            return str(candidate)
+        found = _find_file(folder, filename)
+        if found:
+            return found
     return None
 
 
@@ -488,9 +563,9 @@ def find_official_labels(root: str | os.PathLike | None = None,
     found: dict[str, str] = {}
     for kind, name in OFFICIAL_LABEL_FILES.items():
         for folder in cands:
-            candidate = folder / name
-            if candidate.is_file():
-                found[kind] = str(candidate)
+            hit = _find_file(folder, name)                         # 文件名大小写/全角无关
+            if hit:
+                found[kind] = hit
                 break
     return found
 
@@ -521,25 +596,31 @@ def _column_leaf(name: Any) -> str:
 def _find_col_in_list(header: list[str], keywords: tuple[str, ...]) -> int | None:
     """在表头列表里找列，返回**列号**：先按**分层列名末段**、再按整串；每轮 精确→前缀→包含。
 
-    末段优先的理由见 :func:`_column_leaf`。
+    末段优先的理由见 :func:`_column_leaf`；
+    列名与关键词都先过 :func:`_fold`（**大小写 / 全角 / 空格无关**）——
+    ``SeriesUid`` / ``SERIESUID`` / ``ＳｅｒｉｅｓＵｉｄ`` / ``Series Uid``
+    必须落在同一轮次里，否则同一张表换个写法就"整表 0 行"。
     """
-    full = {str(c).strip().lower(): i for i, c in enumerate(header) if str(c).strip()}
+    full = {_fold(c): i for i, c in enumerate(header) if str(c).strip()}
     leaf: dict[str, int] = {}
     for i, cell in enumerate(header):
         text = str(cell).strip()
         if text:
-            leaf.setdefault(_column_leaf(text).lower(), i)
+            leaf.setdefault(_fold(_column_leaf(text)), i)
     for table in (leaf, full):                                     # 末段 → 整串
         for kw in keywords:                                        # ① 精确
-            if kw in table:
-                return table[kw]
+            key = _fold(kw)
+            if key in table:
+                return table[key]
         for kw in keywords:                                        # ② 前缀
+            key = _fold(kw)
             for low, idx in table.items():
-                if low.startswith(kw):
+                if low.startswith(key):
                     return idx
         for kw in keywords:                                        # ③ 包含
+            key = _fold(kw)
             for low, idx in table.items():
-                if kw in low:
+                if key in low:
                     return idx
     return None
 
@@ -685,8 +766,11 @@ def _detect_header(rows: list[list[str]], max_scan: int = 20,
                 continue
         elif _find_id_column(row) is None:
             continue
-        hits = sum(1 for c in cells
-                   if any(k in c.lower() for k in FIELD_HINTS))
+        # 线索比对同样大小写/全角无关（`FIELD_HINTS` 本身已是小写+中文，只需折叠单元格）；
+        # 否则一张全大写表头的表会"线索 0 命中"，评分退化成只比非空列数、表头行选错。
+        folded = [_fold(c) for c in cells]
+        hits = sum(1 for f in folded
+                   if any(k in f for k in FIELD_HINTS))
         # 非空列数当**第二判据**：标题行常是"一格有字、其余全空"，而真表头是满行。
         # 少了它，标题行 'ROI级别' 会被前缀匹配当成 roi 列、压过真表头 → 表头行混进数据、
         # 还凭空多出一个用表头文字当检查号的假病例。
@@ -699,14 +783,16 @@ def _detect_header(rows: list[list[str]], max_scan: int = 20,
 def _id_key(value) -> str:
     """把"检查号"归一化成可比较的键：只留字母数字，去前导零，大小写无关。
 
-    这样 ``C0E1F8F2-53BA_45BE``、``c0e1f8f253ba45be``、`` 00123 `` 都能对上。
+    这样 ``C0E1F8F2-53BA_45BE``、``c0e1f8f253ba45be``、`` 00123 `` 都能对上；
+    全角（中文输入法）也一并折成半角：``１２３４５６７`` → ``1234567``，
+    否则全角数字会被下面那条"只留 ASCII 字母数字"的正则整段抹掉、键变空串而被丢掉。
 
     另修一个 Excel 专属坑：数字型检查号读出来常带小数尾巴（``1234567.0``），
     若直接去掉非字母数字会拼成 ``12345670`` —— 与目录名 ``1234567``
     差一位、永远不相等。所以先把结尾的 ``.0`` 摘掉再归一化。
     本函数**幂等**：对已归一化的键再调用结果不变。
     """
-    text = str(value).strip()
+    text = unicodedata.normalize("NFKC", str(value)).strip()
     if "." in text:
         text = re.sub(r"\.0+$", "", text)                           # 1234567.0 → 1234567
     text = re.sub(r"[^0-9a-z]+", "", text.casefold())
@@ -1202,24 +1288,31 @@ def _find_col(row: dict, keywords: list[str], exclude: list[str] | None = None) 
 
     末段优先：官方表的列名是字段路径（``Study->CLINICAL->病理结果``），末段才是字段名；
     整串匹配会让父段里的关键词抢列（见 :func:`_column_leaf`）。
+
+    列名与关键词都过 :func:`_fold`（大小写 / 全角 / 空格无关）：同一张表里
+    ``TUMOR_T1WI_C_ENHAN`` 与 ``tumor_t1wi_c_enhan`` 是同一列，
+    漏掉就会"字段没读到"，而字段缺失是**静默**的（下游当金标准不存在）。
     """
-    ex = [e.lower() for e in (exclude or [])]
+    ex = [_fold(e) for e in (exclude or [])]
     items = [(str(k).strip(), k) for k in row if not _is_nested_key(k)]
-    full: dict[str, Any] = {text.lower(): key for text, key in items}
+    full: dict[str, Any] = {_fold(text): key for text, key in items}
     leaf: dict[str, Any] = {}
     for text, key in items:
-        leaf.setdefault(_column_leaf(text).lower(), key)
+        leaf.setdefault(_fold(_column_leaf(text)), key)
     for table in (leaf, full):                                     # 末段 → 整串
         for kw in keywords:                                        # 1) 精确
-            if kw.lower() in table:
-                return table[kw.lower()]
+            folded = _fold(kw)
+            if folded in table:
+                return table[folded]
         for kw in keywords:                                        # 2) 前缀
+            folded = _fold(kw)
             for low, key in table.items():
-                if low.startswith(kw.lower()) and not any(e in low for e in ex):
+                if low.startswith(folded) and not any(e in low for e in ex):
                     return key
         for kw in keywords:                                        # 3) 包含
+            folded = _fold(kw)
             for low, key in table.items():
-                if kw.lower() in low and not any(e in low for e in ex):
+                if folded in low and not any(e in low for e in ex):
                     return key
     return None
 
@@ -1256,18 +1349,21 @@ def _official_columns_to_fields(row: dict) -> dict[str, Any]:
     CysticChange / Hemorrhage / Calcification / Margin / Lobulation /
     Morphology / Signal_T2WI / Signal_FLAIR / Location``，
     与模拟集的中文列名是两套东西。之前只写中文关键词，官方表自然一条也映射不出来。
+
+    列名与取值比较都过 :func:`_fold`：列名大小写/全角变体（``GLIOMA``、``Ｇｌｉｏｍａ``）
+    与取值变体（``YES``/``yes``、``ＮＡ／ＵＮＫ``）都算命中。
     """
-    lower = {str(k).strip().lower(): k for k in row if not _is_nested_key(k)}
+    lower = {_fold(k): k for k in row if not _is_nested_key(k)}
     out: dict[str, Any] = {}
     for column, field in OFFICIAL_FIELD_COLUMNS.items():
-        key = lower.get(column.lower())
+        key = lower.get(_fold(column))
         if key is None:
             continue
         raw = row.get(key)
         text = "" if raw is None else str(raw).strip()
-        if text == "" or text.lower() in ("nan", "none", "na/unk"):
+        if text == "" or _fold(text) in ("nan", "none", "na/unk"):
             continue
-        low = text.lower()
+        low = _fold(text)
         if column in OFFICIAL_BINARY_COLUMNS:
             # 兼容三种写法：No/Yes、false/true、0/1；Margin 的 Clear=1
             if low in ("yes", "true", "1", "clear"):
@@ -1376,8 +1472,15 @@ def structured_from_row(row: dict) -> dict:
 
 
 def _norm_key(value: Any) -> str:
-    """归一化查表键（去空白 + 大小写无关）。"""
-    return re.sub(r"\s+", "", str(value if value is not None else "")).casefold()
+    """归一化查表键（**全角→半角** + 去空白 + 大小写无关）。
+
+    多一步 NFKC 是给"中文输入法全角"准备的：``Ｔ１ＣＥ`` → ``T1CE``、
+    全角检查号 ``１２３`` → ``123``。读表（:func:`read_series_types`）与查表
+    （:func:`lookup_series_type`）都走本函数，两边口径天然一致 ——
+    键归一化只要有一处不一致，就是"表里有、却一条都查不到"的静默错配。
+    """
+    s = unicodedata.normalize("NFKC", str(value if value is not None else ""))
+    return re.sub(r"\s+", "", s).casefold()
 
 
 #: 公开别名：序列类型表与其它模块共用同一套键归一化规则，
@@ -1414,6 +1517,11 @@ def lookup_series_type(series_types: dict | None, accession: str = "",
     """
     if not series_types:
         return ""
+    if isinstance(uid_candidates, str):
+        # 裸字符串会被当成"候选的字符序列"逐个查（``"2.25.1001"`` → ``"2"``、``"."``…）
+        # → 精确键与 UID 回退两轮全落空、**静默返回空表**：调用方以为"表里没有这一路"，
+        # 实际只是参数形态不对。这里收成单元素候选（表键本身是 UID，形态唯一）。
+        uid_candidates = (uid_candidates,)
     for uid in uid_candidates:
         value = series_types.get((_norm_key(accession), _norm_key(uid)))
         if value:
@@ -1491,7 +1599,8 @@ _MODALITY_VALUE_MAXLEN = 16
 
 def _looks_like_modality_value(value) -> bool:
     """该单元格"看着像模态取值"吗（专供列名认不出时的取值嗅探）。"""
-    text = re.sub(r"[\s\-_/]+", "", str(value if value is not None else "")).casefold()
+    text = re.sub(r"[\s\-_/]+", "",
+                  unicodedata.normalize("NFKC", str(value if value is not None else ""))).casefold()
     if not text or len(text) > _MODALITY_VALUE_MAXLEN:
         return False
     return any(text == tok or text.startswith(tok) for tok in _MODALITY_VALUE_TOKENS)
@@ -1719,7 +1828,13 @@ def nifti_stem(filename: str) -> str:
 
 
 def sidecar_desc(path: str | os.PathLike) -> str | None:
-    """读同名 JSON sidecar 的序列描述（不存在或解析失败返回 None）。"""
+    """读同名 JSON sidecar 的序列描述（不存在或解析失败返回 None）。
+
+    JSON 的键是**区分大小写**的精确匹配，而 sidecar 可能是平台导出的
+    （``SeriesDescription``）、也可能是别的工具/人工写的（``seriesdescription``、
+    ``SERIESTYPE``）。所以先按 :func:`_fold` 建一次键映射再查 ——
+    漏认的表现是"旁车明明有描述、却认不出模态"，一路降级且不报错。
+    """
     import json
 
     p = os.path.abspath(str(path))
@@ -1734,8 +1849,9 @@ def sidecar_desc(path: str | os.PathLike) -> str | None:
         return None
     if not isinstance(data, dict):
         return None
+    folded = {_fold(k): v for k, v in data.items()}
     for key in SIDECAR_DESC_KEYS:
-        value = data.get(key)
+        value = folded.get(_fold(key))
         if value not in (None, ""):
             return str(value)
     return None

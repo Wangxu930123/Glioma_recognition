@@ -546,6 +546,14 @@ def main() -> int:
             check("研发侧（goals）同样只读数据信息表：5 条，兼容表一条不掺",
                   len(_g3) == 5 and _g3.get((_acc3, _u3["o"])) == "其他",
                   f"n={len(_g3)} other={_g3.get((_acc3, _u3['o']))!r}")
+            # 表列名是规范拼写 `AccessionNumber`：查表要按 (检查号, 序列号) 命中，
+            # 且大小写无关。另锁一条"裸字符串候选"回归 —— 不拦的话字符串被当成
+            # 字符序列逐个查（"2.25.x" → "2"、"."…）两轮全空、**静默返回空**。
+            from src.data.labels import lookup_series_type as _lst4      # noqa: PLC0415
+            check("lookup_series_type：规范拼写命中 + 裸字符串候选按单元素处理",
+                  _lst4(_t4, _acc3, _u3["w"]) == _t4[(_acc3, _u3["w"])]
+                  and _lst4(_t4, _acc3.upper(), _u3["w"]) == _t4[(_acc3, _u3["w"])],
+                  f"{_lst4(_t4, _acc3, _u3['w'])!r}")
 
             # 兜底已**彻底移除**（两条路线一致）：把数据集那张表移走，即使
             # 3_serieslabel.xlsx 就躺在旁边，也必须读到空表 —— 宁可响亮地报
@@ -667,9 +675,11 @@ def main() -> int:
         check("n_structured_rows 按唯一记录计数",
               "len({id(v) for v in struct.values()})" in _p_src)
 
-        # 数据集**真实排版**（实测）：表头在第 2 行；H 列 `StudyUid`、I 列 `Accessionumber`
-        # （少一个 n 的拼写）、病理结果列写成字段路径 `Study->CLINICAL->病理结果`，
-        # 取值含 `脑胶质瘤2级` / `其他肿瘤或病变` / `病因不明` / `脑胶质瘤4级`。
+        # 数据集**真实排版**（实测）：表头在第 2 行；H 列 `StudyUid`、I 列 `AccessionNumber`
+        # （规范拼写；历史排版里出现过少一个 n 的 `Accessionumber` / `AccessioNumber`，
+        # 下面这张表**故意用变体造**，把"拼写改版也认"锁成回归；同文件后面另有一条
+        # 用规范拼写 + `StudyUid` 诱饵的用例）、病理结果列写成字段路径
+        # `Study->CLINICAL->病理结果`，取值含 `脑胶质瘤2级` / `其他肿瘤或病变` / `病因不明` / `脑胶质瘤4级`。
         # 曾经的错法：`accessionnumber` 只在"包含"轮命中、而 `StudyUid` 精确命中 →
         # 整张检查级别 sheet 按 StudyUid 建索引（键形如 `1.2.3.xxx`），与磁盘检查号
         # 一条都对不上，序列级/ROI 级子行也全部"挂不到病例"（丢行、且不报错）。
@@ -728,7 +738,7 @@ def main() -> int:
               _rh[_rkc].casefold() == "roiname" and _rds == 2 and _rlv == "roi",
               f"表头行={_rds} 行键={_rh[_rkc]!r}")
         _tr = _rst(str(_rp))                      # 离线口径：不给磁盘检查号
-        check("真实排版：行键取 Accessionumber（不是 StudyUid）",
+        check("拼写变体（Accessionumber/AccessioNumber）也认：行键取检查号（不是 StudyUid）",
               {_ACC_A, _ACC_B} <= set(_tr) and not any(k.startswith("1.2.3.") for k in _tr),
               f"键={sorted(_tr)[:3]}")
         check("真实排版：分层列名 Study->CLINICAL->病理结果 能映射字段",
@@ -765,6 +775,108 @@ def main() -> int:
         check("真实排版：ROI 级行不覆盖检查级别给的病例字段",
               structured_from_row(_tr_ids.get(_ACC_B, {})).get("TumorProbability") == 0,
               f"字段={structured_from_row(_tr_ids.get(_ACC_B, {}))}")
+
+        # 规范拼写（各表列名统一是 `AccessionNumber`）单独锁一条：同一行里
+        # `StudyUid`（形如 1.2.3.xxx）与 `AccessionNumber` 并存时，行键必须取检查号。
+        # 这条与上面的变体用例互为补充 —— 只测变体的话，"变体优先"仍可能悄悄写进关键词表
+        # 而把规范拼写挤到包含轮（同一行的 StudyUid 就会再次截走行键）。
+        _rp_acc = Path(_tmpl) / "accession_spelling.xlsx"
+        _wb_acc = _WB()
+        _ws_acc = _wb_acc.active
+        _ws_acc.title = "检查级别"
+        _ws_acc.append(["脑胶质瘤标注结果（训练集）"])                      # 行1 标题
+        _ws_acc.append(["StudyUid", "AccessionNumber",
+                        "Study->CLINICAL->病理结果"])                       # 行2 表头
+        _ws_acc.append(["1.2.3.eee", _ACC_A, "脑胶质瘤3级"])
+        _wb_acc.save(_rp_acc)
+        _tr_acc = _rst(str(_rp_acc))
+        check("规范拼写 AccessionNumber + 同表 StudyUid 诱饵：行键取检查号且字段能映射",
+              {k.upper() for k in _tr_acc} == {_ACC_A.upper()}
+              and not any(k.startswith("1.2.3.") for k in _tr_acc)
+              and structured_from_row(_tr_acc.get(_ACC_A, {})).get("WHO_Grade") == "3",
+              f"键={sorted(_tr_acc)}")
+
+        # —— 表头「大小写 / 全角 / 空格」鲁棒（同一根因：`labels._fold`）——
+        # 这些写法人工看是同一列、精确比较却是不同字符串：掉进"包含匹配"轮后，
+        # 同表的 `StudyUid` 就会抢走行键（整表按 1.2.3.x 建索引、与磁盘一条都对不上）。
+        # 自带临时目录：避免这些表被别的用例的"父目录搜索"捞到。
+        with tempfile.TemporaryDirectory(prefix="casefold_") as _ctmp:
+            from src.data.labels import (MORPH_MAP as _MM2,          # noqa: PLC0415
+                                         guess_modality as _gm2,
+                                         id_key as _idk2,
+                                         norm_key as _nk2,
+                                         read_series_types as _rstc2,
+                                         sidecar_desc as _scd2,
+                                         to_enum as _te2)
+            _cp = Path(_ctmp) / "脑胶质瘤标注结果-训练集.xlsx"
+            _wbc = _WB()
+            _wc = _wbc.active
+            _wc.title = "ＣＡＳＥ"                                          # 全角表名
+            _wc.append(["脑胶质瘤标注结果（训练集）"])
+            _wc.append(["ＳｔｕｄｙＵｉｄ", "ACCESSION NUMBER",              # 全角 + 空格
+                        "Study->CLINICAL->病理结果"])
+            _wc.append(["1.2.3.fff", _ACC_A, "脑胶质瘤3级"])
+            _sc = _wbc.create_sheet("SERIES")
+            _sc.append(["accessionnumber", "Series Uid", "SERIESUID"])
+            _sc.append([_ACC_A, "1.2.3.fff", "2.25.7001"])
+            _rc = _wbc.create_sheet("ＲＯＩ级别")                            # 全角 ROI
+            _hc = [""] * 44
+            _hc[7] = "StudyUid"
+            _hc[8] = "ＡｃｃｅｓｓｉｏｎＮｕｍｂｅｒ"
+            _hc[24] = "ＳＥＲＩＳＤＥＳＣＲＩＰＴＩＯＮ"
+            _hc[27] = "ROI UID"
+            _hc[28] = "roi name"
+            _rc.append(["脑胶质瘤标注结果（训练集）"])
+            _rc.append(_hc)
+            for _i, (_rn, _sd2) in enumerate([("瘤体", "T1"), ("水肿", "T2-FLAIR"),
+                                              ("肿瘤瘤体", "Ｔ１ＣＥ（增强）"), ("全肿瘤", "其他")]):
+                _rwc = [""] * 44
+                _rwc[7] = "1.2.3.fff"; _rwc[8] = _ACC_A; _rwc[24] = _sd2
+                _rwc[27] = f"2.25.8{_i}"; _rwc[28] = _rn
+                _rc.append(_rwc)
+            _wbc.save(_cp)
+            _trc = _rst(str(_cp))
+            _rowc = next(iter(_trc.values()))
+            _roic = _rowc.get("__roi_rows__") or []
+            check("表名/表头 全角+大写+空格（ＣＡＳＥ、ＡｃｃｅｃｓｓｉｏｎＮｕｍｂｅｒ、Series Uid）"
+                  "→ 行键仍是检查号、字段仍映射、子行不串列",
+                  {k.upper() for k in _trc} == {_ACC_A.upper()}
+                  and not any(k.startswith("1.2.3.") for k in _trc)
+                  and structured_from_row(_rowc).get("WHO_Grade") == "3"
+                  and len(_rowc.get("__series_rows__") or []) == 1 and len(_roic) == 4
+                  and [_gmr(x.get("roi name", "")) for x in _roic]
+                  == ["core", "peri", "core", "peri"],
+                  f"键={sorted(_trc)[:2]} 子行={len(_rowc.get('__series_rows__') or [])}/{len(_roic)}")
+
+            _annc = Path(_ctmp) / "annotation"
+            _annc.mkdir()
+            _wbs = _WB()
+            _wss = _wbs.active
+            _wss.append(["ACCESSIONNUMBER", "SERIESUID", "SERIESTYPE"])
+            _wss.append([_ACC_A, "2.25.7001", "t1ce（增强）"])
+            _wbs.save(_annc / "SERIESTYPE.XLSX")                           # 文件名全大写
+            _stc = _rstc2(_ctmp)
+            check("文件名 SERIESTYPE.XLSX（全大写）也能找到（Linux 文件系统区分大小写）",
+                  len(_stc) == 1, f"n={len(_stc)}")
+
+            _sdc = Path(_ctmp) / "sidecar"
+            _sdc.mkdir()
+            (_sdc / "x.nii.gz").write_bytes(b"")
+            (_sdc / "x.json").write_text('{"SERIESDESCRIPTION": "T2-FLAIR"}', encoding="utf-8")
+            check("sidecar 的 JSON 键大小写无关（SERIESDESCRIPTION / seriestype）",
+                  _scd2(_sdc / "x.nii.gz") == "T2-FLAIR",
+                  f"{_scd2(_sdc / 'x.nii.gz')!r}")
+
+            check("枚举取值大小写/全角无关（na/unk、ＮＡ／ＵＮＫ → NA）",
+                  _te2("na/unk", _MM2) == "NA" and _te2("ＮＡ／ＵＮＫ", _MM2) == "NA",
+                  f"{_te2('ＮＡ／ＵＮＫ', _MM2)!r}")
+            check("模态/掩膜名 大小写+全角+空格都认",
+                  [_gm2(v) for v in ("Ｔ１ＣＥ（增强）", "T1 CE", "t1ce")] == ["t1c"] * 3
+                  and [_gmr(v) for v in ("CORE.nii.gz", "ＣＯＲＥ_mask")] == ["core"] * 2,
+                  f"{[_gm2(v) for v in ('Ｔ１ＣＥ（增强）', 'T1 CE', 't1ce')]}")
+            check("检查号/查表键全角归一（１２３４５６７ → 1234567、ＴＥＳＴ → test）",
+                  _idk2("１２３４５６７") == "1234567" and _nk2("ＴＥＳＴ") == "test",
+                  f"{_idk2('１２３４５６７')!r}/{_nk2('ＴＥＳＴ')!r}")
 
         _real_root = Path(_tmpl) / "real_layout_ds"
         _tiny_nii(_real_root / _ACC_A / "2.25.1001" / "2.25.1001.nii.gz")

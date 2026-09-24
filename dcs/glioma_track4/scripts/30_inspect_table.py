@@ -22,7 +22,8 @@
 序列级 sheet 报成"认不出行键列"，好表说成坏表）。
 
 检查号列的判定**不依赖列名**：拿磁盘上真实的检查号目录名逐列比对取值，命中率最高的
-一列就是检查号列 —— 列名叫 `编号`/`Accessionumber`（少个 n 的拼写）/乱码都不影响。
+一列就是检查号列 —— 列名叫 `AccessionNumber`（数据集各表的规范拼写）/历史排版里的拼写
+变体（`Accessionumber`、`AccessioNumber`）/乱码都不影响。
 """
 from __future__ import annotations
 

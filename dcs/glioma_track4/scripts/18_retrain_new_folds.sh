@@ -99,8 +99,11 @@ cat <<EOF
   ① 监控：      tail -f logs/train_fold0.log
   ② 第 5 折：   bash scripts/03_train.sh 4          # 前 4 折收敛后补跑
   ③ 交付数字：  FOLDS="0 1 2 3 4" bash scripts/16_finalize.sh
-                （集成阈值标定 → 留一折集成全图评估 → OOF 目标一二/重复
+                （集成阈值标定 → 全图评估 → 目标一二/重复
                   → 规范导出权重 → Mock Competition → 提交前检查清单）
+                说明：配好官方验证集（VAL_ROOT + 01_probe.sh --val）时，
+                      1~3 步自动切到"官方验证集 + 全折集成"的最终口径；
+                      没配则回退折内 val（留一折集成 / OOF）。
 
 把本机时间预估（以实测 208s/epoch、无争用为基准）：
   · 单折 100 epoch ≈ 5.8h；4 折并行受显存/带宽争用影响约 8~11h

@@ -13,6 +13,8 @@
 
 用法：
     python -m src.training.trainer --config train --fold 0 --tag g4_fold0
+    python -m src.training.trainer --config train --fold full --tag g4_full
+        ↑ 全量模式：train = 清单全部病例，val = 官方验证集（data/manifest_val.json）
 """
 from __future__ import annotations
 
@@ -31,8 +33,8 @@ from torch.utils.data import DataLoader
 from ..data.dataset import (DuplicatePairDataset, GliomaDataset, SpecialImageDataset,
                             build_case_volume, build_folds, make_targets)
 from ..models.unet3d import build_model, cls_spec_from_config
-from ..utils.config import (assert_data_source, data_source_tag, load_config,
-                             load_paths, resolve)
+from ..utils.config import (assert_data_source, data_source_tag, external_val_cases,
+                            load_config, load_paths, resolve)
 from ..utils.logger import run_logger
 
 
@@ -170,18 +172,50 @@ def _split(cases: list[dict], folds: dict, fold: int):
     return tr, va
 
 
-def make_loaders(cfg: dict, fold: int):
+def _seed_off(fold: int | None) -> int:
+    """随机种子偏移：折号用于让各折的数据顺序/增广不同；全量模式无折号。"""
+    return int(fold) if fold is not None else 0
+
+
+def make_loaders(cfg: dict, fold: int | None):
+    """折内模式（``fold=0..N``）或**全量模式**（``fold=None``）的数据加载器。
+
+    全量模式：train = 清单内**全部**病例，val = **官方验证集**
+    （``data/manifest_val.json``，由 ``bash scripts/01_probe.sh --val`` 生成）。
+    这样省掉交叉验证：数据一点不浪费、验证集与训练集天然无交集。
+    代价是没有 OOF —— 想要"多模型集成"就得另训多个 seed（见文档）。
+    """
     paths = load_paths()
     man = _load_manifest(paths["manifest"])
     assert_data_source(man, phase="train")                        # 数据源合规闸门
     cases = man["cases"]
-    folds_path = resolve(paths["folds"])
-    if not os.path.exists(folds_path):
-        folds = build_folds(paths["manifest"], n_folds=cfg["folds"], val_ratio=cfg["val_ratio"])
+    if fold is None:
+        va, vpath = external_val_cases()
+        if not va:
+            # 清单在、但一例都没掩膜时，还喊"先跑 01_probe.sh --val"是**误导**
+            # （用户已经跑过了）。全量模式的 val 只用来算 Dice 选 best，
+            # **掩膜是唯一需要的金标准**；官方验证集实测只给 SeriesType.xlsx
+            # （连字段金标准表都没有），若它同时没有掩膜，就真的没有早停集 ——
+            # 必须说准是哪一种，否则会让人反复重跑探针。
+            _why = ("验证集清单里**没有一例带掩膜**（Dice 算不出来，选不了 best）"
+                    if os.path.exists(vpath) else "还没有验证集清单")
+            raise SystemExit(
+                f"[trainer] 全量训练（--fold full）需要官方验证集：\n"
+                f"  · {_why}（清单：{vpath}）\n"
+                "  · 首次生成：export VAL_ROOT=<验证集根> && bash scripts/01_probe.sh --val\n"
+                "  · 用不了验证集时请用折内 val：bash scripts/03_train.sh 0")
+        tr = cases
+        print(f"[trainer] 全量模式：train={len(tr)}（清单全部病例） "
+              f"val={len(va)}（官方验证集 {vpath}；无掩膜的例已剔除——选模只用 Dice）",
+              flush=True)
     else:
-        with open(folds_path, encoding="utf-8") as f:
-            folds = json.load(f)
-    tr, va = _split(cases, folds, fold)
+        folds_path = resolve(paths["folds"])
+        if not os.path.exists(folds_path):
+            folds = build_folds(paths["manifest"], n_folds=cfg["folds"], val_ratio=cfg["val_ratio"])
+        else:
+            with open(folds_path, encoding="utf-8") as f:
+                folds = json.load(f)
+        tr, va = _split(cases, folds, fold)
 
     labels_cfg = load_config("labels.yaml")
     fields = labels_cfg["fields"]
@@ -205,7 +239,7 @@ def make_loaders(cfg: dict, fold: int):
     n_spec = int(cfg.get("aux", {}).get("special_batch", 2))
     if (pos_fake or pos_comp) and n_spec > 0:
         ds_sp = SpecialImageDataset(cases, pos_fake, pos_comp, pre_cfg=pre, aug_cfg=cfg,
-                                    seed=cfg["seed"] + fold, n_per_epoch=10 ** 6)
+                                    seed=cfg["seed"] + _seed_off(fold), n_per_epoch=10 ** 6)
         aux["special"] = DataLoader(ds_sp, batch_size=n_spec, shuffle=False,
                                     num_workers=0, drop_last=True)
 
@@ -214,7 +248,7 @@ def make_loaders(cfg: dict, fold: int):
     n_pair = int(cfg.get("aux", {}).get("pair_batch", 2))
     if gold and n_pair > 0:
         ds_pr = DuplicatePairDataset(cases, gold, n_neg_per_pos=cfg.get("aux", {}).get("neg_per_pos", 3),
-                                     seed=cfg["seed"] + fold, pre_cfg=pre, aug_cfg=cfg)
+                                     seed=cfg["seed"] + _seed_off(fold), pre_cfg=pre, aug_cfg=cfg)
         aux["pair"] = DataLoader(ds_pr, batch_size=n_pair, shuffle=True, num_workers=0,
                                  drop_last=True)
     return dl_tr, dl_va, len(tr), len(va), aux
@@ -263,17 +297,18 @@ def validate(model, dl, cfg) -> dict:
 # --------------------------------------------------------------------------- #
 # 训练
 # --------------------------------------------------------------------------- #
-def train(cfg_path: str, fold: int, tag: str | None, no_resume: bool = False,
+def train(cfg_path: str, fold: int | None, tag: str | None, no_resume: bool = False,
           pretrained: str | None = None) -> str:
+    """训一折（``fold=0..N``）或**全量一个模型**（``fold=None``，val=官方验证集）。"""
     cfg = load_config(os.path.basename(cfg_path) if cfg_path.endswith(".yaml") else cfg_path)
     paths = load_paths()
-    tag = tag or f"g4_fold{fold}"
+    tag = tag or ("g4_full" if fold is None else f"g4_fold{fold}")
     out_dir = resolve(os.path.join(paths["checkpoints_dir"], tag))
     os.makedirs(out_dir, exist_ok=True)
     logger = run_logger(resolve(paths["logs_dir"]), tag)
 
-    torch.manual_seed(cfg["seed"] + fold)
-    np.random.seed(cfg["seed"] + fold)
+    torch.manual_seed(cfg["seed"] + _seed_off(fold))
+    np.random.seed(cfg["seed"] + _seed_off(fold))
 
     labels_cfg = load_config("labels.yaml")
     cls_spec = cls_spec_from_config(labels_cfg)
@@ -339,7 +374,8 @@ def train(cfg_path: str, fold: int, tag: str | None, no_resume: bool = False,
     n_pair_b = int((cfg.get("aux") or {}).get("pair_batch", 2)) if aux.get("pair") else 0
     sp_iter = itertools.cycle(aux["special"]) if aux.get("special") else None
     pr_iter = itertools.cycle(aux["pair"]) if aux.get("pair") else None
-    print(f"[trainer] tag={tag} fold={fold} train={n_tr} val={n_va} steps/epoch={steps_per_epoch} "
+    print(f"[trainer] tag={tag} fold={'full' if fold is None else fold} train={n_tr} val={n_va} "
+          f"steps/epoch={steps_per_epoch} "
           f"特殊影像正样本={aux['pos_counts']} 重复对={aux.get('pair') is not None}", flush=True)
 
     for epoch in range(start_epoch, cfg["epochs"]):
@@ -462,12 +498,19 @@ def train(cfg_path: str, fold: int, tag: str | None, no_resume: bool = False,
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="train")
-    ap.add_argument("--fold", type=int, default=0)
+    ap.add_argument("--fold", default="0",
+                    help="折号 0..N；或 full = 全量训练（train=清单全部病例，"
+                         "val=官方验证集 data/manifest_val.json）")
     ap.add_argument("--tag", default=None)
     ap.add_argument("--no-resume", action="store_true")
     ap.add_argument("--pretrained", default=None, help="预训练权重（可选；合规性自行确认）")
     a = ap.parse_args()
-    train(a.config, a.fold, a.tag, a.no_resume, a.pretrained)
+    f = str(a.fold).strip().lower()
+    if f in ("full", "none"):
+        fold: int | None = None
+    else:
+        fold = int(f)
+    train(a.config, fold, a.tag, a.no_resume, a.pretrained)
 
 
 if __name__ == "__main__":

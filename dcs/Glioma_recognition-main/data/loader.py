@@ -40,6 +40,41 @@ _MASK_HINTS = ("mask", "seg", "label", "roi", "掩码", "标注",
 
 _SERIES_TYPE_HEADERS = ("accessionnumber", "seriesuid", "seriestype")
 
+#: 类型表的列名候选（归一化后做**子串**匹配，故短词靠后）。
+#:
+#: 为什么不能只认 :data:`_SERIES_TYPE_HEADERS` 里的三个精确名：官方表是**中文/英文
+#: 混着来**的（另一份表就叫"检查号 / 序列号 / 序列类型"）。列名对不上时旧实现直接抛
+#: ``InvalidInputError`` —— 而评测期**不可重跑**，一次列名改版就是整批 0 分。
+_SERIES_TYPE_ALIASES: dict[str, tuple[str, ...]] = {
+    "acc": ("accessionnumber", "accession", "检查号", "检查编号", "病例号"),
+    "uid": ("seriesinstanceuid", "seriesuid", "序列号", "序列uid"),
+    "typ": ("seriestype", "序列类型", "模态", "序列描述", "type"),
+}
+
+#: 表**可能**落在的位置（相对数据根）。表与影像同层，但数据根常被指到
+#: 阶段目录 / 病例目录 / 容器层的上一层，所以把相邻位置一并试掉。
+#: 只认 ``root/SeriesType.xlsx`` 的话，差一层目录就整表读不到。
+_TABLE_CANDIDATE_SUBDIRS = ("", "annotation", "original")
+
+#: 表头行扫描上限：第 1~3 行都可能是"索引信息"（标题/说明/空行），
+#: 所以在前若干行里找"能凑齐三列名"的那一行，不假设它在第几行。
+_HEADER_SCAN_ROWS = 20
+#: 按取值嗅探时最多看多少行（够算比例即可，不把全表读进内存）。
+_SNIFF_SCAN_ROWS = 300
+
+#: 模态取值的长度上限：``T1CE（增强）`` 也就 8 个字符，检查号 / UID 这类长串必不是模态。
+_MODALITY_VALUE_MAXLEN = 16
+#: 这些取值本身不是模态（``其他`` 是**权威排除**），但出现在类型列里说明"这列是类型列"。
+_OTHER_VALUE_TOKENS = frozenset({
+    "其他", "其它", "无", "没有", "other", "none", "na", "n/a", "正常", "平扫",
+})
+
+#: 列别名 → 代码里统一使用的规范列名（都归一到 :data:`_SERIES_TYPE_HEADERS`）。
+_SERIES_TYPE_CANON = {"acc": "accessionnumber", "uid": "seriesuid", "typ": "seriestype"}
+
+#: 已就"行缺值被跳过"告警过（避免每行刷一条；评测日志要能一眼看到）
+_WARNED_PARTIAL_ROW = False
+
 #: 顶层**非病例**目录（与训练侧 ``discover_cases`` 的跳过列表保持同一语义）。
 #:
 #: 官方数据根除病例号目录外还有标注目录 ``annotation/{fake,Composition,duplicate}``。
@@ -51,7 +86,13 @@ _SERIES_TYPE_HEADERS = ("accessionnumber", "seriesuid", "seriestype")
 #: 3. 更致命的是若 ``annotation/fake/<uid>/`` 下的文件名不等于目录名，
 #:    :func:`_select_original_nifti_files` 会**直接抛错**——一次评测机会全盘报废。
 #:    （赛事评测不可重跑，1 个标注目录不该让整批归零。）
-_NON_CASE_DIRS = frozenset({"annotation", "cache", "runs", "folds", "labels"})
+#:
+#: ``original`` 是**验证集**的容器层（``verification/original/<检查号>/``）。
+#: 它在正常情况下会被 :meth:`DatasetLoader._resolve_dataset_root` 下钻掉；
+#: 万一没下钻（dataset_path 直接指 ``…/verification`` 且本层还混了别的目录），
+#: 把它列进来至少让"扫不到 NIfTI"响亮失败，而不是拿容器名当检查号产出垃圾答案。
+_NON_CASE_DIRS = frozenset({"annotation", "original", "cache", "runs", "folds",
+                            "labels"})
 
 #: 平台 ``/2026aicompetition/datasets`` 下的阶段目录名。
 #: ``dataset_path`` 若误指**父目录**，这些名字会被当成病例号，静默产出 5 份垃圾答案；
@@ -63,6 +104,10 @@ _PLATFORM_PHASES = frozenset({
     "evaluation_finals",
     "verification",
 })
+
+#: 阶段目录**内部**再套的容器层名：影像、``SeriesType.xlsx``、标注表都在它下面。
+#: 实测：训练集是 ``training/annotation/``，验证集是 ``verification/original/``。
+_CONTAINER_DIRS = frozenset({"annotation", "original"})
 
 
 def _nifti_stem(path: Path) -> str:
@@ -117,10 +162,101 @@ def _metadata_key(value: Any) -> str:
     return re.sub(r"\s+", "", str(value if value is not None else "")).casefold()
 
 
+def _looks_like_modality_value(value: Any) -> bool:
+    """该单元格"看着像模态取值"吗（专供列名认不出时的取值嗅探）。
+
+    判据与模态匹配**同源**（``data.series_selector.guess_modality``，局部导入）：
+    嗅探认定"这列是类型列"的取值，后面也得真能被认出来 —— 两套口径不一致，
+    会出现"列挑对了、模态仍全空"这种最难查的情形。
+    """
+    text = re.sub(r"[\s\-_/]+", "", str(value if value is not None else "")).casefold()
+    if not text or len(text) > _MODALITY_VALUE_MAXLEN:
+        return False
+    if text in _OTHER_VALUE_TOKENS:
+        return True
+    from data.series_selector import guess_modality           # 局部导入：不引入模块级耦合
+    return guess_modality(text) is not None
+
+
+def _match_header_row(row) -> dict[str, int] | None:
+    """这一行是不是类型表的表头（三列都能按别名认出来）→ ``{规范列名: 下标}``。"""
+    cells = [_metadata_key(value) for value in row]
+    if not any(cells):
+        return None
+    found: dict[str, int] = {}
+    for want, keys in _SERIES_TYPE_ALIASES.items():
+        for index, cell in enumerate(cells):
+            if cell and any(k in cell for k in keys):
+                found[_SERIES_TYPE_CANON[want]] = index
+                break
+    return found if set(found) == set(_SERIES_TYPE_HEADERS) else None
+
+
+def _sniff_series_type_columns(rows: list) -> tuple[int, int, int] | None:
+    """**不看列名**，按取值找出 ``(检查号列, 序列号列, 类型列)``；认不出返回 ``None``。
+
+    为什么需要它：列名是唯一会被"改版"的东西（前两列写成 ``编号/影像号``、
+    加了索引列、或干脆是 ``A/B/C``），而**取值**不会变（检查号、DICOM UID、
+    5 类模态取值）。评测期不可重跑，多这一层兜底就少一种整批 0 分的方式。
+
+    判据（全在取值上）：类型列 = "像模态取值"的比例最高且 ≥ 0.5；
+    剩下两列里取值含 ``.``（DICOM UID）比例更高 / 平均更长的那个是序列号列。
+
+    找不到就返回 ``None``（随后仍按原逻辑响亮报错），绝不硬凑 —— 凑错会把整表挂在
+    错误的键上，比读不到更难查。
+    """
+    body = [r for r in rows[:_SNIFF_SCAN_ROWS]
+            if any(str(c).strip() for c in r if c is not None)]
+    if len(body) < 3:
+        return None
+    width = max(len(r) for r in body)
+    if width < 3:
+        return None
+    cols = [[str(r[c]).strip() for r in body if c < len(r) and str(r[c]).strip()]
+            for c in range(width)]
+    ratio = [(sum(1 for v in vals if _looks_like_modality_value(v)) / len(vals)
+              if vals else 0.0) for vals in cols]
+    typ_col = max(range(width), key=lambda c: (ratio[c], len(cols[c])))
+    if ratio[typ_col] < 0.5:
+        return None
+    rest = [c for c in range(width) if c != typ_col and cols[c]]
+    if len(rest) < 2:
+        return None
+
+    def dotted(c: int) -> float:
+        return sum(1 for v in cols[c] if "." in v) / len(cols[c])
+
+    def mean_len(c: int) -> float:
+        return sum(len(v) for v in cols[c]) / len(cols[c])
+
+    rest.sort(key=lambda c: (dotted(c), mean_len(c)), reverse=True)
+    uid_col, acc_col = rest[0], rest[1]
+    return acc_col, uid_col, typ_col
+
+
+def _series_type_table_path(root: Path) -> Path | None:
+    """在数据根本层与相邻层找 ``SeriesType.xlsx`` → 路径（都没有返回 ``None``）。"""
+    seen: set[Path] = set()
+    for base in (root, root.parent):
+        for sub in _TABLE_CANDIDATE_SUBDIRS:
+            candidate = (base / sub / "SeriesType.xlsx") if sub else (base / "SeriesType.xlsx")
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 def _read_series_types(root: Path) -> dict[tuple[str, str], str]:
-    path = root / "SeriesType.xlsx"
-    if not path.is_file():
+    global _WARNED_PARTIAL_ROW
+    path = _series_type_table_path(root)
+    if path is None:
+        print(f"[loader][告警] {root} 及其相邻层都没找到 SeriesType.xlsx → "
+              f"序列类型读不到（将退回 sidecar / 文件名关键词 / 兜底表）。", flush=True)
         return {}
+    if path.parent != root:
+        print(f"[loader][告警] SeriesType.xlsx 不在数据根那一层，已定位到 {path}", flush=True)
 
     try:
         workbook = load_workbook(path, read_only=True, data_only=True)
@@ -130,30 +266,49 @@ def _read_series_types(root: Path) -> dict[tuple[str, str], str]:
         ) from exc
 
     try:
+        # ① 按**列名**扫表头行：哪一行能凑齐三列就用哪一行，不假设它在第几行
+        #    （第 1~3 行都可能是索引信息）。列名走别名子串匹配，中英文表头都认。
         header: tuple[Any, int, dict[str, int]] | None = None
         for worksheet in workbook.worksheets:
             for row_number, row in enumerate(
-                worksheet.iter_rows(values_only=True),
+                worksheet.iter_rows(max_row=_HEADER_SCAN_ROWS, values_only=True),
                 start=1,
             ):
-                cells = [_metadata_key(value) for value in row]
-                if all(name in cells for name in _SERIES_TYPE_HEADERS):
-                    header = (
-                        worksheet,
-                        row_number,
-                        {name: cells.index(name) for name in _SERIES_TYPE_HEADERS},
-                    )
+                columns = _match_header_row(row)
+                if columns is not None:
+                    header = (worksheet, row_number, columns)
                     break
             if header is not None:
                 break
 
         if header is None:
+            # ② 列名一条都没命中（改版 / 加了索引列 / 表头用了别的词）
+            #    → 按**取值**嗅探三列。嗅探也失败才响亮报错（原行为）。
+            for worksheet in workbook.worksheets:
+                sample = list(worksheet.iter_rows(max_row=_SNIFF_SCAN_ROWS,
+                                                  values_only=True))
+                sniff = _sniff_series_type_columns(sample)
+                if sniff is None:
+                    continue
+                acc_col, uid_col, typ_col = sniff
+                print(f"[loader][告警] {path.name} 工作表 {worksheet.title!r} 列名未识别 → "
+                      f"已按取值定位：检查号=第 {acc_col + 1} 列、序列号=第 {uid_col + 1} 列、"
+                      f"类型=第 {typ_col + 1} 列。若取值明显不对，请把该表前几行贴出来。",
+                      flush=True)
+                header = (worksheet, 0, {"accessionnumber": acc_col,
+                                         "seriesuid": uid_col,
+                                         "seriestype": typ_col})
+                break
+
+        if header is None:
             raise InvalidInputError(
                 f"series metadata {path} is missing headers: "
-                "AccessionNumber, SeriesUid, SeriesType"
+                "AccessionNumber / SeriesUid / SeriesType"
+                f"（已扫前 {_HEADER_SCAN_ROWS} 行，并尝试按取值嗅探）"
             )
 
         worksheet, header_row, columns = header
+        sniffed = header_row == 0
         series_types: dict[tuple[str, str], str] = {}
         for row_number, row in enumerate(
             worksheet.iter_rows(min_row=header_row + 1, values_only=True),
@@ -168,16 +323,22 @@ def _read_series_types(root: Path) -> dict[tuple[str, str], str]:
                 for value in values.values()
             ):
                 continue
+            if sniffed and not _looks_like_modality_value(values["seriestype"]):
+                continue        # 嗅探模式：表头行 / 说明行的"类型"取值不像模态，滤掉
             missing = [
                 name
                 for name, value in values.items()
                 if not str(value if value is not None else "").strip()
             ]
             if missing:
-                raise InvalidInputError(
-                    f"series metadata {path} sheet={worksheet.title!r} "
-                    f"row={row_number} is missing {', '.join(missing)}"
-                )
+                # 表尾的合计/备注行常常只填一两列。旧实现直接抛错 → **整批评测失败**，
+                # 与"一行残缺"的代价完全不相称；跳过并告警即可（同一键冲突仍会响亮报错）。
+                if not _WARNED_PARTIAL_ROW:
+                    _WARNED_PARTIAL_ROW = True
+                    print(f"[loader][告警] {path.name} 工作表 {worksheet.title!r} 第 "
+                          f"{row_number} 行缺 {', '.join(missing)} → 已跳过该行"
+                          f"（表尾备注行常见；本进程内只提示这一次）。", flush=True)
+                continue
 
             key = (
                 _metadata_key(values["accessionnumber"]),
@@ -258,6 +419,14 @@ class DatasetLoader:
 
         children = sorted(p.name for p in root.iterdir() if p.is_dir())
         if not children or not {name.casefold() for name in children} <= _PLATFORM_PHASES:
+            # 本层不是"阶段目录的父目录"，但可能是"影像/表的容器层"：
+            # ``verification/`` 下只有 ``original/``、``training/`` 下只有 ``annotation/``。
+            # 唯一候选时下钻并告警；候选多于一个则维持原样（由后续"扫不到 NIfTI"报错接手，
+            # 猜错层比直接失败更糟）。
+            if len(children) == 1 and children[0].casefold() in _CONTAINER_DIRS:
+                print(f"[loader][告警] dataset_path={root} 下没有检查号目录，"
+                      f"已自动下钻到 {children[0]}/", flush=True)
+                return root / children[0]
             return root
         if len(children) == 1:
             print(f"[loader][告警] dataset_path={root} 是数据集父目录，"

@@ -507,10 +507,10 @@ def main() -> int:
             (_r3 / "标注结果").mkdir()                                # 表藏在容器子目录里
             _wb3.save(_r3 / "标注结果" / "SeriesType.xlsx")
 
-            # 再放一份**工作区那份的兼容表**进同一层，且刻意写得"更粗/更错"：
-            # ①T2WI → 粗粒度 "T2"（会静默覆盖权威取值）
-            # ②其他 → "FLAIR"（会把"权威排除"变成一路假 flair 灌进通道）
-            # 数据集那份必须赢；顺序反了这两条 check 会立刻红。
+            # 再放一份**工作区那份兼容表**进同一层，且刻意写得"更粗/更错"：
+            # ①T2WI → 粗粒度 "T2"（曾会静默覆盖权威取值）
+            # ②其他 → "FLAIR"（曾会把"权威排除"变成一路假 flair 灌进通道）
+            # 现在**两条路线都不读它**；一旦有人把兜底加回来，这两条 check 会立刻红。
             _wb3b = _WB3()
             _ws3b = _wb3b.active
             _ws3b.append(["AccessionNumber", "SeriesUid", "SeriesLabel"])
@@ -537,15 +537,28 @@ def main() -> int:
                   bool(find_named_table("SeriesType.xlsx", Path(_tmp3) / "training")))
 
             _t4 = _t4rst3(_r3)
-            check("数据集那份权威：5 条都在，兼容表不覆盖（T2WI 不被压成 T2）",
+            check("数据集那张表是唯一来源：5 条都在（T2WI 不被压成 T2）",
                   _t4.get((_acc3, _u3["w"])) == "T2WI" and len(_t4) == 5,
                   f"n={len(_t4)} t2wi={_t4.get((_acc3, _u3['w']))!r}")
-            check("数据集那份权威：『其他』不被兼容表改写成 FLAIR",
+            check("『其他』保持权威取值（不被兼容表改写成 FLAIR）",
                   _t4.get((_acc3, _u3["o"])) == "其他")
             _g3 = _rst3(_r3)
-            check("研发侧同样以数据集那份为准（5 条，未被覆盖）",
+            check("研发侧（goals）同样只读数据信息表：5 条，兼容表一条不掺",
                   len(_g3) == 5 and _g3.get((_acc3, _u3["o"])) == "其他",
                   f"n={len(_g3)} other={_g3.get((_acc3, _u3['o']))!r}")
+
+            # 兜底已**彻底移除**（两条路线一致）：把数据集那张表移走，即使
+            # 3_serieslabel.xlsx 就躺在旁边，也必须读到空表 —— 宁可响亮地报
+            # series_type_rows=0，也不静默换粗粒度取值顶上（T2WI/T2-Flair → T2）。
+            _stash = Path(_tmp3) / "SeriesType.xlsx.bak"
+            (_r3 / "标注结果" / "SeriesType.xlsx").rename(_stash)
+            try:
+                _t4_off, _g3_off = _t4rst3(_r3), _rst3(_r3)
+                check("数据集表不在时不再拿 3_serieslabel.xlsx 顶上（两条路线都读空）",
+                      _t4_off == {} and _g3_off == {},
+                      f"track4={len(_t4_off)} goals={len(_g3_off)}")
+            finally:
+                _stash.rename(_r3 / "标注结果" / "SeriesType.xlsx")
 
             _c3 = _scan3(str(_r3))[0]
             check("5 类取值 → 通道键（T1/T1CE/T2-Flair/T2WI 各一路，其他单列）",
@@ -577,8 +590,11 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as _tmpl:
         import csv as _csv                                            # noqa: PLC0415
         from src.data.labels import (find_structured_tables,          # noqa: PLC0415
+                                     guess_mask_role as _gmr,
                                      read_structured_table,
-                                     structured_from_row)
+                                     structured_from_row,
+                                     _sheet_frames as _sframes,
+                                     _sheet_plan as _splan)
         from src.data.probe import probe as _probe                    # noqa: PLC0415
         _lroot = Path(_tmpl) / "training" / "annotation"
         _tiny_nii(_lroot / "ACC001" / "S1" / "S1.nii.gz")
@@ -651,6 +667,147 @@ def main() -> int:
         check("n_structured_rows 按唯一记录计数",
               "len({id(v) for v in struct.values()})" in _p_src)
 
+        # 数据集**真实排版**（实测）：表头在第 2 行；H 列 `StudyUid`、I 列 `Accessionumber`
+        # （少一个 n 的拼写）、病理结果列写成字段路径 `Study->CLINICAL->病理结果`，
+        # 取值含 `脑胶质瘤2级` / `其他肿瘤或病变` / `病因不明` / `脑胶质瘤4级`。
+        # 曾经的错法：`accessionnumber` 只在"包含"轮命中、而 `StudyUid` 精确命中 →
+        # 整张检查级别 sheet 按 StudyUid 建索引（键形如 `1.2.3.xxx`），与磁盘检查号
+        # 一条都对不上，序列级/ROI 级子行也全部"挂不到病例"（丢行、且不报错）。
+        _ACC_A = "1a2b3c4d5e6f708192a3b4c5d6e7f809"
+        _ACC_B = "2b3c4d5e6f708192a3b4c5d6e7f8091a"
+        # 放在数据根**上一级**：与探针的 `label_search_dirs`（数据根 → 其父 → 祖父）同口径，
+        # 表放别处（如 _rt 子目录）探针扫不到，会出现"表在磁盘上、代码没看见"的假失败。
+        _rp = Path(_tmpl) / "real_layout.xlsx"
+        _wb4 = _WB()
+        _wsA = _wb4.active
+        _wsA.title = "检查级别"
+        _wsA.append(["脑胶质瘤标注结果（训练集）"])                        # 行1 标题
+        _wsA.append(["Study->DICOM->StudyDate", "", "", "", "", "", "",
+                     "StudyUid", "Accessionumber", "", "", "", "",
+                     "Study->CLINICAL->病理结果"])                         # 行2 表头
+        _wsA.append(["20240101", "", "", "", "", "", "", "1.2.3.aaa", _ACC_A,
+                     "", "", "", "", "脑胶质瘤2级"])
+        _wsA.append(["20240102", "", "", "", "", "", "", "1.2.3.bbb", _ACC_B,
+                     "", "", "", "", "其他肿瘤或病变"])
+        # 序列级 / ROI 级的表头同样在第 2 行。ROI 级的列位置实测为：
+        # Y 列 `SerisDescription`（T1 / T2-FLAIR / T1CE（增强）/ 其他）、AB 列 `ROIUid`、
+        # AC 列 `RoiName`（瘤体 / 水肿 / 肿瘤瘤体 / 全肿瘤）、
+        # AQ 列 `Study->CLINICAL->病理结果`（与检查级别同字段，用于"病例只在这张表里"时兜底）。
+        # 曾经的错法：ROI 行键靠 `roi` **前缀**匹配，命中位置更靠前的 AB 列 `ROIUid`，
+        # ROI 名退化成普通列 —— 掩膜角色的唯一来源（瘤体/水肿/全肿瘤）就没了。
+        def _put(_ws, _row, _mapping) -> None:
+            for _c, _v in _mapping.items():
+                _ws.cell(row=_row, column=_c, value=_v)
+
+        _wsS = _wb4.create_sheet("序列级别")
+        _wsS.append(["脑胶质瘤标注结果（训练集）"])                        # 行1 标题
+        _wsS.append(["AccessioNumber", "StudyUid", "SeriesUid",
+                     "Study->IMAGE->序列描述"])                           # 行2 表头
+        _wsS.append([_ACC_A, "1.2.3.aaa", "2.25.1001", "T2-Flair"])
+        _ACC_C = "3c4d5e6f708192a3b4c5d6e7f8091a2b"      # 只出现在 ROI 级 sheet 的病例
+        _wsR = _wb4.create_sheet("ROI级别")
+        _wsR.append(["脑胶质瘤标注结果（训练集）"])                        # 行1 标题
+        _put(_wsR, 2, {8: "StudyUid", 9: "AccessioNumber", 25: "SerisDescription",
+                       28: "ROIUid", 29: "RoiName", 43: "Study->CLINICAL->病理结果"})
+        for _i, (_rn, _sd) in enumerate([("瘤体", "T1"), ("水肿", "T2-FLAIR"),
+                                         ("肿瘤瘤体", "T1CE（增强）"),
+                                         ("全肿瘤", "其他")]):
+            _put(_wsR, 3 + _i, {8: "1.2.3.aaa", 9: _ACC_A, 25: _sd,
+                                28: f"2.25.90{_i}", 29: _rn, 43: "脑胶质瘤2级"})
+        for _i, _rn in enumerate(("瘤体", "水肿")):                       # 检查级别里没有这一例
+            _put(_wsR, 7 + _i, {8: "1.2.3.ccc", 9: _ACC_C, 25: "T1",
+                                28: f"2.25.91{_i}", 29: _rn, 43: "脑胶质瘤4级"})
+        _ACC_D = "4d5e6f70819a2b3c4d5e6f7081a2b3c4"      # 子行标签列**自相矛盾**的病例
+        for _i, _ph in enumerate(("其他肿瘤或病变", "脑胶质瘤4级")):
+            _put(_wsR, 9 + _i, {8: "1.2.3.ddd", 9: _ACC_D, 25: "T1",
+                                28: f"2.25.92{_i}", 29: "瘤体", 43: _ph})
+        _wb4.save(_rp)
+
+        _rh, _rds, _rkc, _rlv = _splan(dict(_sframes(str(_rp)))["ROI级别"], "roi", None)
+        check("真实排版：ROI 级行键 = RoiName（同表 ROIUid 不被截走）",
+              _rh[_rkc].casefold() == "roiname" and _rds == 2 and _rlv == "roi",
+              f"表头行={_rds} 行键={_rh[_rkc]!r}")
+        _tr = _rst(str(_rp))                      # 离线口径：不给磁盘检查号
+        check("真实排版：行键取 Accessionumber（不是 StudyUid）",
+              {_ACC_A, _ACC_B} <= set(_tr) and not any(k.startswith("1.2.3.") for k in _tr),
+              f"键={sorted(_tr)[:3]}")
+        check("真实排版：分层列名 Study->CLINICAL->病理结果 能映射字段",
+              structured_from_row(_tr.get(_ACC_A, {})).get("WHO_Grade") == "2"
+              and structured_from_row(_tr.get(_ACC_A, {})).get("TumorProbability") == 1,
+              f"字段={structured_from_row(_tr.get(_ACC_A, {}))}")
+        check("真实排版：非胶质瘤取值映射为 TumorProbability=0",
+              structured_from_row(_tr.get(_ACC_B, {})).get("TumorProbability") == 0,
+              f"字段={structured_from_row(_tr.get(_ACC_B, {}))}")
+        _roi_rows = _tr.get(_ACC_A, {}).get("__roi_rows__", [])
+        check("真实排版：离线也能把序列级/ROI 级子行挂到病例上",
+              len(_tr.get(_ACC_A, {}).get("__series_rows__", [])) == 1
+              and len(_roi_rows) == 4,
+              f"子行={len(_tr.get(_ACC_A, {}).get('__series_rows__', []))}/{len(_roi_rows)}")
+        _roles = [_gmr(_r.get("RoiName", "")) for _r in _roi_rows]
+        check("真实排版：ROI 名 → 掩膜角色（瘤体/肿瘤瘤体=core，水肿/全肿瘤=peri）",
+              _roles == ["core", "peri", "core", "peri"], f"roles={_roles}")
+        check("真实排版：ROI 级子行保留序列描述（SerisDescription）",
+              any(_r.get("SerisDescription") == "T1CE（增强）" for _r in _roi_rows),
+              f"描述={[_r.get('SerisDescription') for _r in _roi_rows]}")
+        # 病例只在 ROI 级 sheet 里时（检查级别没有这一行），AQ 列的病理结果必须落到病例上：
+        # 否则这一例"没有金标准"，评测分母悄悄变小且不报错。
+        _tr_ids = _rst(str(_rp), {_ACC_A, _ACC_B, _ACC_C, _ACC_D})      # 带磁盘检查号
+        _fc = structured_from_row(_tr_ids.get(_ACC_C, {}))
+        check("真实排版：病例只在 ROI 级 sheet 时 AQ 列病理结果仍落到病例上",
+              _fc.get("WHO_Grade") == "4" and _fc.get("TumorProbability") == 1,
+              f"字段={_fc}")
+        # 子行标签列自相矛盾（同一病例两行写了不同病理）时**不能任取一行**：
+        # 宁可没有金标准，也不能把错的当金标准（真值靠人工核，进程给不了）。
+        _fd = structured_from_row(_tr_ids.get(_ACC_D, {}))
+        check("真实排版：子行标签列取值冲突时不提升（不任取一行当金标准）",
+              "TumorProbability" not in _fd and "WHO_Grade" not in _fd,
+              f"字段={_fd}")
+        check("真实排版：ROI 级行不覆盖检查级别给的病例字段",
+              structured_from_row(_tr_ids.get(_ACC_B, {})).get("TumorProbability") == 0,
+              f"字段={structured_from_row(_tr_ids.get(_ACC_B, {}))}")
+
+        _real_root = Path(_tmpl) / "real_layout_ds"
+        _tiny_nii(_real_root / _ACC_A / "2.25.1001" / "2.25.1001.nii.gz")
+        _tiny_nii(_real_root / _ACC_B / "2.25.2002" / "2.25.2002.nii.gz")
+        _rep_rl = _probe(str(_real_root), limit_cases=2)["report"]
+        check("真实排版：探针给两例都判出结构化字段",
+              _rep_rl["label_field_counts"].get("TumorProbability") == 2
+              and _rep_rl["label_field_counts"].get("WHO_Grade") == 1,
+              f"counts={_rep_rl['label_field_counts']}")
+
+        # 官方验证集实测**只有** SeriesType.xlsx（字段金标准表、重复影像金标准都没有）→
+        # 这种"没表"是**预期**：提示语必须说预期，不能把人引去满磁盘找一张不存在的表。
+        # 自带临时目录：数据根的**父/祖父**也在金标准搜索范围内（`max_parents=2`），
+        # 放在共享的 _tmpl 下会搜到别的用例留下的表，把这条检查测成"有表但对不上"。
+        with tempfile.TemporaryDirectory(prefix="valonly_") as _vtmp:
+            _val_root = Path(_vtmp) / "verification"
+            _ACC_E = "5e6f7081a2b3c4d5e6f70819a2b3c4d5"
+            _tiny_nii(_val_root / "original" / _ACC_E / "2.25.3003" / "2.25.3003.nii.gz")
+            _wbV = _WB()
+            _wsV = _wbV.active
+            _wsV.append(["AccessionNumber", "SeriesUid", "SeriesType"])
+            _wsV.append([_ACC_E, "2.25.3003", "T1CE"])
+            _wbV.save(_val_root / "original" / "SeriesType.xlsx")
+            _repV = _probe(str(_val_root), limit_cases=1, phase="val")["report"]
+            check("验证集：只有 SeriesType.xlsx 时判为预期，而不是'去找金标准表'",
+                  _repV["no_labels"] == [_ACC_E] and _repV["series_type_rows"] == 1
+                  and "预期" in _repV["labels_hint"],
+                  f"no_labels={_repV['no_labels']} hint={_repV['labels_hint'][:36]}")
+        # 反过来：搜到的表**属于另一份数据**（检查号一条都对不上）时，不能说成"列名有问题" ——
+        # 那会让人反复改列名，而真正该做的是确认数据根与表是否配套。
+        with tempfile.TemporaryDirectory(prefix="foreign_") as _ftmp:
+            _fb = Path(_ftmp) / "verification"
+            _tiny_nii(_fb / "original" / _ACC_A / "2.25.4004" / "2.25.4004.nii.gz")
+            _wbF = _WB()
+            _wsF = _wbF.active
+            _wsF.append(["AccessionNumber", "病理结果"])
+            _wsF.append(["9f8e7d6c5b4a39281706f5e4d3c2b1a0", "脑胶质瘤4级"])
+            _wbF.save(_fb / "脑胶质瘤标注结果-验证集.xlsx")
+            _repF = _probe(str(_fb), limit_cases=1, phase="val")["report"]
+            check("验证集：表与本数据集对不上时说'表属于另一份数据'而不是'列名有问题'",
+                  "一条都对不上" in _repF["labels_hint"],
+                  f"hint={_repF['labels_hint'][:40]}")
+
         # 列名不可靠：**按取值**找检查号列（拿磁盘上的检查号逐列比对，列名叫什么都不影响）
         check("实现按取值定位检查号列",
               "_best_id_column_by_values" in _labels_src2)
@@ -676,9 +833,9 @@ def main() -> int:
 
     # ---------------------------------------------------------------- #
     _section("⑯ 研发侧（glioma_goals）官方标注对接")
-    # 官方 5 张标注表是模态/掩膜/字段/异常标记的**唯一权威来源**。
-    # 之前这些走的是 label.json、目录名关键词、中文列名 —— 官方数据里都不存在，
-    # 于是 special 标签恒为 0、字段全空，训练照跑完却什么都没学到。
+    # 官方标注表是掩膜/字段/异常标记的**唯一权威来源**（模态来自数据集自带的
+    # SeriesType.xlsx）。之前这些走的是 label.json、目录名关键词、中文列名 ——
+    # 官方数据里都不存在，于是 special 标签恒为 0、字段全空，训练照跑完却什么都没学到。
     _goals_mod = (_GOALS / "shared/official_labels.py")
     _goals_data = (_GOALS / "shared/data.py").read_text(encoding="utf-8")
     check("研发侧新增 official_labels 模块", _goals_mod.is_file())
@@ -686,8 +843,13 @@ def main() -> int:
           "_official_context" in _goals_data and "read_characteristics" in _goals_data)
     check("研发侧跳过 fake/compositing/duplicate 当检查号",
           "SPECIAL_SOURCE_DIRS" in _goals_data)
-    check("研发侧序列类型不再「缺 SeriesType.xlsx 就提前 return」",
-          "不能提前 return" in _goals_data or "read_series_labels" in _goals_data)
+    # 兜底已彻底移除（与 track4 同口径）：源码里不能再出现读 3_serieslabel 的入口，
+    # 且 OFFICIAL_LABEL_FILES 不应再有 "series" 键 —— 否则又会有第二个模态来源。
+    _goals_lbl = (_GOALS / "shared/official_labels.py").read_text(encoding="utf-8")
+    check("研发侧不再读 3_serieslabel.xlsx（兜底函数已删除）",
+          "def read_series_labels" not in _goals_lbl
+          and '"series": "3_serieslabel.xlsx"' not in _goals_lbl,
+          "兜底加回来的话，T2WI/T2-Flair 会被压成 T2 且不报错")
     _g1 = (_GOALS / "goal1_authenticity/dataset.py").read_text(encoding="utf-8")
     _g2a = (_GOALS / "goal2_stitched/dataset.py").read_text(encoding="utf-8")
     check("goal1 用官方 special.fake", 'special.get("fake")' in _g1 or '"fake" in special' in _g1)
@@ -707,8 +869,14 @@ def main() -> int:
         _tiny_nii(_oroot / "fake" / _F / _U[2] / f"{_U[2]}.nii.gz")
         _xlsx_rows = [("1_abnormal.xlsx", ["AccessionNumber", "SeriesUid", "Label"],
                        [(_A, _U[0], "true"), (_A, _U[1], "true"), (_F, _U[2], "fake")]),
+                      # 数据信息表：模态的唯一来源（真数据里与病例目录同层，这里借 labels 目录）
+                      ("SeriesType.xlsx", ["AccessionNumber", "SeriesUid", "SeriesType"],
+                       [(_A, _U[0], "T2-Flair"), (_A, _U[1], "T1CE（增强）"),
+                        (_F, _U[2], "T2WI")]),
+                      # 工作区那份兼容表：刻意写成"更粗/更错"，用来证明**它已不再被读**
+                      # （若有人把兜底加回来，desc 会变成 T2，下面的 check 立刻红）
                       ("3_serieslabel.xlsx", ["AccessionNumber", "SeriesUid", "SeriesLabel"],
-                       [(_A, _U[0], "FLAIR"), (_A, _U[1], "T1CE"), (_F, _U[2], "T2")]),
+                       [(_A, _U[0], "T2"), (_A, _U[1], "T2"), (_F, _U[2], "T2")]),
                       ("4_masklabel.xlsx", ["AccessionNumber", "SeriesUid", "Maskname"],
                        [(_A, _U[1], "mask_x.nii.gz")]),
                       ("5_characteristics.xlsx",
@@ -731,8 +899,10 @@ def main() -> int:
                   _A in _cases and _F in _cases, f"{len(_cases)} 例")
             check("官方格式：special.fake 正确（原来恒为 0）",
                   _cases.get(_F, {}).get("special", {}).get("fake") == 1.0)
-            check("官方格式：模态来自 3_serieslabel",
-                  sorted(s["desc"] for s in _cases[_A]["series"]) == ["FLAIR", "T1CE"])
+            check("官方格式：模态来自数据信息表 SeriesType.xlsx",
+                  sorted(s["desc"] for s in _cases[_A]["series"])
+                  == ["T1CE（增强）", "T2-Flair"],
+                  f"desc={[s['desc'] for s in _cases[_A]['series']]}")
             check("官方格式：任意名掩膜被识别",
                   "core" in (_cases[_A].get("masks") or {}))
             check("官方格式：字段来自 5_characteristics",
@@ -766,12 +936,12 @@ def main() -> int:
             for _u in _uids[_a]:
                 _tiny_nii(_droot / _a / _u / f"{_u}.nii.gz")
         _w = _WB3()
-        _w.active.append(["AccessionNumber", "SeriesUid", "SeriesLabel"])
+        _w.active.append(["AccessionNumber", "SeriesUid", "SeriesType"])
         for _a in _accs:
             for _u in _uids[_a]:
-                _w.active.append([_a, _u, "FLAIR"])
+                _w.active.append([_a, _u, "T2-Flair"])
         _dlabels.mkdir(parents=True, exist_ok=True)
-        _w.save(_dlabels / "3_serieslabel.xlsx")
+        _w.save(_dlabels / "SeriesType.xlsx")
         _pairs = [(_accs[0], _accs[1]), (_accs[2], _accs[3])]
         _w2 = _WB3()
         _w2.active.append(["src_img", "desc_img"])
@@ -811,7 +981,7 @@ def main() -> int:
 
     # ---------------------------------------------------------------- #
     _section("⑱ 评测期无标注表：体素统计模型兜底判模态")
-    # 官方训练集给了 labels/3_serieslabel.xlsx，评测集**不给**；评测集的序列
+    # 官方训练集给了 annotation/SeriesType.xlsx，评测集**不给**；评测集的序列
     # 目录名是 DICOM UID，关键词一个都命中不了。此时若不判模态：
     # 训练侧表现为"无任何可用序列"直接崩；推理侧更隐蔽 ——
     # inference/pipeline.py 要先知道"哪个序列是 T1C"才能把掩膜写回它的空间，
@@ -938,20 +1108,19 @@ def main() -> int:
     _section("⑲ 文档里标出的「数据路径 / 数据信息路径」")
     # 交付文档必须让人一眼看到：影像在哪、数据信息在哪。这是**文档契约**——
     # 改了目录结构却忘了改文档、或又把工作区那 5 张表说成"本赛道的数据信息"，这里会红。
+    # 全流程文档只有 README.md 一份（docs/ 下的分册已合并删除）。
     _doc_expect = [
         ("README.md", "annotation/SeriesType.xlsx", "数据信息路径"),
         ("README.md", "2.25.* 序列UID", "影像数据路径"),
-        ("docs/MASTER_GUIDE.md", "★ 数据路径（影像）", "数据路径显式标注"),
-        ("docs/MASTER_GUIDE.md", "★ 数据信息路径", "数据信息路径显式标注"),
-        ("docs/MASTER_GUIDE.md", "脑胶质瘤标注结果-训练集.xlsx", "字段金标准表名"),
-        ("docs/CLOUD_DESKTOP_RUNBOOK.md", "annotation/SeriesType.xlsx", "数据信息路径"),
-        ("docs/DATASET_ROOT_TROUBLESHOOT.md", "★ 数据信息：", "数据信息路径"),
+        ("README.md", "★ 数据路径（影像）", "数据路径显式标注"),
+        ("README.md", "★ 数据信息路径", "数据信息路径显式标注"),
+        ("README.md", "脑胶质瘤标注结果-训练集.xlsx", "字段金标准表名"),
     ]
     for _rel, _needle, _what in _doc_expect:
         _p = _TRACK4 / _rel
         _txt = _p.read_text(encoding="utf-8") if _p.is_file() else ""
         check(f"{_rel} 标出{_what}（含 {_needle!r}）", _needle in _txt)
-    _mg = (_TRACK4 / "docs/MASTER_GUIDE.md").read_text(encoding="utf-8")
+    _mg = (_TRACK4 / "README.md").read_text(encoding="utf-8")
     check("文档明确那 5 张表与赛道四数据集无关（别再去配它们的路径）",
           "与赛道四数据集没有关系" in _mg)
 

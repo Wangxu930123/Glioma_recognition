@@ -55,10 +55,10 @@ def _no_usable_series_message(study) -> str:
     worker 里（看不出是路径问题）。因此把两类信息都拼进报错：
 
     - 每条序列的 ``uid`` / ``描述``，并标注描述的性质：
-      ``未解析（描述退化成目录名/UID）`` = 类型表与 sidecar 都没给值；
+      ``未解析（描述退化成目录名/UID）`` = 数据信息表与 sidecar 都没给值；
       ``描述里没有模态关键词`` = 拿到了值（表/sidecar）但不是目标模态（如取值
       ``其他``）——后者说明该病例确实没有目标序列，不是路径问题；
-    - 官方 ``labels/3_serieslabel.xlsx`` 到底找没找到
+    - 数据信息表 ``SeriesType.xlsx`` 到底找没找到
       （:func:`shared.official_labels.describe_modality_sources`）。
     """
     from shared.official_labels import describe_modality_sources
@@ -79,8 +79,9 @@ def _no_usable_series_message(study) -> str:
         f"study {study.accession_number!r} 无任何可用序列"
         f"（共 {len(study.series)} 条序列；uid/描述前几条={seen}）。"
         f"模态来源自检：{describe_modality_sources(getattr(study, 'data_root', None))}。"
-        f"按顺序试：① 定位并接上官方表 —— find $WORKSPACE -name 3_serieslabel.xlsx，"
-        f"再 export GLIOMA_LABELS_DIR=<它所在目录>（或软链到 <工程>/labels），重跑训练；"
+        f"按顺序试：① 定位并接上数据信息表 —— find $WORKSPACE -name SeriesType.xlsx"
+        f"（它与病例目录同层），再 export GLIOMA_LABELS_DIR=<它所在目录>"
+        f"（或软链到 <工程>/labels），重跑训练；"
         f"② 若自检显示表已找到、描述也不是 UID，说明表里这几条序列的标注本身不是 "
         f"T1CE/T2/FLAIR（如 ''其他''）——属于该病例确实没有目标模态，不是路径问题；"
         f"③ 详见 glioma_track4/docs/DATASET_ROOT_TROUBLESHOOT.md"

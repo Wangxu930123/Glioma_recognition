@@ -3,8 +3,10 @@
 # 用法：
 #   bash scripts/03_train.sh 0                     # 单折（前台）
 #   bash scripts/03_train.sh all 4                 # 4 折并行（4 张卡）
-#   FOLD=2 GPUS="0 1" bash scripts/03_train.sh one
+#   bash scripts/03_train.sh full                  # **全量训练**（train=全部病例，
+#                                                  #   val=官方验证集 → checkpoints/g4_full/）
 #   PRETRAINED=/path/to.pth bash scripts/03_train.sh 0    # 加载预训练权重（合规性自行确认）
+#   CONFIG=train_large bash scripts/03_train.sh 0         # 换配置（默认 train）
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 PY="${PY:-}"
@@ -22,7 +24,13 @@ EXTRA=()
 [[ -n "$PRETRAINED" ]] && EXTRA+=(--pretrained "$PRETRAINED")
 
 MODE="${1:-0}"
-if [[ "$MODE" == "all" ]]; then
+if [[ "$MODE" == "full" ]]; then
+  # 全量训练：不做交叉验证，train = 清单全部病例，val = 官方验证集
+  #   （需要 data/manifest_val.json：export VAL_ROOT=... && bash scripts/01_probe.sh --val）
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "$PY" -m src.training.trainer --config "$CONFIG" --fold full --tag "${TAG_PREFIX}_full" \
+    "${EXTRA[@]+"${EXTRA[@]}"}" 2>&1 | tee "logs/train_full.log"
+elif [[ "$MODE" == "all" ]]; then
   NGPU="${2:-4}"
   for f in $(seq 0 $((NGPU - 1))); do
     CUDA_VISIBLE_DEVICES=$f PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \

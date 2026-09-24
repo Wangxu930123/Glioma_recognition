@@ -14,11 +14,19 @@
 再把各折结果汇总。每一例都恰好被"没见过它的那个折模型"预测过一次，
 既**无泄漏**，又用满全部样本，让稀疏正样本尽可能参与统计。
 
+## 官方验证集（external，最终口径）
+
+配好验证集数据根并跑过 ``bash scripts/01_probe.sh --val`` 之后，
+默认（``--split auto``）改为在**官方验证集**上评估：验证集与训练集无交集 →
+用**全折集成**（每个病例都过全部折模型），不做留一、也不需要 OOF。
+正样本（fake / 拼接 / 重复对）取自**验证集清单自己的** ``special``。
+
 用法::
 
-    python scripts/15_eval_special_dup.py                    # OOF（推荐，无泄漏）
-    python scripts/15_eval_special_dup.py --all              # 全量单次（含训练集，仅看趋势）
-    python scripts/15_eval_special_dup.py --ckpt a.pt,b.pt   # 指定权重（--all 时=集成）
+    python scripts/15_eval_special_dup.py                    # auto：有验证集→external，否则 OOF
+    python scripts/15_eval_special_dup.py --split oof        # 强制 OOF（旧口径）
+    python scripts/15_eval_special_dup.py --split all        # 全量单次（含训练集，仅看趋势）
+    python scripts/15_eval_special_dup.py --ckpt a.pt,b.pt   # 指定权重（external/oof 集成用）
     python scripts/15_eval_special_dup.py --limit 100
 """
 from __future__ import annotations
@@ -64,13 +72,19 @@ def _split_ckpts(raw: str, paths) -> list[str]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--fold", type=int, default=0, help="构造默认权重路径时使用的折号")
-    ap.add_argument("--ckpt", default=None, help="权重路径；逗号分隔即多折集成（--all 时生效）")
+    ap.add_argument("--ckpt", default=None,
+                    help="权重路径；逗号分隔即多折集成（external/oof 集成用；"
+                         "external 未指定时=自动取全部折权重）")
     ap.add_argument("--limit", type=int, default=0, help="0=全量")
     ap.add_argument("--fp-weight", type=float, default=0.5)
-    ap.add_argument("--oof", dest="oof", action="store_true", default=True,
-                    help="（默认）OOF 评估：逐折用本折模型评本折 val，汇总后无泄漏")
-    ap.add_argument("--all", dest="oof", action="store_false",
-                    help="全量单次评估（含训练集 → 数字虚高，仅用于快速看趋势）")
+    ap.add_argument("--split", choices=("auto", "oof", "all", "external"), default="auto",
+                    help="auto（默认）=有官方验证集清单就评它（全折集成，最终口径），"
+                         "否则 OOF；oof=逐折评本折 val（旧默认）；external=强制官方验证集；"
+                         "all=全量单次（含训练集，仅看趋势）")
+    ap.add_argument("--oof", dest="legacy_oof", action="store_true", default=False,
+                    help="（兼容旧参数）等价于 --split oof")
+    ap.add_argument("--all", dest="legacy_all", action="store_true", default=False,
+                    help="（兼容旧参数）等价于 --split all")
     a = ap.parse_args()
 
     from src.data.dataset import brain_center, global_view, load_case_cached, resolve_cache_dir
@@ -80,14 +94,41 @@ def main() -> int:
     from src.inference.sliding import _forward_batch, _tta_combos
     from src.inference.writer import case_fingerprint
     from src.evaluation import metrics as M
-    from src.utils.config import load_config, load_paths, resolve
+    from src.utils.config import (external_val_manifest, fold_ckpts, load_config,
+                                  load_paths, resolve)
+
+    split = a.split
+    if a.legacy_all:
+        split = "all"
+    elif a.legacy_oof and split == "auto":
+        split = "oof"
+    if split == "auto":
+        split = "external" if external_val_manifest()[0] is not None else "oof"
 
     paths = load_paths()
-    ckpts = _split_ckpts(
-        a.ckpt or os.path.join(paths["checkpoints_dir"], f"g4_fold{a.fold}", "best.pth"), paths)
+    if a.ckpt:
+        ckpts = _split_ckpts(a.ckpt, paths)
+    elif split == "external":
+        # 验证集与训练集无交集 → 全折集成即无泄漏（不做留一；留一反而少用一个模型）
+        ckpts = _split_ckpts(",".join(fold_ckpts(paths)), paths)
+        if not ckpts:
+            raise SystemExit("[eval-sd] --split external 需要折权重，但 checkpoints/ 下没有 "
+                             "g4_fold*/best.pth；请先训练或显式 --ckpt")
+    else:
+        ckpts = _split_ckpts(
+            os.path.join(paths["checkpoints_dir"], f"g4_fold{a.fold}", "best.pth"), paths)
 
-    with open(resolve(paths["manifest"]), encoding="utf-8") as f:
-        man = json.load(f)
+    # 清单：external 用**验证集清单**（目标一/二的金标准也在它自己的 special 里）；
+    # 其余口径用训练清单（OOF 划分同样来自训练清单的 folds）。
+    if split == "external":
+        man, _man_path = external_val_manifest()
+        if man is None:
+            raise SystemExit(
+                f"[eval-sd] --split external 但验证集清单不可用：{_man_path}\n"
+                f"  · 生成：export VAL_ROOT=<验证集目录> && bash scripts/01_probe.sh --val")
+    else:
+        with open(resolve(paths["manifest"]), encoding="utf-8") as f:
+            man = json.load(f)
     cases_all = [c for c in man["cases"] if c.get("images")]
     by_acc = {c["accession"]: c for c in cases_all}
     folds: dict = {}
@@ -104,7 +145,9 @@ def main() -> int:
     # ---------------- 组装评估范围 ----------------
     # 每个 scope = (标签, 权重列表, 该 scope 内的 AccessionNumber 集合)
     scopes: list[tuple[str, list[str], list[str]]] = []
-    if a.oof and folds:
+    if split == "external":
+        scopes = [("external", ckpts, [c["accession"] for c in cases_all])]
+    elif split == "oof" and folds:
         # 去重：同一病例若出现在多个折的 val（旧版 build_folds 的轮转绕回缺陷），
         # 只保留首次出现，避免同一例被多个折模型重复评估、污染统计。
         _seen: set[str] = set()
@@ -147,11 +190,19 @@ def main() -> int:
         if not scopes:
             print("[eval-sd] ⚠️ 无可用折权重，回退为全量模式（--all）")
             scopes = [("all", ckpts, [c["accession"] for c in cases_all])]
+            split = "all"                    # 让下面的 scope 文案/记录与实际一致
     else:
         scopes = [("all", ckpts, [c["accession"] for c in cases_all])]
 
-    if a.oof and folds:
+    _scope_mode = ("external" if split == "external"
+                   else ("oof" if (split == "oof" and folds) else "all"))
+    if _scope_mode == "oof":
         _scope_txt = f"OOF（逐折评本折 val，{len(scopes)} 折汇总，无泄漏）"
+    elif _scope_mode == "external":
+        _scope_txt = f"官方验证集（全折集成 {len(ckpts)} 个权重，无泄漏；最终口径）"
+        if len(ckpts) == 1:
+            print("[eval-sd] ⚠️ external 口径下**多折集成**才是最终数字；"
+                  "单折结果只适合快速自检。", flush=True)
     else:
         _tag = f"，{len(ckpts)} 折集成" if len(ckpts) > 1 else ""
         _scope_txt = f"全量（含训练集⚠，数字会虚高{_tag}）"
@@ -214,7 +265,8 @@ def main() -> int:
 
     # 供 scripts/24_verify_eval_split.py 自检读取（不影响正常输出）
     globals()["_LAST_PROBS"] = {"fake": dict(p_fake), "stitch": dict(p_stitch),
-                                "n_embeds": len(embeds), "scope": "oof" if (a.oof and folds) else "all"}
+                                "n_embeds": len(embeds), "scope": _scope_mode,
+                                "n_ckpt": len(ckpts)}
 
     # ---------------- 指标 ----------------
     accs_done = sorted(embeds)
@@ -225,7 +277,7 @@ def main() -> int:
           f"gold 对 {sum(1 for x, y in gold if x in embeds and y in embeds)}")
 
     rep: dict = {"n": len(accs_done), "n_fake_pos": n_fake, "n_comp_pos": n_comp,
-                 "scope": "oof" if (a.oof and folds) else "all"}
+                 "scope": _scope_mode, "n_ckpt": len(ckpts)}
 
     if not accs_done:
         print("[eval-sd] ✗ 没有任何病例完成推理")
@@ -247,8 +299,9 @@ def main() -> int:
 
     gold_in = {g for g in gold if g[0] in embeds and g[1] in embeds}
     if len(gold_in) < 3:
-        print(f"[eval-sd] ⚠️ 评估集内重复金标准仅 {len(gold_in)} 对，指标不稳定"
-              f"（建议用 OOF 模式以纳入全部 {len(gold)} 对）")
+        _hint = ("（验证集清单里就这么多对；本轮口径即最终口径）"
+                 if _scope_mode == "external" else f"（建议用 OOF 模式以纳入全部 {len(gold)} 对）")
+        print(f"[eval-sd] ⚠️ 评估集内重复金标准仅 {len(gold_in)} 对，指标不稳定" + _hint)
     if gold_in:
         pos, neg = gold_similarities(embeds, [list(g) for g in gold_in])
         calib = calibrate(pos, neg)

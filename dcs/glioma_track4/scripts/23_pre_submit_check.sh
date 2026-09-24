@@ -164,10 +164,10 @@ if [[ -n "$soft" ]]; then
 fi
 
 # --------------------------------------------------------------------------- #
-_sec "⑨ 评估划分逻辑自检（OOF / 留一折）"
+_sec "⑨ 评估划分逻辑自检（external / OOF / 留一折）"
 if out=$("$PY" scripts/24_verify_eval_split.py 2>&1); then
   if grep -q "全部 PASS" <<< "$out"; then
-    _ok "评估划分逻辑自检通过（含 OOF 语义端到端验证）"
+    _ok "评估划分逻辑自检通过（含 external 全折集成与 OOF 语义端到端验证）"
   else
     _bad "评估划分自检未全通过"
   fi

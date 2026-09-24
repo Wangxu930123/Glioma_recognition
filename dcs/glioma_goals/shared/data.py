@@ -86,6 +86,87 @@ _ROLE_PERI_KW = ("peri", "perimeter", "水肿", "异常", "whole", "总")
 
 #: 已就"缺 openpyxl"告警过（避免每条病例刷一次屏）
 _WARNED_NO_OPENPYXL = False
+#: 已就"列名与取值都认不出类型表"告警过（每个进程一次）
+_WARNED_SERIES_TYPE_DEP = False
+
+#: 类型表的列名候选（顺序即优先级；用**包含**匹配，故短词靠后）。
+_SERIES_TYPE_ALIASES: dict[str, tuple[str, ...]] = {
+    "acc": ("accessionnumber", "accession", "检查号", "检查编号", "病例号"),
+    "uid": ("seriesinstanceuid", "seriesuid", "序列号", "序列uid"),
+    "typ": ("seriestype", "type", "序列类型", "模态", "序列描述"),
+}
+
+#: 表头行扫描行数。**不要假设表头在第几行**：实测数据里第 1~3 行都可能是
+#: "索引信息"（标题 / 字段说明 / 空行），写死 ``rows[0]`` 会在换一版排版时
+#: 整表读成 0 条 —— 表现是"文件明明找到了，序列类型却全是空"。
+_HEADER_SCAN_ROWS = 20
+
+#: 模态取值的长度上限：``T1CE（增强）`` 也就 8 个字符，检查号 / UID 这类长串必不是模态。
+_MODALITY_VALUE_MAXLEN = 16
+
+#: "像模态取值"的额外词：它们本身不是模态（``其他`` 是**权威排除**，
+#: 表示该病例确实没有目标序列），但出现在类型列里说明"这一列就是类型列"。
+_OTHER_VALUE_TOKENS = frozenset({
+    "其他", "其它", "无", "没有", "other", "none", "na", "n/a", "正常", "平扫",
+})
+
+
+def _looks_like_modality_value(value) -> bool:
+    """该单元格"看着像模态取值"吗（专供列名认不出时的取值嗅探）。
+
+    判据与模态匹配**同源**（:func:`shared.selector.guess_modality`）：
+    嗅探认定"这列是类型列"的取值，后面也得能被模态匹配认出来。
+    两套口径不一致的话，会出现"列挑对了、模态仍全空"这种最难查的情形。
+    """
+    text = re.sub(r"[\s\-_/]+", "", str(value if value is not None else "")).casefold()
+    if not text or len(text) > _MODALITY_VALUE_MAXLEN:
+        return False
+    return guess_modality(text) is not None or text in _OTHER_VALUE_TOKENS
+
+
+def _sniff_series_type_columns(rows: list, max_scan: int = 300
+                               ) -> tuple[int, int, int] | None:
+    """**不看列名**，按取值找出 ``(检查号列, 序列号列, 类型列)``；认不出返回 ``None``。
+
+    为什么需要它：列名是唯一会被"改版"的东西 —— 前两列写成 ``编号/影像号``、
+    加了索引列、或干脆是 ``A/B/C``，按列名匹配就一条也读不到，而**取值**不会变
+    （检查号、DICOM UID、5 类模态取值）。
+
+    判据（全在取值上）：
+
+    * **类型列**：该列非空取值里"像模态取值"的比例最高且 ≥ 0.5；
+    * **序列号列**：剩下两列里取值含 ``.``（DICOM UID）比例更高 / 平均更长的那个；
+    * **检查号列**：另一个。
+
+    找不到（整表只有两列、类型列是自由文本…）返回 ``None``，绝不硬凑 ——
+    凑错会把整表挂到错误的键上，比读不到更难查。
+    """
+    body = [r for r in rows[:max_scan] if any(str(c).strip() for c in r if c is not None)]
+    if len(body) < 3:
+        return None
+    width = max(len(r) for r in body)
+    if width < 3:
+        return None
+    cols = [[str(r[c]).strip() for r in body if c < len(r) and str(r[c]).strip()]
+            for c in range(width)]
+    ratio = [(sum(1 for v in vals if _looks_like_modality_value(v)) / len(vals)
+              if vals else 0.0) for vals in cols]
+    typ_col = max(range(width), key=lambda c: (ratio[c], len(cols[c])))
+    if ratio[typ_col] < 0.5:
+        return None
+    rest = [c for c in range(width) if c != typ_col and cols[c]]
+    if len(rest) < 2:
+        return None
+
+    def dotted(c: int) -> float:
+        return sum(1 for v in cols[c] if "." in v) / len(cols[c])
+
+    def mean_len(c: int) -> float:
+        return sum(len(v) for v in cols[c]) / len(cols[c])
+
+    rest.sort(key=lambda c: (dotted(c), mean_len(c)), reverse=True)
+    uid_col, acc_col = rest[0], rest[1]
+    return acc_col, uid_col, typ_col
 
 
 def _norm_key(value) -> str:
@@ -94,53 +175,61 @@ def _norm_key(value) -> str:
 
 
 def read_series_types(root: Path) -> dict[tuple[str, str], str]:
-    """读序列类型表（``3_serieslabel.xlsx`` / ``SeriesType.xlsx`` 两个命名）：
-    ``(检查号, 序列号) → 序列类型``。
+    """读数据信息表 ``SeriesType.xlsx`` → ``(检查号, 序列号) → 序列类型``。
 
     ⚠️ **数据里这是模态的唯一来源**。序列目录名是 DICOM UID
     （``2.25.135...``），任何"按名字猜模态"的关键词都命中不了，
     于是出现"扫出几千例、却一例都没有可用序列"——但病例计数看起来完全正常，
     很容易被误判成数据损坏或路径写错。
 
-    **两个命名、两个来源，数据集那份优先**（列都是 检查号 + 序列号 + 类型）：
+    表就在**数据集里**、与病例目录**同层**：训练集 ``<阶段>/annotation/``、
+    验证集 ``<阶段>/original/``（实测 ``verification/original/`` 里影像、
+    ``SeriesType.xlsx``、标注表是放在一起的，所以数据根填 ``…/verification``
+    也要能找到）。表头实测 ``AccessionNumber`` / ``SeriesUid`` / ``SeriesType``；
+    取值 **5 类**：``T1`` / ``T1CE（增强）`` / ``T2-Flair`` / ``T2WI`` / ``其他``。
+    训练集、验证集都有，**评测集随测试数据一起下发**。
 
-    * ``SeriesType.xlsx`` —— **赛道四数据集的内容**：``<阶段>/annotation/`` 下、
-      与病例目录同层（表头实测就是 ``AccessionNumber`` / ``SeriesUid`` /
-      ``SeriesType``；取值 **5 类**：``T1`` / ``T1CE（增强）`` / ``T2-Flair`` /
-      ``T2WI`` / ``其他``）。训练集、验证集都有，**评测集随测试数据一起下发**；
-    * ``3_serieslabel.xlsx`` —— 团队工作区 ``labels/``（**不是数据集的内容**，
-      属另一个目标的产物；仅作兜底、不覆盖数据集取值）。
+    读取上**不假设排版**：表头行由"能否凑齐三列名"在**前 20 行里扫**出来
+    （第 1~3 行都可能是索引信息，写死 ``rows[0]`` 会在换一版排版时整表读成 0 条）；
+    列名一条都不命中时还会按**取值**嗅探三列（见 :func:`_sniff_series_type_columns`）。
 
     定位见 :func:`shared.official_labels.label_search_dirs`：显式/环境变量 →
     ``<工程>/labels`` → **``$WORKSPACE`` 下 3 层** → 数据根/父/祖父 →
     这些目录下像标注容器的一级子目录（``annotation`` / ``标注结果`` …）。
-    只认其中一个名字、或只认数据根那一层，都会在另一半环境里翻车。
+    只认数据根那一层会翻车（数据根常指到 ``training/`` 或某个病例目录）。
     表里检查号列与磁盘目录名对不上**不再是问题**：查表走两级口径
     （精确键 → SeriesUid 单键回退，见 :func:`shared.official_labels.lookup_series_type`）。
 
     与提交工程 ``data/metadata.py: read_series_types`` 保持同一语义：
     表头别名容错、缺文件返回空表（不是错误）、同一键冲突取值**直接失败**。
 
-    找不到 openpyxl 时给出**一次性显式告警**：静默返回空表会让人去改
-    真正没错的地方（数据布局），而问题其实只是缺个依赖。
-    """
-    global _WARNED_NO_OPENPYXL
+    ⚠️ **工作区那份 ``3_serieslabel.xlsx`` 不再参与**（这里曾把它当"只补缺、
+    不覆盖"的兜底）。两个原因：①它取值粗（``SeriesLabel`` 只有 ``T1CE``/``T2``/
+    ``FLAIR``），混进来会把数据集的 ``T2WI``/``T2-Flair`` **静默压成 ``T2``** ——
+    表现是"模态看着都认出来了、通道里却是错的对比度"，比报错难查得多；
+    ②它属于**另一个目标**的产物，用它会让"表在哪"这件事有两套答案。
+    读不到就是读不到：返回空表 → 上层响亮地报 `series_type_rows = 0`
+    （带 :func:`describe_modality_sources` 自检），而不是悄悄换个来源顶上。
 
-    from shared.official_labels import (find_named_table, find_official_labels,
-                                        read_series_labels)
+    找不到 openpyxl 时给出**一次性显式告警**：静默返回空表会让人去改
+    真正没错的地方（数据布局），而问题其实只是缺个依赖。同理，文件找到了、
+    却既没认出列名也没嗅探出取值时，也会**显式告警**而不是静默返回空表。
+    """
+    global _WARNED_NO_OPENPYXL, _WARNED_SERIES_TYPE_DEP
+
+    from shared.official_labels import find_named_table
 
     out: dict[tuple[str, str], str] = {}
 
-    # ---- ① `SeriesType.xlsx`（**赛道四数据集里的就是这张**，权威取值）----
     # 位置与影像同层：`<阶段>/annotation/SeriesType.xlsx`（训练/验证集已下发，
     # 评测集在正式测试时随测试数据一起下发）。早期这里写的是
     # `Path(root) / "SeriesType.xlsx"`：只认数据根那一层，于是数据根指成
     # annotation/ 的上一层（或表被放进容器子目录）时，表就在磁盘上却读不到 ——
-    # 现在与官方表走同一批候选目录（数据根/父/祖父 + 像标注容器的子目录）。
+    # 现在与其它表走同一批候选目录（数据根/父/祖父 + 像标注容器的子目录）。
     hit = find_named_table("SeriesType.xlsx", root)
     path = Path(hit) if hit else None
     if path is None:
-        return _read_legacy_series_types(out, root)
+        return out
     try:
         from openpyxl import load_workbook
     except ImportError:                                           # pragma: no cover
@@ -149,13 +238,9 @@ def read_series_types(root: Path) -> dict[tuple[str, str], str]:
             print(f"[data][告警] 发现 {path} 但未安装 openpyxl，序列类型读不到 → "
                   f"UID 命名的序列会全部认不出模态。请先 pip install openpyxl",
                   flush=True)
-        return _read_legacy_series_types(out, root)
+        return out
 
-    aliases = {
-        "acc": ("accessionnumber", "accession", "检查号", "检查编号", "病例号"),
-        "uid": ("seriesinstanceuid", "seriesuid", "序列号", "序列uid"),
-        "typ": ("seriestype", "type", "序列类型", "模态", "序列描述"),
-    }
+    aliases = _SERIES_TYPE_ALIASES
     workbook = load_workbook(path, read_only=True, data_only=True)
     seen_here: dict[tuple[str, str], str] = {}                     # 仅用于本文件内冲突检测
     try:
@@ -163,22 +248,46 @@ def read_series_types(root: Path) -> dict[tuple[str, str], str]:
             rows = list(sheet.iter_rows(values_only=True))
             if not rows:
                 continue
-            header = [_norm_key(c) for c in rows[0]]
+            # ① 按**列名**扫表头行：哪一行能凑齐三列就用哪一行，不假设第几行。
+            #    数据里第 1~3 行都可能是索引信息，写死 rows[0] 会整表读成 0 条。
             idx: dict[str, int] = {}
-            for want, keys in aliases.items():
-                for i, h in enumerate(header):
-                    if any(k in h for k in keys):
-                        idx[want] = i
-                        break
-            if set(idx) != {"acc", "uid", "typ"}:
-                continue                                          # 该 sheet 不是映射表
-            for row in rows[1:]:
+            data_start = 0
+            for i, row in enumerate(rows[:_HEADER_SCAN_ROWS]):
+                if not any(str(c).strip() for c in row if c is not None):
+                    continue
+                header = [_norm_key(c) for c in row]
+                found: dict[str, int] = {}
+                for want, keys in aliases.items():
+                    for j, h in enumerate(header):
+                        if any(k in h for k in keys):
+                            found[want] = j
+                            break
+                if set(found) == {"acc", "uid", "typ"}:
+                    idx, data_start = found, i + 1
+                    break
+            sniffed = False
+            if not idx:
+                # ② 列名一条都没命中（改版 / 加了索引列 / 只有英文缩写）
+                #    → 按**取值**嗅探三列（检查号、DICOM UID、模态取值本身就有形态）。
+                sniff = _sniff_series_type_columns(rows)
+                if sniff is None:
+                    continue                                      # 该 sheet 不是映射表
+                acc_col, uid_col, typ_col = sniff
+                idx = {"acc": acc_col, "uid": uid_col, "typ": typ_col}
+                data_start, sniffed = 0, True
+                print(f"[data][告警] {path.name} 的工作表 {sheet.title!r} 列名未识别 → "
+                      f"已按取值定位：检查号=第 {acc_col + 1} 列、序列号=第 {uid_col + 1} 列、"
+                      f"类型=第 {typ_col + 1} 列（读到 {len(rows)} 行）。"
+                      f"若取值明显不对，把表的前几行贴出来。", flush=True)
+            for row in rows[data_start:]:
                 try:
                     acc, uid, typ = row[idx["acc"]], row[idx["uid"]], row[idx["typ"]]
                 except IndexError:
                     continue
-                if acc is None or uid is None or typ is None:
+                if acc in (None, "") or uid in (None, "") or typ in (None, ""):
                     continue
+                if sniffed and not _looks_like_modality_value(typ):
+                    continue                                      # 嗅探模式下靠取值滤掉表头/说明行
                 key = (_norm_key(acc), _norm_key(uid))
                 value = str(typ).strip()
                 if not value:
@@ -192,34 +301,16 @@ def read_series_types(root: Path) -> dict[tuple[str, str], str]:
     finally:
         workbook.close()
     if seen_here:
-        print(f"[data] 已读序列类型表 {path.name}：{len(seen_here)} 条（{path}）", flush=True)
-    return _read_legacy_series_types(out, root)
-
-
-def _read_legacy_series_types(out: dict[tuple[str, str], str],
-                              root: Path) -> dict[tuple[str, str], str]:
-    """补读工作区那份 ``3_serieslabel.xlsx``：**只补缺，不覆盖** ``out``。
-
-    它**不是赛道四数据集的内容**（属工作区里另一个目标的产物），列结构恰好同构
-    （``SeriesLabel ∈ {T1CE,T2,FLAIR}``），所以留作兜底；数据集里的
-    ``SeriesType.xlsx`` 一旦给出同一个 ``(检查号, 序列号)``，就以数据集为准。
-    顺序反了会**静默覆盖**权威取值（工作区那份取值更粗，如只写 ``T2``，
-    而数据集分 ``T2WI``/``T2-Flair``），表现是"模态看着都认出来了、通道里却是错的对比度"。
-    """
-    from shared.official_labels import find_official_labels, read_series_labels
-
-    series_file = find_official_labels(root).get("series")
-    if not series_file:
-        return out
-    added = 0
-    for (acc, uid), value in read_series_labels(series_file).items():
-        key = (_norm_key(acc), _norm_key(uid))
-        if key not in out:
-            out[key] = value
-            added += 1
-    if added:
-        print(f"[data] 已读兼容类型表 {Path(series_file).name}：{added} 条"
-              f"（{series_file}；数据集里的 SeriesType.xlsx 优先）", flush=True)
+        print(f"[data] 已读数据信息表 {path.name}：{len(seen_here)} 条（{path}）", flush=True)
+    elif not _WARNED_SERIES_TYPE_DEP:
+        # 文件在、openpyxl 也在，却一条都没读到：只可能是"排版对不上"。
+        # 静默返回空表会让人去怀疑数据损坏/路径写错，所以这里明确指向排版，
+        # 并说明该看什么（表的前几行），而不是丢一句"序列类型读不到"。
+        _WARNED_SERIES_TYPE_DEP = True
+        print(f"[data][告警] {path} 里既没找到 AccessionNumber / SeriesUid / SeriesType "
+              f"三列（已扫前 {_HEADER_SCAN_ROWS} 行）、也没能按取值嗅探出它们 → "
+              f"序列类型读不到，UID 命名的序列会全部认不出模态。"
+              f"请把该表前几行原样贴出来。", flush=True)
     return out
 
 
@@ -301,10 +392,15 @@ def _mask_role(filename: str, desc: str) -> str | None:
 SPECIAL_SOURCE_DIRS = ("fake", "compositing", "composition", "duplicate")
 
 #: 允许自动下钻的中间层：``annotation``（影像/标注表所在层）+ 平台阶段名。
-_DESCEND_DIRS = frozenset({"annotation"}) | _PLATFORM_PHASES
+#:
+#: ``original`` 是**验证集**的实测布局：``verification/original/<检查号>/<序列>/``，
+#: 影像、``SeriesType.xlsx`` 与标注表都在 ``verification/original/``。漏了它，
+#: 数据根填 ``…/verification`` 时 ``original`` 会被当成检查号 —— 表现是
+#: "病例数正常、却报无任何可用序列"，且表也找不到。
+_DESCEND_DIRS = frozenset({"annotation", "original"}) | _PLATFORM_PHASES
 #: 顶层非病例目录：本层出现其中任何一个，说明"还没到病例层"
-_NON_CASE_DIRS = (frozenset({"annotation", "cache", "runs", "folds", "labels",
-                             "logs", "checkpoints", "weights"})
+_NON_CASE_DIRS = (frozenset({"annotation", "original", "cache", "runs", "folds",
+                             "labels", "logs", "checkpoints", "weights"})
                   | frozenset(SPECIAL_SOURCE_DIRS))
 
 
@@ -336,12 +432,15 @@ def resolve_case_root(root):
 
 
 def _official_context(root: Path) -> dict:
-    """一次性读取官方 5 张标注表（缺失的键为默认空值）。
+    """一次性读取官方标注表（``1_/2_/4_/5_`` 四张；缺失的键为默认空值）。
 
-    这是研发侧**唯一权威**的标签来源：模态、掩膜、结构化字段、异常标记
+    这是研发侧**唯一权威**的标签来源：掩膜、结构化字段、异常标记
     全都来自它，而不是 ``label.json``、目录名关键词或中文列名——
     官方数据里那些都不存在，于是 special 标签恒为 0、字段全空，
     训练照常跑完却什么都没学到（最难发现的一类失效）。
+
+    模态**不在这里**：它来自数据集自带的 ``SeriesType.xlsx``
+    （见 :func:`read_series_types`）。
     """
     from shared.official_labels import (find_official_labels, read_abnormal_labels,
                                         read_characteristics, read_duplicate_pairs,
@@ -375,7 +474,7 @@ def discover_cases(dataset_root: Path, limit: int | None = None) -> list[dict]:
 
     返回的每个 case 除 ``accession``/``dir``/``series`` 外，还可能带：
 
-    - ``series[].desc``：序列类型描述（官方 `3_serieslabel.xlsx` → sidecar → 目录名）
+    - ``series[].desc``：序列类型描述（数据信息 `SeriesType.xlsx` → sidecar → 目录名）
     - ``masks``：按角色分组的掩膜（官方 `4_masklabel.xlsx` 的 Maskname 或名称启发）
     - ``labels``：结构化字段（官方 `5_characteristics.xlsx`，已是规范字段名）
     - ``special``：``{fake, stitched, duplicate}``（官方 `1_abnormal.xlsx`）
@@ -486,12 +585,12 @@ def discover_cases(dataset_root: Path, limit: int | None = None) -> list[dict]:
         from shared.official_labels import describe_modality_sources
 
         print("[data] ⚠️ 没有任何序列能识别出模态（前 50 例逐条试过：目录名/文件名不含关键词，"
-              "类型表也没给出 T1CE/T2/FLAIR 这类取值）。\n"
+              "数据信息表也没给出 T1CE/T2-Flair 这类取值）。\n"
               f"       自检：{describe_modality_sources(root)}\n"
               "       继续训练会在取数时报「无任何可用序列」。\n"
-              "       处理：先 find $WORKSPACE -name 3_serieslabel.xlsx 定位；表若本来就在，"
-              "说明清单/标注有问题（把自检行与报错原文一起贴出来）；确实缺表就 "
-              "export GLIOMA_LABELS_DIR=<它所在目录>（或软链到 <工程>/labels）",
+              "       处理：先 find $WORKSPACE -name SeriesType.xlsx 定位（表与病例目录同层）；"
+              "表若本来就在，说明清单/标注有问题（把自检行与报错原文一起贴出来）；"
+              "确实在非常规位置就 export GLIOMA_LABELS_DIR=<它所在目录>（或软链到 <工程>/labels）",
               flush=True)
     return cases
 

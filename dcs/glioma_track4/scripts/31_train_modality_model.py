@@ -1,14 +1,15 @@
 #!/usr/bin/env python
-"""训练模态判别模型（评测期没有 ``3_serieslabel.xlsx`` 时的兜底）。
+"""训练模态判别模型（评测期没读到 ``SeriesType.xlsx`` 时的兜底）。
 
-**为什么需要**：官方训练集给了序列标注，评测集**不给**；而评测集的序列目录名是
+**为什么需要**：训练/验证集的数据里带序列标注（``annotation/SeriesType.xlsx``），
+``evaluation_*`` 评测集在正式测试前**拿不到**；而评测集的序列目录名是
 DICOM UID，靠关键词一个模态也挑不出来 —— 官方为此在推理主链里放了一个
 ``sequence`` 任务（3 分类）。本脚本用体素统计特征 + 逻辑回归训练一个轻量替代：
 CPU 秒级训练、单例秒级预测、模型只有几百个参数。
 
 用法::
 
-    # 用官方训练集（标签来自 labels/3_serieslabel.xlsx）
+    # 用官方训练集（标签来自数据自带的 annotation/SeriesType.xlsx）
     python scripts/31_train_modality_model.py --root $DATASET_ROOT
 
     # 用本地模拟集（标签来自目录名 flair_0000 / t1c_0000 …）
@@ -40,7 +41,7 @@ from src.data.modality_model import (DEFAULT_MODEL_PATH, FEATURE_NAMES,   # noqa
                                      OFFICIAL_CLASSES, ModalityModel,
                                      features_from_file)
 
-#: 我们内部的模态键 → 官方 ``3_serieslabel.xlsx`` 的取值
+#: 我们内部的模态键 → 主链 ``sequence`` 任务的三分类取值（实测值域 T1CE / T2 / FLAIR）
 MOD_TO_OFFICIAL = {"t1c": "T1CE", "t1ce": "T1CE", "t2": "T2", "flair": "FLAIR"}
 
 #: 官方只有这三个模态（``schema.MODALITIES``）；T1 不在其中，训练时跳过
@@ -63,8 +64,8 @@ def _features(args: tuple[str, int]) -> tuple[np.ndarray, str] | None:
 def collect(root: str, classes: tuple[str, ...], max_per_class: int) -> list[tuple[str, str]]:
     """收集 ``(nifti 路径, 官方模态)``。
 
-    标签来源与训练/探针完全一致：官方 ``3_serieslabel.xlsx`` 优先，其次是
-    目录名（本地模拟集）。**两条路径都走 ``scan_real``**，避免这里另起一套
+    标签来源与训练/探针完全一致：数据自带的 ``annotation/SeriesType.xlsx`` 优先，
+    其次是目录名（本地模拟集）。**两条路径都走 ``scan_real``**，避免这里另起一套
     解析规则而与训练数据不一致。
     """
     from src.data.probe import scan_real
@@ -115,7 +116,7 @@ def main() -> int:
     dist = Counter(lab for _, lab in samples)
     print(f"收集到 {len(samples)} 条已标注序列：{dict(dist)}")
     if len(samples) < 30 or len(dist) < 2:
-        print("⚠️ 样本不足：确认数据根正确、且 labels/3_serieslabel.xlsx 存在"
+        print("⚠️ 样本不足：确认数据根正确、且 annotation/SeriesType.xlsx 在数据里"
               "（或本地模拟集的目录名带模态）"); return 1
 
     print(f"提取特征（stride={a.stride}, jobs={a.jobs}）……")

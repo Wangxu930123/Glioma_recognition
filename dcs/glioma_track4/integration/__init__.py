@@ -8,7 +8,7 @@
     export COMPETITION_PIPELINE_FACTORY=tasks.glioma.pipeline:build_pipeline
 
 契约细节见 ``integration/common.py`` 顶部注释与 ``integration/tasks.py``；
-整体运行方式见 ``docs/MASTER_GUIDE.md``。
+整体运行方式见 ``README.md`` 第 3 节「全流程」与第 8 节「服务」。
 """
 
 from .factory import build_pipeline

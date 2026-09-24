@@ -7,7 +7,9 @@
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 from typing import Any
 
 import yaml
@@ -48,6 +50,20 @@ def dataset_root() -> str:
         return os.environ["DATASET_ROOT"]
     try:
         return str((load_config("paths.yaml").get("raw") or {}).get("track4", ""))
+    except Exception:                                             # noqa: BLE001
+        return ""
+
+
+def val_root() -> str:
+    """官方验证集数据根（``VAL_ROOT`` 优先，其次 paths.yaml 的 ``raw.val``）；未配置返回 ""。
+
+    与 :func:`dataset_root` 对称：路径解析统一走这里，避免各处直接读 env/yaml
+    造成"有人在 env 里覆盖了、有人没读到"这种半路切换数据源的隐蔽问题。
+    """
+    if os.environ.get("VAL_ROOT"):
+        return os.environ["VAL_ROOT"]
+    try:
+        return str((load_config("paths.yaml").get("raw") or {}).get("val") or "")
     except Exception:                                             # noqa: BLE001
         return ""
 
@@ -103,6 +119,72 @@ def assert_data_source(man: dict, phase: str = "train", strict: bool = True) -> 
     return cur_tag
 
 
+def external_val_manifest(verify: bool = True) -> tuple[dict | None, str]:
+    """官方验证集清单（**可选链路**）：不可用时返回 ``(None, 清单路径)``。
+
+    这是"最终指标以官方验证集为准"的唯一入口：训练侧不看它；
+    评估侧（04/14/15/16）在它可用时切到 external 分支，
+    否则原样回退折内 val（OOF / 留一折集成）。
+
+    判定"可用"的条件刻意保守：文件在、能解析、有病例（三条缺一即回退）。
+    数据源标识不一致只**告警**不拒绝 —— 用本地复现的验证集跑通流程是允许的，
+    但日志里必须留下痕迹（合规要求可追溯）。
+    """
+    path = resolve(str(load_paths().get("manifest_val") or "data/manifest_val.json"))
+    if not os.path.isfile(path):
+        return None, path
+    try:
+        with open(path, encoding="utf-8") as f:
+            man = json.load(f)
+    except Exception as e:                                        # noqa: BLE001
+        print(f"[guard] ⚠️ 验证集清单解析失败（{path}）：{e} → 回退折内 val")
+        return None, path
+    if not (man.get("cases") or []):
+        print(f"[guard] ⚠️ 验证集清单没有病例（{path}）→ 回退折内 val")
+        return None, path
+    if verify:
+        assert_data_source(man, phase="val", strict=False)
+    return man, path
+
+
+def external_val_cases(require_label: bool = True) -> tuple[list[dict], str]:
+    """官方验证集病例（**全量训练**模式的验证集来源）。
+
+    与 :func:`external_val_manifest` 共用同一个可用性判定入口，额外**只保留带掩膜的**
+    病例。为什么不是 ``masks or labels``：全量模式的 val 只用来算 Dice 选 best
+    （``checkpoint_metric: val_dice_peri``），结构化标签在 val 里**不参与任何计算**；
+    而没有掩膜的病例会让 ``make_targets`` 产出**全零 target** —— Dice 要么恒 0，
+    要么在"预测也为空"时按 ``den == 0`` 记成 **1.0 的假满分**，把 best 直接选歪
+    （官方验证集实测没有字段金标准表，若它同时也没有掩膜，这种情况会全量命中）。
+    被剔掉几例由调用方打印，不静默。
+    """
+    man, path = external_val_manifest()
+    if not man:
+        return [], path
+    cases = list(man.get("cases") or [])
+    if require_label:
+        cases = [c for c in cases if c.get("masks")]
+    return cases, path
+
+
+def fold_ckpts(paths: dict | None = None) -> list[str]:
+    """已存在的折权重（``checkpoints/g4_fold*/best.pth``，按折号排序）。
+
+    用途：**官方验证集**评估的默认集成成员 —— 验证集与训练集无交集，
+    无需"留一折"排除任何一折（排除反而白少用一个模型）。
+    """
+    import glob
+    p = paths or load_paths()
+    pattern = os.path.join(resolve(p.get("checkpoints_dir", "checkpoints")),
+                           "g4_fold*", "best.pth")
+
+    def _num(fp: str) -> int:
+        m = re.search(r"g4_fold(\d+)", fp)
+        return int(m.group(1)) if m else 1 << 30
+
+    return sorted(glob.glob(pattern), key=_num)
+
+
 def load_paths() -> dict:
     """路径配置 + 环境变量覆盖 + 平台合规兜底。"""
     p = load_config("paths.yaml")
@@ -113,6 +195,9 @@ def load_paths() -> dict:
     # 数据根：DATASET_ROOT 优先（云桌面里换路径最省事）
     if os.environ.get("DATASET_ROOT"):
         p.setdefault("raw", {})["track4"] = os.environ["DATASET_ROOT"]
+    # 验证集数据根：VAL_ROOT 优先（同 DATASET_ROOT 的道理）
+    if os.environ.get("VAL_ROOT"):
+        p.setdefault("raw", {})["val"] = os.environ["VAL_ROOT"]
 
     # 训练日志：规范要求写在 {workspace}/logs；平台目录存在时强制切换
     if os.environ.get("LOGS_DIR"):
@@ -127,6 +212,7 @@ def load_paths() -> dict:
         p["answer_root"] = os.path.join(ws, "answer")
 
     for k, env in (("uif_root", "UIF_DIR"), ("manifest", "MANIFEST"),
+                   ("manifest_val", "VAL_MANIFEST"),
                    ("folds", "FOLDS"), ("checkpoints_dir", "CKPT_DIR"),
                    ("preprocessed_root", "PREPROCESSED_ROOT"),
                    ("preprocess_cache", "CACHE_DIR")):

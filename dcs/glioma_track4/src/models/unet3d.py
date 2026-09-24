@@ -137,7 +137,7 @@ def build_model(cls_spec: list[tuple[str, int]], in_ch: int = 4, base: int = 32,
                 dec_blocks: int = 1) -> nn.Module:
     """骨干工厂：``arch="mednext"``（默认，强）或 ``"resunet"``（备选，轻）。
 
-    容量档位（见 ``docs/CAPACITY_AND_NNUNET.md``）：
+    容量档位（见 ``README.md`` §6.2 训练配置）：
     - ``plain_stages``：最深的 N 级改用普通 3×3×3 卷积（**参数大增、FLOPs 几乎不变**）；
     - ``max_ch``：通道上限，配合 ``depth=5`` 得到 320 通道瓶颈；
     - ``expand``：倒瓶颈膨胀比；``dec_blocks``：解码器每级 block 数。

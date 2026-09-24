@@ -1,16 +1,21 @@
 """官方标注表读取（依据天坛医院参考实现 ``AIRecongition/``）。
 
 官方把标注放在**工程目录**的 ``labels/`` 下（``paths.labels_dir: ./labels``），
-是 5 个独立 xlsx：
+是 4 个独立 xlsx（外加**数据集自带**的数据信息表 ``SeriesType.xlsx``）：
 
 | 文件 | 关键列 | 用途 |
 |---|---|---|
 | ``1_abnormal.xlsx`` | AccessionNumber, SeriesUid, **Label** ∈ {true,fake,compositing,duplicate} | 目标一（真实性）/ 目标二-A（拼接）的正样本，**逐序列** |
 | ``2_duplicate.xlsx`` | src_img, desc_img | 目标二-B（重复影像）的正对 |
-| ``3_serieslabel.xlsx`` | AccessionNumber, SeriesUid, **SeriesLabel** ∈ {T1CE,T2,FLAIR} | **模态的唯一来源** |
-| ``SeriesType.xlsx`` | AccessionNumber, SeriesUid, **SeriesType** ∈ {T1, T1CE（增强）, T2-Flair, T2WI, 其他} | **赛道四数据集自带的数据信息**：与病例目录同层（``<阶段>/annotation/``），训练/验证集都有、评测集随测试数据下发；取值里的 ``其他`` 是权威排除（不是模态）。与 5 张表**无关**，只是列结构同构 |
+| ``SeriesType.xlsx`` | AccessionNumber, SeriesUid, **SeriesType** ∈ {T1, T1CE（增强）, T2-Flair, T2WI, 其他} | **赛道四数据集自带的数据信息**：与病例目录同层（``<阶段>/annotation/``），训练/验证集都有、评测集随测试数据下发；取值里的 ``其他`` 是权威排除（不是模态）。**模态的唯一来源** |
 | ``4_masklabel.xlsx`` | AccessionNumber, SeriesUid, **Maskname** | 掩膜文件名（任意名，关键词认不出） |
 | ``5_characteristics.xlsx`` | AccessionNumber + 14 个英文列 | 目标三/四的结构化字段金标准 |
+
+> ``3_serieslabel.xlsx``（团队工作区那份）**不在本模块读取范围内**：它不是赛道四
+> 数据集的内容，且取值更粗（只有 ``T1CE``/``T2``/``FLAIR``）—— 混用会把数据集的
+> ``T2WI``/``T2-Flair`` **静默压成 ``T2``**，表现是"模态看着都认出来了、通道里却是
+> 错的对比度"，比直接报错难查得多。它曾作为兜底出现在 ``read_series_labels`` 里，
+> 现已连函数一起删除；照旧按候选目录搜它的人只会读到"找不到"。
 
 在此之前，研发侧是从 ``label.json``、目录名关键词、中文列名去猜的 ——
 官方数据里这些都不存在，于是 special 标签恒为 0、字段全空，
@@ -25,10 +30,12 @@ from pathlib import Path
 from typing import Any
 
 #: 官方标注文件名 → 用途（键名与官方一致，便于对照）
+#:
+#: **不含** ``3_serieslabel.xlsx``：模态来自数据集自带的 ``SeriesType.xlsx``
+#: （见模块 docstring）。留"series"这个键会让调用方以为还有第二个来源可选。
 OFFICIAL_LABEL_FILES = {
     "abnormal": "1_abnormal.xlsx",
     "duplicate": "2_duplicate.xlsx",
-    "series": "3_serieslabel.xlsx",
     "mask": "4_masklabel.xlsx",
     "characteristics": "5_characteristics.xlsx",
 }
@@ -72,7 +79,7 @@ _SKIP_WORKSPACE_DIRS = frozenset({
 def workspace_labels_dirs(max_depth: int = 3) -> list[Path]:
     """``$WORKSPACE`` 下所有名为 ``labels`` 的目录（"官方表更全 + 更新"者在前）。
 
-    为什么需要它：官方 5 张表**不随数据集下发**，通常躺在团队持久化工作区里
+    为什么需要它：官方标注表**不随数据集下发**，通常躺在团队持久化工作区里
     （如 ``<workspace>/dcs/goal1and2/Goal1and2/labels``）。有了这一步，容器里
     **零配置**就能读到表，不必每个人都记得 ``export GLIOMA_LABELS_DIR``。
 
@@ -120,7 +127,7 @@ def workspace_labels_dirs(max_depth: int = 3) -> list[Path]:
 
 def find_official_labels(root: str | os.PathLike | None = None,
                          labels_dir: str | os.PathLike | None = None) -> dict[str, str]:
-    """定位官方 5 张标注表 → ``{用途: 路径}``（找不到的键不出现）。
+    """定位官方标注表（``1_/2_/4_/5_`` 四张）→ ``{用途: 路径}``（找不到的键不出现）。
 
     搜索顺序见 :func:`label_search_dirs`（逐个候选目录试，命中即止）。
     ``root=None`` 时只搜 1~4（用于报错时做"表到底在不在"的自检）。
@@ -139,9 +146,15 @@ def find_official_labels(root: str | os.PathLike | None = None,
 #: 逐个 stat 既慢，又会在备份/缓存目录里撞到同名旧表。而"标注放在哪个容器目录"
 #: 是个有限集合：平台那份在 ``training/annotation/``（英文）或下载后的
 #: ``标注结果/``（中文），下面这些名字把两种情况都覆盖了。
+#: "像标注容器"的子目录名。
+#:
+#: ``original`` 是**验证集**的中间层：``verification/original/`` 里既放影像也放
+#: ``SeriesType.xlsx`` / ``脑胶质瘤标注结果-验证集.xlsx``。漏了它，数据根填
+#: ``…/verification``（而不是 ``…/verification/original``）时表就一条都搜不到。
 _LABEL_SUBDIR_NAMES = frozenset({
     "labels", "label", "annotation", "annotations", "标注结果", "标注", "结果",
-    "gold", "groundtruth", "ground_truth", "gt", "meta", "metadata", "results",
+    "original", "gold", "groundtruth", "ground_truth", "gt", "meta", "metadata",
+    "results",
 })
 
 #: 往下钻几层。2 层是为了覆盖"数据根填高一层（``training/``）**且**
@@ -214,8 +227,8 @@ def find_named_table(filename: str, root: str | os.PathLike | None = None,
     """在候选目录里按**文件名**找一张表 → 路径（找不到返回 ``None``）。
 
     与 :func:`find_official_labels` 同一批候选目录，区别只在"名字由调用方给"：
-    序列类型表在**平台**上叫 ``SeriesType.xlsx``、在团队工作区里叫
-    ``3_serieslabel.xlsx``，同一张表两个命名 → 必须分别找。
+    数据信息表（``SeriesType.xlsx``）与字段金标准（``脑胶质瘤标注结果-*.xlsx``）
+    名字不同、位置也可能不同，用同一个搜索口径分别找。
     """
     for folder in label_search_dirs(root, labels_dir):
         candidate = folder / filename
@@ -227,7 +240,7 @@ def find_named_table(filename: str, root: str | os.PathLike | None = None,
 def build_uid_index(series_types: dict | None) -> dict[str, str]:
     """``{(检查号, 序列号): 类型}`` → ``{序列号: 类型}``（UID 单键回退索引）。
 
-    为什么需要它：``3_serieslabel.xlsx`` 的**检查号列**与磁盘上的病例目录名并非总能
+    为什么需要它：类型表的**检查号列**与磁盘上的病例目录名并非总能
     对上（平台匿名化口径不同、前导零、目录名是哈希而表里是原始检查号），而
     **SeriesUid 与影像同源**，是两边唯一必然一致的键。精确键查不到时按 UID 单键回退，
     能把整批"看起来没模态"的病例救回来。
@@ -268,19 +281,19 @@ def lookup_series_type(series_types: dict | None, accession: str = "",
 def describe_modality_sources(root: str | os.PathLike | None = None) -> str:
     """一句话自检"模态来源现在什么状态"（专供报错文案，省掉一轮来回排查）。
 
-    形如 ``类型表 SeriesType.xlsx=<路径>；类型表 3_serieslabel.xlsx=<路径或"未找到">``。
+    形如 ``数据信息表 SeriesType.xlsx=<路径或"未找到">``。
     报错带上它，用户立刻能分清是"表没接上"还是"表接到了但标注本身不含目标模态"。
     ``root`` 传**病例目录**也行：候选目录含数据根/父/祖父，正好覆盖到
     ``training/annotation/``。
+
+    只报这一张表：模态**只有一个来源**（工作区那份 ``3_serieslabel.xlsx`` 已不再被读，
+    列出来只会误导排查方向）。
     """
-    found = [(name, find_named_table(name, root))
-             for name in ("SeriesType.xlsx", "3_serieslabel.xlsx")]
-    table_desc = "；".join(f"类型表 {name}={path}" for name, path in found if path)
-    if not table_desc:
-        table_desc = ("类型表 SeriesType.xlsx / 3_serieslabel.xlsx=均未找到（已搜 "
-                      "$GLIOMA_LABELS_DIR、<工程>/labels、$WORKSPACE 下 3 层、数据根/父/祖父；"
-                      "平台数据里这张表与病例目录同层，叫 SeriesType.xlsx）")
-    return table_desc
+    path = find_named_table("SeriesType.xlsx", root)
+    if path:
+        return f"数据信息表 SeriesType.xlsx={path}"
+    return ("数据信息表 SeriesType.xlsx=未找到（已搜 $GLIOMA_LABELS_DIR、<工程>/labels、"
+            "$WORKSPACE 下 3 层、数据根/父/祖父；平台数据里这张表与病例目录同层）")
 
 
 # --------------------------------------------------------------------------- #
@@ -366,15 +379,8 @@ def _triples(path: str,
 
 
 # --------------------------------------------------------------------------- #
-# 五张表各自的读取接口
+# 各表读取接口
 # --------------------------------------------------------------------------- #
-def read_series_labels(path: str) -> dict[tuple[str, str], str]:
-    """``3_serieslabel.xlsx`` → ``{(检查号, 序列号): SeriesLabel}``（T1CE/T2/FLAIR）。"""
-    triples = _triples(path, value_kws=("serieslabel", "series_label",
-                                        "seriestype", "序列类型", "模态"))
-    return {k: v[0] for k, v in triples.items() if v}
-
-
 def read_mask_labels(path: str) -> dict[tuple[str, str], list[str]]:
     """``4_masklabel.xlsx`` → ``{(检查号, 序列号): [Maskname, ...]}``。"""
     return _triples(path, value_kws=("maskname", "mask_name", "mask", "掩膜"))

@@ -755,6 +755,7 @@ source /2026aicompetition/workspace/common/env.sh
 | 文档 | 内容 |
 |---|---|
 | `glioma_track4/docs/CLOUD_DESKTOP_RUNBOOK.md` | **本文件**：克隆/搬迁/训练/推理全流程 |
+| `glioma_track4/docs/TRACK4_RUNBOOK.md` | 算法工程**照抄手册**：变量表 + 每步命令与期望输出 + 验收判据 + 报错对照（探针→折划分→缓存→训练→收尾→导出→提交） |
 | `glioma_track4/docs/DATASET_ROOT_TROUBLESHOOT.md` | 数据根排查（含"只有 annotation""无任何可用序列"） |
 | `glioma_track4/docs/PLATFORM_GUIDE.md` | 平台使用指南（容器、存储、依赖） |
 | `glioma_track4/README.md` | 算法工程说明（§4.0 平台数据目录） |

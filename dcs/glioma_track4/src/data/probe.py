@@ -19,9 +19,9 @@ import json
 import os
 from collections import Counter
 
-from ..utils.config import data_source_tag, load_paths, resolve
-from .labels import (build_uid_index, find_named_table, find_official_labels,
-                     find_structured_tables,
+from ..utils.config import data_source_tag, load_paths, resolve, val_root
+from .labels import (SERIES_TYPE_TABLE, build_uid_index, find_named_table,
+                     find_official_labels, find_structured_tables,
                      guess_modality, has_strict_mask_hint, id_key, is_explicit_other,
                      lookup_series_type, mask_role_for, read_abnormal_table,
                      read_duplicate_pairs, read_mask_table, read_series_types,
@@ -165,19 +165,24 @@ def scan_special(root: str) -> dict:
 #: duplicate 的"病例"，而它们的"序列"是几百上千个真实病例目录。
 SPECIAL_SOURCE_DIRS = ("fake", "compositing", "composition", "duplicate")
 
-#: 允许自动下钻的中间层：``annotation``（影像/标注表所在层）+ 平台阶段名。
-#: 平台实际布局比"数据集根"多这一层，见 ``docs/CLOUD_DESKTOP_RUNBOOK.md`` §3.2。
-_DESCEND_DIRS = frozenset({"annotation"}) | _PLATFORM_PHASES
+#: 允许自动下钻的中间层：``annotation`` / ``original``（影像/标注表所在层）+ 平台阶段名。
+#: 平台实际布局比"数据集根"多这一层，见 ``README.md`` §2.2「数据布局」。
+#:
+#: ``original`` 是**验证集**的实测布局：``verification/original/<检查号>/<序列>/``，
+#: 影像、``SeriesType.xlsx`` 与标注表都在 ``verification/original/``。漏了它，
+#: 数据根填 ``…/verification`` 时 ``original`` 会被当成检查号 —— 扫描结果是
+#: "病例数正常、却报无任何可用序列"，且表也找不到（候选目录里没有它）。
+_DESCEND_DIRS = frozenset({"annotation", "original"}) | _PLATFORM_PHASES
 #: 顶层非病例目录：本层出现其中任何一个，说明"还没到病例层"
-_NON_CASE_DIRS = (frozenset({"annotation", "cache", "runs", "folds", "labels",
-                             "logs", "checkpoints", "weights"})
+_NON_CASE_DIRS = (frozenset({"annotation", "original", "cache", "runs", "folds",
+                             "labels", "logs", "checkpoints", "weights"})
                   | frozenset(SPECIAL_SOURCE_DIRS))
 
 
 def resolve_case_root(root: str) -> str:
     """把"填高了一层"的数据根下钻到真正含病例目录的那一层。
 
-    平台实测结论（``docs/CLOUD_DESKTOP_RUNBOOK.md`` §3.2）：
+    平台实测结论（``README.md`` §2.2「数据布局」）：
     ``/2026aicompetition/datasets/training`` 下**只有** ``annotation/``，
     影像、``SeriesType.xlsx`` 与标注表都在 ``training/annotation/`` 里。
 
@@ -320,7 +325,7 @@ def scan_real(root: str, limit_cases: int | None = None,
         series_types = read_series_types(root)
     if series_types:
         print(f"[probe] 已读取序列类型映射：{len(series_types)} 条（来源："
-              f"{'SeriesType.xlsx' if find_named_table('SeriesType.xlsx', root) else '3_serieslabel.xlsx'}）",
+              f"{find_named_table(SERIES_TYPE_TABLE, root) or SERIES_TYPE_TABLE}）",
               flush=True)
     # UID 单键回退索引：一次建好、全病例复用（表可能上万行，别放进每病例的循环里）
     uid_index = build_uid_index(series_types)
@@ -407,7 +412,8 @@ def merge_special_cases(cases: list[dict], special: dict, log: list | None = Non
     return cases
 
 
-def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -> dict:
+def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8,
+          phase: str = "train") -> dict:
     log: list[str] = []
     # 先把根定到病例层：否则下面读标注表、列检查号都会落在空的父目录上，
     # 报告里出现"0 例 + 0 张表"，看起来像数据没挂载，实际只是根填高了一层。
@@ -419,12 +425,13 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
     known_ids = ({id_key(e) for e in os.listdir(root)
                   if os.path.isdir(os.path.join(root, e)) and e.lower() != "annotation"}
                  if os.path.isdir(root) else set())
-    # 天坛参考实现那 5 张表（`1_abnormal` / `2_duplicate` / `3_serieslabel` /
-    # `4_masklabel` / `5_characteristics`）**不是赛道四数据集的内容**，只在附近
-    # 有（如团队工作区 labels/）时顺手用上：字段金标准、掩膜名表都在这里，
-    # 靠目录名或关键词猜不出来。数据集自带的模态信息在 `SeriesType.xlsx`
-    # （上面 read_series_types 已读），字段金标准在
-    # `annotation/脑胶质瘤标注结果-训练集.xlsx`（下面 find_structured_tables 会找到）。
+    # 天坛参考实现那几张表（`1_abnormal` / `2_duplicate` / `4_masklabel` /
+    # `5_characteristics`）**不是赛道四数据集的内容**，只在附近有（如团队工作区
+    # labels/）时顺手用上：字段金标准、掩膜名表都在这里，靠目录名或关键词猜不出来。
+    # 它们的 `3_serieslabel.xlsx` **不再参与**（模态只认数据集自带的 `SeriesType.xlsx`，
+    # 上面 read_series_types 已读；工作区那份取值更粗，读了会把 T2WI/T2-Flair 压平）；
+    # 数据集里的字段金标准在 `annotation/脑胶质瘤标注结果-训练集.xlsx`
+    # （下面 find_structured_tables 会找到）。
     label_files = find_official_labels(root)
     if label_files:
         print("[probe] 官方标注表：" + ", ".join(
@@ -501,6 +508,15 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
     labels_hint = ""
     if label_counter:
         labels_hint = ""
+    elif not tables and phase == "val":
+        # 官方验证集**没有**字段金标准表（实测 ``verification/original/`` 下只有
+        # ``SeriesType.xlsx``）→ 验证集 labels 全空是**预期**，不是配置错。
+        # 不说清的话，下面那条"表在别处"的提示会把人引去满磁盘找一张不存在的表。
+        labels_hint = ("这是**验证集**：官方验证集实测只有 SeriesType.xlsx、**没有**字段金标准表"
+                       " → 本级 labels 全空属**预期**，不必去找表。分类头只由训练折监督；"
+                       "官方评估口径是 Dice/NSD/HD95 + 重复影像（scripts/04_eval.sh --split external）。"
+                       "若平台后续单独发布验证集标注表：放进验证集目录或 "
+                       "export GLIOMA_LABELS_DIR=<含表目录>，重跑本探针即自动接上")
     elif not tables:
         labels_hint = ("数据根/父/祖父、<工程>/labels、$GLIOMA_LABELS_DIR、"
                        "$WORKSPACE 下 3 层都没找到 csv/xlsx 金标准表；"
@@ -511,9 +527,20 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
                        f"表里需要有 检查号/AccessionNumber/PatientId 之类的列"
                        f"（候选：{', '.join(os.path.basename(t) for t in tables[:3])}）")
     else:
-        labels_hint = (f"表解析出 {n_struct_rows} 行，但列名没映射到规范字段；"
-                       f"需要 病理结果 / location_of_lesion / lesion_morphology / "
-                       f"tumor_t2wi_signal_intensity 这类列")
+        # 有表、也解析出了行，但**没有一例因此拿到字段**。两种原因的处理方式完全不同：
+        # 表属于另一份数据（检查号一条都对不上，例如把训练集的 `5_characteristics.xlsx`
+        # 也搜进来了）vs 检查号对上了但列名没映射到规范字段。
+        # 只报后一种会把前者说成"列名有问题"，让人反复改列名 —— 先看有没有一行落到磁盘上。
+        n_hit = len(known_ids & set(struct))
+        if not n_hit:
+            labels_hint = (f"表解析出 {n_struct_rows} 行，但与本数据集的检查号**一条都对不上**："
+                           f"表多半属于另一份数据/另一个阶段（候选："
+                           f"{', '.join(os.path.basename(t) for t in tables[:3])}）——"
+                           f"先确认数据根与表是不是配套的")
+        else:
+            labels_hint = (f"表解析出 {n_struct_rows} 行、命中 {n_hit} 个磁盘检查号，"
+                           f"但列名没映射到规范字段；需要 病理结果 / location_of_lesion / "
+                           f"lesion_morphology / tumor_t2wi_signal_intensity 这类列")
 
     report = {
         "root": os.path.abspath(root),
@@ -530,7 +557,7 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
         "series_type_rows": len(series_types),
         "modality_counts": dict(mod_counter),
         # 认不出模态的序列总数 / 涉及病例数。评测集没有标注表时它会等于"序列总数"，
-        # 此时全靠 data/modality_model.json 兜底（见 DATASET_ROOT_TROUBLESHOOT.md）
+        # 此时全靠 data/modality_model.json 兜底（见 README.md §7.2）
         "unknown_series_total": n_unknown_series,
         "cases_with_unknown_series": n_unknown_cases,
         # 类型表里写着"其他"的病例数（`SeriesType.xlsx` 常见）：**不是**缺表信号，
@@ -549,45 +576,71 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8) -
         "dicom_log": log[:20],
     }
     return {"report": report, "cases": cases, "special": special,
-            "data_source": data_source_tag(root, phase="train")}
+            # phase="val" 时记 `local/<验证集目录名>/val` —— 验证集清单不参与训练，
+            # 但同样要可追溯数据来源（评估侧 assert_data_source(phase="val") 会比对）。
+            "data_source": data_source_tag(root, phase=phase)}
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     paths = load_paths()
-    ap.add_argument("--root", default=os.environ.get("DATASET_ROOT") or paths["raw"]["track4"])
-    ap.add_argument("--out", default=paths["manifest"])
+    ap.add_argument("--phase", choices=("train", "val"), default="train",
+                    help="train=训练集（默认，写 data/manifest.json）；"
+                         "val=官方验证集（写 data/manifest_val.json，"
+                         "供评估侧 external 分支使用）")
+    ap.add_argument("--root", default=None,
+                    help="数据根；train 默认 DATASET_ROOT / raw.track4，"
+                         "val 默认 VAL_ROOT / raw.val")
+    ap.add_argument("--out", default=None)
     ap.add_argument("--limit-cases", type=int, default=None)
     a = ap.parse_args()
 
-    res = probe(a.root, a.limit_cases)
+    if a.phase == "val":
+        a.root = a.root or val_root()
+        if not a.root:
+            raise SystemExit(
+                "[probe] ✗ 未配置验证集数据根：export VAL_ROOT=<验证集目录>，"
+                "或在 configs/paths.yaml 的 raw.val 填写（验证集布局见该处注释）")
+        a.out = a.out or paths.get("manifest_val") or "data/manifest_val.json"
+    else:
+        a.root = a.root or os.environ.get("DATASET_ROOT") or paths["raw"]["track4"]
+        a.out = a.out or paths["manifest"]
+
+    res = probe(a.root, a.limit_cases, phase=a.phase)
     out = resolve(a.out)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         json.dump({"cases": res["cases"], "special": res["special"], "report": res["report"],
                    # 数据源标识：训练前会与本机数据源比对，防止"用本地/公开数据清单训练官方数据"
-                   "data_source": res.get("data_source") or data_source_tag(a.root, phase="train"),
+                   "data_source": res.get("data_source") or data_source_tag(a.root, phase=a.phase),
                    "data_root": os.path.abspath(a.root)},
                   f, ensure_ascii=False, indent=1)
 
     print(json.dumps(res["report"], ensure_ascii=False, indent=1))
-    print(f"\n[probe] manifest -> {out}  病例 {res['report']['n_cases']}")
+    _kind = "验证集清单" if a.phase == "val" else "训练清单"
+    print(f"\n[probe] {_kind} -> {out}  病例 {res['report']['n_cases']}")
+    if a.phase == "val":
+        print("[probe] ℹ️ 已生成验证集清单：scripts/04/14/15/16 会自动切到 external 分支"
+              "（全折集成，不做留一；最终指标以官方验证集为准）。"
+              "想回退折内 val：删除该清单或清空 raw.val/VAL_ROOT。")
     if res["report"]["n_cases"] == 0:
         print("[probe] ⚠️ 未找到病例：请确认 --root 指向含'检查号目录'的数据根（其内应有 NIfTI 或 DICOM）")
     if not res["report"]["label_field_counts"]:
         # 目标三/目标四的监督信号全在这里；为 0 就意味着分类头学不到东西，
         # 而训练照样能跑完（loss 只统计有 mask 的样本）——必须显式提醒。
-        print(f"[probe] ⚠️ 结构化字段金标准为空（label_field_counts={{}}）："
+        # 验证集没有字段金标准表是**预期**（官方只给 SeriesType.xlsx），
+        # 用 ⚠️ 会让人以为自己配错了，去翻一张不存在的表。
+        _mark = "ℹ️" if a.phase == "val" else "⚠️"
+        print(f"[probe] {_mark} 结构化字段金标准为空（label_field_counts={{}}）："
               f"{res['report']['labels_hint']}")
     if res["report"]["modality_counts"].get("other") and not res["report"]["series_type_rows"]:
-        # 序列类型表在数据里（platform）或工作区（团队那份）都能被找到，所以走到这里
-        # 就是"两处都没有"—— 而不是我们没看那几个目录。
-        print("[probe] ⚠️ 有序列落到 other 且没读到任何序列类型表"
-              "（SeriesType.xlsx / 3_serieslabel.xlsx）："
+        # 序列类型表只在**数据集里**（与病例目录同层），走到这里就是没找到 ——
+        # 而不是我们没看那几个目录（工作区那份 3_serieslabel.xlsx 已不参与）。
+        print(f"[probe] ⚠️ 有序列落到 other 且没读到数据信息表（{SERIES_TYPE_TABLE}）："
               "先确认数据根指向的是含 annotation/ 的那一层（表与病例目录同层），"
               "或 export GLIOMA_LABELS_DIR=<含该表的目录>（/ ln -s 到 <工程>/labels）"
               "再重跑本探针；表也没有时走体素判别兜底（见下一条）。"
-              "排查步骤：docs/DATASET_ROOT_TROUBLESHOOT.md")
+              "排查步骤：README.md §7.2")
     if res["report"].get("cases_with_declared_other_series"):
         print(f"[probe] ℹ️ {res['report']['cases_with_declared_other_series']} 例含被类型表标为"
               f"『其他』的序列（不属于 T1/T2-FLAIR/T1CE），已排除、不交给体素模型猜；"

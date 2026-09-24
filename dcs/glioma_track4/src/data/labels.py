@@ -49,6 +49,9 @@ YESNO_MAP = {"有": 1, "无": 0, "有/清": 1, "无/不清": 0, "无病灶": 0, 
 # ---- 病理结果 → WHO 分级 / 是否胶质瘤 ----
 GRADE_MAP = {"脑胶质瘤1级": "1", "脑胶质瘤2级": "2", "脑胶质瘤3级": "3", "脑胶质瘤4级": "4"}
 NON_GLIOMA = {"其他肿瘤或病变", "脑转移", "脑脓肿", "脑梗死", "病因不明", "无", "NA/UNK", ""}
+#: 级别单独成列（`WHO分级` / `分级`）时可能出现全角数字；罗马数字见 ``_ROMAN_GRADE``
+_CIRCLED_GRADE = {"Ⅰ": "1", "Ⅱ": "2", "Ⅲ": "3", "Ⅳ": "4"}
+_ROMAN_GRADE = {"i": "1", "ii": "2", "iii": "3", "iv": "4"}
 
 # ---- 掩码文件角色识别（《公共数据集格式说明》赛道4 的 ROI 命名）----
 MASK_ROLE_KEYWORDS = {
@@ -140,7 +143,13 @@ def to_enum(value: Any, mapping: dict) -> Any:
 #: **顺序即优先级**（精确 → 包含两轮，都按此顺序取第一个命中）：
 #: 越具体的检查号命名越靠前，泛化的"记录号/序号"放最后，
 #: 避免一张表里同时存在行列号时把行号当成了检查号。
-ID_COLUMN_KEYWORDS = ("accessionnumber", "accession_number", "accession_no", "accession",
+#:
+#: ⚠️ ``accessionumber``（少一个 n）是**数据集真实表头里的拼写**，必须按精确命中列出来：
+#: 只留 ``accessionnumber`` 时它进不了精确轮，而同一行的 ``StudyUid`` 能精确命中 ——
+#: 于是整张检查级别 sheet 按 **StudyUid** 建索引（键形如 ``1.2.3.xxxx``），
+#: 与磁盘上的检查号目录名一条都对不上，序列级/ROI级子行也全部挂不上（静默丢行）。
+ID_COLUMN_KEYWORDS = ("accessionnumber", "accession_number", "accession_no",
+                      "accessionumber", "accession_num", "accessionno", "accession",
                       "patientid", "patient_id", "record_uuid", "studyuid",
                       "study_instance_uid", "study_id", "studyid",
                       "检查号", "检查编号", "病例号", "患者号", "检查id",
@@ -160,6 +169,74 @@ FIELD_HINTS = ("病理", "glioma", "location", "lesion", "morpholog", "tumor",
 
 #: 已告警过的表（避免每次探测/训练都刷屏）
 _WARNED_TABLES: set[str] = set()
+
+
+# --------------------------------------------------------------------------- #
+# 数据集金标准表的**三张工作表**（`脑胶质瘤标注结果-训练集.xlsx`）与"级别"
+# --------------------------------------------------------------------------- #
+#: 实测排版：三个 sheet 依次是 ``检查级别`` / ``序列级别`` / ``ROI级别``。
+#:
+#: ⚠️ **不要假设表头在第几行**：三个 sheet 的表头行位置各不相同，第 1~3 行
+#: 都可能是"索引信息"（标题 / 字段说明 / 空行）。表头行一律由
+#: :func:`_detect_header` 在**前 20 行里扫描**确定（要求含该级别的行键列），
+#: 写死"第 N 行"会在官方换一版排版时整表解析出 0 行。
+#:
+#: 为什么必须分级别处理：三个 sheet 的**行键不是同一个** ——
+#: 检查级别 = 检查号（一例一行）、序列级别 = 检查号 + 序列号（一例多行）、
+#: ROI 级别 = 检查号 + 序列号 + ROI 名（一例更多行）。
+#: 全部按检查号合并会让同病例的后续行**互相覆盖**：看起来"读到了 N 行"、
+#: 字段却来自最后一行（序列级/ROI 级），病例级字段全丢 —— 而且不报任何错。
+_SHEET_LEVEL_RULES: tuple[tuple[str, str], ...] = (
+    ("检查", "case"), ("case", "case"), ("study", "case"), ("exam", "case"),
+    ("序列", "series"), ("series", "series"), ("serie", "series"),
+    ("roi", "roi"), ("病灶", "roi"), ("掩膜", "roi"), ("mask", "roi"),
+)
+
+#: 各级别**行键**的列名候选（合并时用它区分同一病例下的多行）
+LEVEL_KEY_COLUMNS: dict[str, tuple[str, ...]] = {
+    "case": ID_COLUMN_KEYWORDS + ID_COLUMN_EXACT,
+    "series": ("序列号", "序列编号", "序列id", "序列uid", "seriesuid", "series_uid",
+               "seriesinstanceuid", "seriesid", "series"),
+    # ROI 名**显式列出无下划线拼写并排最前**：官方表头是 ``RoiName``，只写 ``roi名称`` /
+    # ``roi`` 时它仅被"前缀"轮的 ``roi`` 兜住 —— 而同一行还有 AB 列 ``ROIUid``（官方表的
+    # 实测拼写），位置更靠前、又同样满足 ``roi`` 前缀，于是**先撞上它**：行键变成 ROI UID，
+    # ROI 名（瘤体/水肿/肿瘤瘤体/全肿瘤，掩膜角色 core/peri 的唯一来源）退化成普通列。
+    # 这不是理论隐患：``ROIUid`` 这种拼写靠 ``roi`` 前缀兜不住，必然被截走。
+    "roi": ("roiname", "roi_name", "roi名称", "roi名", "roi编号", "roi号", "roi",
+            "掩膜名", "掩膜文件", "掩膜", "maskname", "mask_name", "mask",
+            "病灶名", "病灶"),
+}
+
+#: 序列级 / ROI 级的行**原样挂**在病例记录的这两个键下（不参与字段映射）。
+#: 用双下划线包起来是为了与真实列名不可能撞名（列名都是中文或英文单词）。
+LEVEL_NESTED_KEY: dict[str, str] = {"series": "__series_rows__", "roi": "__roi_rows__"}
+
+#: 合并顺序：检查级别在前（病例级字段以它为准），序列/ROI 级只做嵌套保留
+_LEVEL_ORDER: dict[str, int] = {"case": 0, "series": 1, "roi": 2, "unknown": 3}
+
+#: 在**序列级 / ROI 级**表里认"检查号列"用的名字（比 :data:`ID_COLUMN_KEYWORDS` 更严）。
+#:
+#: 这里不能用那套宽松关键词：序列级表的行键是 ``序列号``、ROI 级是 ``ROI名称``，
+#: 宽松匹配里的 ``id`` / ``编号``（包含匹配）会把 ``SeriesUid`` / ``序列编号`` 认成检查号，
+#: 于是整张表的子行被挂到"序列号当检查号"的假病例上 —— 有结果、全错位。
+_CASE_COLUMN_STRICT = ("accessionnumber", "accession_number", "accession_no",
+                       "accessionumber", "accession_num", "accessionno", "accession",
+                       "检查号", "检查编号", "病例号", "患者号", "检查序号", "检查id",
+                       "studyid", "study_id", "study_instance_uid")
+
+
+def _sheet_level(name: str) -> str:
+    """由工作表名判"级别"：``检查级别``→case、``序列级别``→series、``ROI级别``→roi。
+
+    名字认不出来时返回 ``"unknown"``（单张 csv、``Sheet1``、空名…）——
+    **不是**"按检查号合并"：:func:`_sheet_plan` 会按表头列回退判级
+    （ROI 名 → 序列号 → 检查号）。这里只负责"表名这一条线索"。
+    """
+    low = str(name or "").strip().casefold()
+    for kw, level in _SHEET_LEVEL_RULES:
+        if kw in low:
+            return level
+    return "unknown"
 
 
 def _find_id_column(header) -> str | None:
@@ -198,39 +275,36 @@ def _find_id_column(header) -> str | None:
 #: |---|---|---|
 #: | ``1_abnormal.xlsx`` | AccessionNumber, SeriesUid, **Label** ∈ {true,fake,compositing,duplicate} | 目标一/二的正样本（**逐序列**） |
 #: | ``2_duplicate.xlsx`` | src_img, desc_img | 重复影像 pair |
-#: | ``3_serieslabel.xlsx`` | AccessionNumber, SeriesUid, **SeriesLabel** ∈ {T1CE,T2,FLAIR} | 模态（**兼容兜底**；权威是数据集里的 ``SeriesType.xlsx``） |
+#: | ~~``3_serieslabel.xlsx``~~ | ~~AccessionNumber, SeriesUid, SeriesLabel~~ | **已删除，不再读**（模态只认数据集里的 ``SeriesType.xlsx``；读它只会把 ``T2WI``/``T2-Flair`` 静默压平成 ``T2``） |
 #: | ``4_masklabel.xlsx`` | AccessionNumber, SeriesUid, **Maskname** | 掩膜文件名（任意名，关键词认不出） |
 #: | ``5_characteristics.xlsx`` | AccessionNumber + 14 个英文列 | 结构化字段金标准（**兼容**；数据集里那份是中文表头的 ``脑胶质瘤标注结果-训练集.xlsx``） |
 #:
 #: 这套约定是**唯一权威**。在此之前我们按中文列名去猜，于是出现
 #: "病例数正常、一例都挑不出模态""字段金标准为空"——表一直都在，
 #: 只是文件名和列名都不是我们猜的那套。
+#:
+#: 因此本字典里**没有** ``series`` 这个键（:data:`OFFICIAL_LABEL_FILES`）——
+#: 找表、打印自检时都不会再出现 ``3_serieslabel.xlsx``。
 OFFICIAL_LABEL_FILES = {
     "abnormal": "1_abnormal.xlsx",
     "duplicate": "2_duplicate.xlsx",
-    "series": "3_serieslabel.xlsx",
     "mask": "4_masklabel.xlsx",
     "characteristics": "5_characteristics.xlsx",
 }
 
-#: 序列类型表在**赛道四数据集里**的文件名（**权威**）。
+#: 序列类型表在**赛道四数据集里**的文件名（**唯一来源**）。
 #:
 #: 它的位置与影像同层：``<阶段>/annotation/SeriesType.xlsx``，
-#: 三个阶段的**数据里都有**（``training`` / ``verification`` 训练与验证集已下发，
-#: ``evaluation_*`` 评测集在正式测试时**随测试数据一起下发**）。
+#: 训练/验证集的数据里都有（``training`` / ``verification``），
+#: ``evaluation_*`` 评测集在正式测试时**随测试数据一起下发**。
 #: 列：``AccessionNumber`` + ``SeriesUid`` + ``SeriesType``；
 #: 取值共 **5 类**：``T1`` / ``T1CE（增强）`` / ``T2-Flair`` / ``T2WI`` / ``其他``。
 SERIES_TYPE_TABLE = "SeriesType.xlsx"
 
-#: 团队工作区里那份**名字不同、来源也不同**的表（``<workspace>/dcs/*/*/labels/``）。
-#:
-#: ⚠️ 它**不是赛道四数据集的内容**（是工作区里另一个目标的产物），只是列结构与
-#: 上表同构、取值写法更粗（``T1CE``/``T2``/``FLAIR``），所以保留为**兜底**：
-#: 数据集那份读不到时才用它。顺序不能反 —— 详见 :func:`read_series_types`。
-SERIES_TYPE_TABLE_LEGACY = "3_serieslabel.xlsx"
-
-#: 两个命名的**查找顺序**（前者权威）：自检文案与探针日志都按这个顺序打印。
-SERIES_TYPE_FILENAMES = (SERIES_TYPE_TABLE, SERIES_TYPE_TABLE_LEGACY)
+#: 查找/自检文案里出现的表名（**只有一个名字**：数据集自带的那张）。
+#: 以前这里还有 ``3_serieslabel.xlsx`` 做兜底 —— 已删除：它与本赛道数据集无关，
+#: 而且取值更粗（只写 ``T2``），会把数据集里的 ``T2WI`` / ``T2-Flair`` 静默压平。
+SERIES_TYPE_FILENAMES = (SERIES_TYPE_TABLE,)
 
 #: 官方标注表所在目录的环境变量（对应官方 config 的 ``paths.labels_dir``）
 LABELS_DIR_ENV = "GLIOMA_LABELS_DIR"
@@ -299,9 +373,16 @@ def workspace_labels_dirs(max_depth: int = 3) -> list[Path]:
 #: 逐个 stat 既慢，又会在备份/缓存目录里撞到同名旧表。而"标注放在哪个容器目录"
 #: 其实是个有限集合 —— 平台那份在 ``training/annotation/``（英文）
 #: 或下载后的 ``标注结果/``（中文），下面这些名字把两种情况都覆盖了。
+#: "像标注容器"的子目录名。
+#:
+#: ``original`` 是**验证集**的中间层：``verification/original/`` 里既放影像也放
+#: ``SeriesType.xlsx`` / ``脑胶质瘤标注结果-验证集.xlsx``。漏了它，数据根填
+#: ``…/verification``（而不是 ``…/verification/original``）时表就一条都搜不到，
+#: 报错只说"未找到"，看不出是差了一层目录。
 _LABEL_SUBDIR_NAMES = frozenset({
     "labels", "label", "annotation", "annotations", "标注结果", "标注", "结果",
-    "gold", "groundtruth", "ground_truth", "gt", "meta", "metadata", "results",
+    "original", "gold", "groundtruth", "ground_truth", "gt", "meta", "metadata",
+    "results",
 })
 
 #: 往下钻几层。2 层是为了覆盖"数据根填高一层（``training/``）**且**
@@ -338,10 +419,9 @@ def label_search_dirs(root: str | os.PathLike | None = None,
     6. 上述每个目录下"像标注容器"的一级子目录（见 :data:`_LABEL_SUBDIR_NAMES`）——
        防止表藏在 ``annotation/`` 的下一层（下载解压后常见的 ``标注结果/``）
 
-    抽成独立函数是因为序列类型表（模态来源）与其它表**可能不在一起**：
-    赛道四数据集自带 ``SeriesType.xlsx``（与病例目录同层），而工作区那份
-    ``3_serieslabel.xlsx`` 在 ``labels/`` 下；两套搜索必须同一口径，否则又出现
-    "表在磁盘上、代码却只看了一个目录"。
+    抽成独立函数是因为各类表**可能不在一起**：赛道四数据集自带 ``SeriesType.xlsx``
+    （与病例目录同层），而字段金标准 / 掩膜名表在**工作区**的 ``labels/`` 下；
+    两套搜索必须同一口径，否则又出现"表在磁盘上、代码却只看了一个目录"。
     """
     cands: list[Path] = []
     if labels_dir:
@@ -382,9 +462,9 @@ def find_named_table(filename: str, root: str | os.PathLike | None = None,
                      labels_dir: str | os.PathLike | None = None) -> str | None:
     """在候选目录里按**文件名**找一张表 → 路径（找不到返回 ``None``）。
 
-    为什么不复用 :func:`find_official_labels`：它只认那 5 个固定名字
-    （``3_serieslabel.xlsx`` 等），而赛道四数据集里那张叫 ``SeriesType.xlsx`` ——
-    列结构同构、名字不同，必须在**同一批候选目录**里分别找，才能既认数据集又兼容工作区。
+    为什么不复用 :func:`find_official_labels`：它只认工作区那几张固定名字的表
+    （``1_abnormal.xlsx`` 等），而赛道四数据集里那张叫 ``SeriesType.xlsx`` ——
+    名字不同，必须在**同一批候选目录**里分别找，才能既认数据集又兼容工作区。
     """
     for folder in label_search_dirs(root, labels_dir):
         candidate = folder / filename
@@ -395,11 +475,14 @@ def find_named_table(filename: str, root: str | os.PathLike | None = None,
 
 def find_official_labels(root: str | os.PathLike | None = None,
                          labels_dir: str | os.PathLike | None = None) -> dict[str, str]:
-    """定位官方 5 张标注表 → ``{用途: 路径}``（找不到的键不出现）。
+    """定位团队工作区那几张标注表 → ``{用途: 路径}``（找不到的键不出现）。
 
-    搜索顺序见 :func:`label_search_dirs`。官方把标注放在**工程目录**而不是数据集里 ——
+    搜索顺序见 :func:`label_search_dirs`。这些表放在**工程/工作区目录**而不是数据集里 ——
     这也是"数据根下找不到金标准"的原因之一。``root=None`` 时只搜 1~4
     （用于报错时做"表到底在不在"的自检）。
+
+    ⚠️ 里面**没有模态表**：``3_serieslabel.xlsx`` 已从 :data:`OFFICIAL_LABEL_FILES`
+    移除，模态只在数据集的 ``SeriesType.xlsx`` 里认（见 :func:`read_series_types`）。
     """
     cands = label_search_dirs(root, labels_dir)
     found: dict[str, str] = {}
@@ -412,20 +495,52 @@ def find_official_labels(root: str | os.PathLike | None = None,
     return found
 
 
+#: 分层列名的分隔符：官方表的列名就是**字段路径**（``Study->CLINICAL->病理结果``）。
+#:
+#: ⚠️ 只认这两种箭头：普通连字符列名（``T2-Flair``、``t1wi_c_enhan``）不能拆。
+_COLUMN_PATH_SEPS: tuple[str, ...] = ("->", "→")
+
+
+def _column_leaf(name: Any) -> str:
+    """取**分层列名的末段**：``Study->CLINICAL->病理结果`` → ``病理结果``。
+
+    实测排版：检查级别 sheet 的病例级字段全写成路径形式
+    （``Study->CLINICAL->病理结果``、``Study->DICOM->StudyDate``），**末段才是字段名**。
+
+    只按整串匹配时字段能不能命中全靠"包含"，父段里出现关键词就会被抢走
+    （``...->病理结果`` 与 ``...->病理类型`` 谁在前面谁得）。因此匹配顺序统一成
+    **先末段、再整串** —— 只增精度，不改旧行为（非分层列名的末段就是它自己）。
+    """
+    text = str(name if name is not None else "").strip()
+    for sep in _COLUMN_PATH_SEPS:
+        if sep in text:
+            text = text.rsplit(sep, 1)[-1].strip()
+    return text
+
+
 def _find_col_in_list(header: list[str], keywords: tuple[str, ...]) -> int | None:
-    """在表头列表里找列，返回**列号**：精确 → 前缀 → 包含（按关键词顺序）。"""
-    lower = {str(c).strip().lower(): i for i, c in enumerate(header) if str(c).strip()}
-    for kw in keywords:                                            # ① 精确
-        if kw in lower:
-            return lower[kw]
-    for kw in keywords:                                            # ② 前缀
-        for low, idx in lower.items():
-            if low.startswith(kw):
-                return idx
-    for kw in keywords:                                            # ③ 包含
-        for low, idx in lower.items():
-            if kw in low:
-                return idx
+    """在表头列表里找列，返回**列号**：先按**分层列名末段**、再按整串；每轮 精确→前缀→包含。
+
+    末段优先的理由见 :func:`_column_leaf`。
+    """
+    full = {str(c).strip().lower(): i for i, c in enumerate(header) if str(c).strip()}
+    leaf: dict[str, int] = {}
+    for i, cell in enumerate(header):
+        text = str(cell).strip()
+        if text:
+            leaf.setdefault(_column_leaf(text).lower(), i)
+    for table in (leaf, full):                                     # 末段 → 整串
+        for kw in keywords:                                        # ① 精确
+            if kw in table:
+                return table[kw]
+        for kw in keywords:                                        # ② 前缀
+            for low, idx in table.items():
+                if low.startswith(kw):
+                    return idx
+        for kw in keywords:                                        # ③ 包含
+            for low, idx in table.items():
+                if kw in low:
+                    return idx
     return None
 
 
@@ -434,9 +549,9 @@ def read_official_triples(path: str,
                           uid_kws: tuple[str, ...] = ("seriesuid", "series_uid", "序列号"),
                           value_kws: tuple[str, ...] = ("label",),
                           ) -> dict[tuple[str, str], list[str]]:
-    """读官方"检查号 + 序列号 + 取值"三类表 → ``{(检查号, 序列号): [取值, ...]}``。
+    """读"检查号 + 序列号 + 取值"三类表 → ``{(检查号, 序列号): [取值, ...]}``。
 
-    ``1_abnormal`` / ``3_serieslabel`` / ``4_masklabel`` 都是这个形状
+    ``1_abnormal`` / ``4_masklabel`` 都是这个形状
     （掩膜表同一序列可能有多行 → 取值列表）。取值保持原样大小写，
     调用方按需 ``.upper()`` / ``.lower()`` 比较。
     """
@@ -462,15 +577,6 @@ def read_official_triples(path: str,
                 if value not in bucket:
                     bucket.append(value)
     return out
-
-
-def read_serieslabel_table(path: str) -> dict[tuple[str, str], str]:
-    """读 ``3_serieslabel.xlsx`` → ``{(检查号, 序列号): SeriesLabel}``（模态）。"""
-    triples = read_official_triples(
-        path,
-        value_kws=("serieslabel", "series_label", "seriestype", "序列类型", "模态", "序列标签"),
-    )
-    return {k: v[0] for k, v in triples.items() if v}
 
 
 def read_mask_table(path: str) -> dict[tuple[str, str], list[str]]:
@@ -526,46 +632,68 @@ def read_abnormal_table(path: str) -> dict[tuple[str, str], str]:
     return {k: v[0].lower() for k, v in triples.items() if v}
 
 
-def _sheet_rows(path: str) -> list[list[list[str]]]:
-    """把 csv/xlsx 读成"若干张表、每张是原始行"（**不做任何表头假设**）。
+def _sheet_frames(path: str) -> list[tuple[str, list[list[str]]]]:
+    """把 csv/xlsx 读成 ``[(工作表名, 原始行), ...]``（**不做任何表头假设**）。
 
     为什么不直接用 ``pandas.read_excel`` 的默认行为：它把**第一行**当表头、
-    且**只读第一个 sheet**。中文标注表的常见排版是
+    且**只读第一个 sheet**。本项目两类表的真实排版都跟默认行为对不上：
 
-        A1: 脑胶质瘤标注结果（训练集）      ← 标题
-        A2: （空行 / 填表说明）
-        A3: 检查号 | 病理结果 | …           ← 真正的表头
+    * ``脑胶质瘤标注结果-训练集.xlsx``：**3 个 sheet（检查级别/序列级别/ROI级别）**，
+      每个 sheet 的表头行位置还不一样（第 1~3 行都可能是索引信息）；
+    * 中文标注表的常见排版：``标题 → 空行/说明 → 真正的表头``。
 
     默认行为下列名会变成"标题/Unnamed"，检查号列认不出来，整表 0 行。
+    工作表名要留着：它是"这张表是哪个级别"的**第一条线索**（见 :func:`_sheet_level`）；
+    名字认不出来时级别由表头列决定（见 :func:`_sheet_plan`）。
     """
     if path.endswith((".xlsx", ".xls")):
         import pandas as pd
         sheets = pd.read_excel(path, sheet_name=None, header=None, dtype=str)
-        return [[["" if v is None else str(v).strip() for v in row]
-                 for row in frame.fillna("").values.tolist()]
-                for frame in sheets.values()]
+        return [(str(name), [["" if v is None else str(v).strip() for v in row]
+                             for row in frame.fillna("").values.tolist()])
+                for name, frame in sheets.items()]
     import csv
     with open(path, encoding="utf-8-sig", newline="") as f:
-        return [[[str(c).strip() for c in row] for row in csv.reader(f)]]
+        return [(os.path.splitext(os.path.basename(path))[0],
+                 [[str(c).strip() for c in row] for row in csv.reader(f)])]
 
 
-def _detect_header(rows: list[list[str]], max_scan: int = 20) -> int | None:
-    """在前若干行里找**真正的表头行**：必须含检查号列，字段线索越多越优先。
+def _sheet_rows(path: str) -> list[list[list[str]]]:
+    """只要行、不要工作表名（多数调用方用不到名字）。"""
+    return [rows for _, rows in _sheet_frames(path)]
+
+
+def _detect_header(rows: list[list[str]], max_scan: int = 20,
+                   level: str = "unknown") -> int | None:
+    """在前若干行里找**真正的表头行**：必须含该级别的行键列，字段线索越多越优先。
 
     只看第一行是这个数据最常见的失效点（标题行占了第一行）；
-    而"必须含检查号列"这条同时挡住了把说明行、数据行误判成表头。
+    而"必须含行键列"这条同时挡住了把说明行、数据行误判成表头。
+
+    ``level`` 决定"行键列"是什么：检查级别看检查号，**序列级别看序列号，
+    ROI 级别看 ROI 名**。少了这个参数，序列级别 / ROI 级别的 sheet 会因为
+    "没有检查号列"而判成找不到表头 → 整张表 0 行（序列级字段全丢、还不报错）。
     """
-    best: tuple[int, int] | None = None                            # (线索数, 行号)
+    key_cols = LEVEL_KEY_COLUMNS.get(level)
+    best: tuple[int, int, int] | None = None            # (字段线索, 非空列数, 行号)
     for idx, row in enumerate(rows[:max_scan]):
-        if not any(str(c).strip() for c in row):
+        cells = [str(c).strip() for c in row]
+        if not any(cells):
             continue                                               # 空行
-        if _find_id_column(row) is None:
+        if key_cols is not None:
+            if _find_col_in_list(cells, key_cols) is None:
+                continue
+        elif _find_id_column(row) is None:
             continue
-        hits = sum(1 for c in row
-                   if any(k in str(c).lower() for k in FIELD_HINTS))
-        if best is None or hits > best[0]:
-            best = (hits, idx)
-    return best[1] if best else None
+        hits = sum(1 for c in cells
+                   if any(k in c.lower() for k in FIELD_HINTS))
+        # 非空列数当**第二判据**：标题行常是"一格有字、其余全空"，而真表头是满行。
+        # 少了它，标题行 'ROI级别' 会被前缀匹配当成 roi 列、压过真表头 → 表头行混进数据、
+        # 还凭空多出一个用表头文字当检查号的假病例。
+        score = (hits, sum(1 for c in cells if c))
+        if best is None or score > best[:2]:
+            best = (score[0], score[1], idx)
+    return best[2] if best else None
 
 
 def _id_key(value) -> str:
@@ -650,11 +778,13 @@ def dump_table(path: str, max_rows: int = 8, max_cols: int = 12,
     用途很直接：当解析失败时不要让人猜表长什么样 —— 直接打印出来看。
     """
     lines: list[str] = [f"文件：{path}"]
-    sheets = _sheet_rows(path)
+    sheets = _sheet_frames(path)
     lines.append(f"工作表数：{len(sheets)}")
-    for s_idx, rows in enumerate(sheets):
+    for s_idx, (name, rows) in enumerate(sheets):
         width = max((len(r) for r in rows), default=0)
-        lines.append(f"\n--- sheet{s_idx}: {len(rows)} 行 × {width} 列 ---")
+        level = _sheet_level(name)
+        lines.append(f"\n--- sheet{s_idx} {name!r}（级别={level}）: "
+                     f"{len(rows)} 行 × {width} 列 ---")
         for r_idx, row in enumerate(rows[:max_rows]):
             cells = [str(c)[:cell_width].ljust(cell_width)
                      for c in row[:max_cols]]
@@ -665,20 +795,24 @@ def dump_table(path: str, max_rows: int = 8, max_cols: int = 12,
     return "\n".join(lines)
 
 
-def _diagnose_id_columns(sheets: list[list[list[str]]], known_keys: set[str],
+def _diagnose_id_columns(sheets: list[tuple[str, list[list[str]]]], known_keys: set[str],
                          top: int = 3, max_scan: int = 300) -> str:
-    """解析失败时给出**可执行的**原因：哪一列最像检查号、命中多少行。
+    """解析失败时给出**可执行的**原因：哪一列最像行键、命中多少行。
 
     "0 行"有两种成因，处理方式相反：
     ① 检查号列存在，但取值与磁盘目录名不是同一套编号（要按值映射或换表）；
     ② 表里根本没有检查号（这表不是字段金标准）。
     只看 `label_field_counts: {}` 分不清，只能反复猜 —— 所以把命中率打出来。
+
+    ⚠️ 只拿**磁盘检查号**去比对每个 sheet：序列级别 / ROI 级别的 sheet
+    列的是序列号 / ROI 名，命中率天然为 0，那不代表表有问题。
     """
     if not known_keys:
         return ("  ⚠️ 取不到磁盘上的检查号（数据根下没有病例目录），"
                 "只能按列名识别 —— 请先把数据根指到含检查号目录的那一层。")
     lines: list[str] = []
-    for s_idx, rows in enumerate(sheets):
+    for s_idx, (sheet_name, rows) in enumerate(sheets):
+        tag = f"sheet{s_idx} {sheet_name!r}"
         if not rows:
             continue
         width = max(len(r) for r in rows[:max_scan])
@@ -697,8 +831,8 @@ def _diagnose_id_columns(sheets: list[list[list[str]]], known_keys: set[str],
         scored.sort(key=lambda s: (-s[0], -s[1]))
         if not scored:
             head = [str(c)[:18] for c in rows[min(1, len(rows) - 1)][:8]]
-            lines.append(f"  sheet{s_idx}: 没有哪一列的取值能对上磁盘检查号"
-                         f"（前几列表头={head}）→ 这表多半不是字段金标准")
+            lines.append(f"  {tag}: 没有哪一列的取值能对上磁盘检查号"
+                         f"（前几列表头={head}）→ 该 sheet 多半不是订单级别、或不是这张表")
             continue
         for ratio, hit, total, col in scored[:top]:
             name = ""
@@ -706,109 +840,387 @@ def _diagnose_id_columns(sheets: list[list[list[str]]], known_keys: set[str],
                 if col < len(r) and str(r[col]).strip() and _id_key(r[col]) not in known_keys:
                     name = str(r[col]).strip()[:18]
                     break
-            lines.append(f"  sheet{s_idx}: 第 {col} 列最像检查号（表头 {name!r}）"
+            lines.append(f"  {tag}: 第 {col} 列最像检查号（表头 {name!r}）"
                          f"命中 {hit}/{total} 行（{ratio:.0%}）")
         lines.append(f"  → 上面命中率若明显低于 30%，说明该表编号与目录名不是同一套；"
                      f"把 dump 出来的前几行发出来即可确定映射关系")
     return "\n".join(lines)
 
 
-def read_structured_table(path: str, known_ids: set[str] | None = None) -> dict[str, dict]:
-    """读结构化金标准表（csv 或 xlsx）→ {检查号: {列名: 值}}。
+def _row_to_record(header: list[str], row: list[str]) -> dict[str, Any]:
+    """一行 + 表头 → ``{列名: 值}``（表头认不出时用 ``colN`` 占位）。"""
+    record: dict[str, Any] = {
+        col: (str(row[i]).strip() if i < len(row) else "")
+        for i, col in enumerate(header) if col
+    }
+    if not record:                                                # 表头认不出：用列号占位
+        record = {f"col{i}": (str(row[i]).strip() if i < len(row) else "")
+                  for i in range(len(row))}
+    return record
 
-    三个"看起来应该没问题、实际常常出问题"的地方都做了处理：
 
-    1. **标题行/空行**：中文标注表的排版通常是
-       ``标题行 → 空行/说明 → 真正的表头``，而 ``pandas.read_excel``
-       默认把第一行当表头 —— 列名成了"标题/Unnamed"，检查号列认不出来，
-       整表解析出 **0 行**。这里改为自己在前若干行里找表头行。
-    2. **多工作表**：默认只读第一个 sheet；这里遍历全部 sheet。
-    3. **检查号大小写**：目录名是小写哈希、表里可能是大写，
-       因此大小写折叠后的键也一并登记。
+def _key_forms(value: str) -> set[str]:
+    """登记/查找用的键形式：原样、去前导零、以及两者的 casefold，再加归一化键。
 
-    一行都没解析出来时会打印告警（含表头预览），
-    而不是只给上层返回一个空字典。
+    目录名可能是 ``C0E1F8F2-53BA-45BE``，表里是 ``c0e1f8f253ba45be``（或反之），
+    只登记原始形式会一条都查不到。
+
+    ⚠️ 归一化后是**空串**的键一律丢掉：``_id_key("检查号")`` 这种"整串都是非字母数字"
+    的取值会归一化成 ``""``，留着就会把不同来源的无意义文字**合并成同一个病例**。
     """
-    out: dict[str, dict] = {}
-    sheets = _sheet_rows(path)
-    for rows in sheets:
-        header: list[str] = []
-        data_start: int | None = None
-        id_col: int | None = None
+    text = str(value).strip()
+    stripped = text.lstrip("0") or text
+    return {f for f in (text, stripped, text.casefold(), stripped.casefold(),
+                        _id_key(text)) if f}
 
-        # ① 首选：**按取值**找检查号列（不依赖列名，见 _best_id_column_by_values）
-        if known_ids:
+
+def _case_record(out: dict[str, dict], case_id: str, create: bool = True) -> dict | None:
+    """取（必要时新建）某检查号的病例记录，并把**它的所有键形式都指到同一个对象**。
+
+    序列级 / ROI 级的行要挂到病例上，而病例记录可能还没被创建
+    （表里只有序列级 / ROI 级 sheet），也可能已由检查级别 sheet 建好 ——
+    两条路径必须落到**同一个 dict**，否则后挂的子行会凭空消失。
+
+    ``create=False`` 时只认**已存在**的病例（找不到返回 ``None``）：用于
+    "检查号列是靠列名猜出来的"这种不够可靠的场景，避免把 ``SeriesId`` 之类的
+    取值当成检查号、凭空造出一批假病例。
+    """
+    forms = _key_forms(case_id)
+    record = next((out[k] for k in forms if k in out), None)
+    if record is None:
+        if not create:
+            return None
+        record = {}
+    for key in forms:
+        out[key] = record
+    return record
+
+
+def _fill_gaps(base: dict, record: dict) -> None:
+    """把 ``record`` 里**非空、且 base 还没有**的列填进 base（先到的值优先）。
+
+    多个 sheet 都可能带病例级字段时用它合并：后一张表只补空，
+    不会用空值 / 粗粒度取值把前面（权威）的表覆盖掉。
+    """
+    for col, value in record.items():
+        if isinstance(value, list):                                # 子行列表：合并而非覆盖
+            base.setdefault(col, []).extend(value)
+            continue
+        if value == "" or base.get(col, "") != "":
+            continue
+        base[col] = value
+
+
+#: 允许从序列级 / ROI 级子行"提"到病例级的**标签列**（三组：各取一个；见 :func:`_promote_case_labels`）。
+#:
+#: 只认这三组，是因为**只有丢它们才会静默缩小评测分母**（``TumorProbability`` / ``WHO_Grade``
+#: 直接从这三组来）。其余字段本来就该留在各自级别上，见 :func:`_promote_case_labels`。
+_CASE_LABEL_COLUMN_GROUPS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("病理结果", "pathology", "病理"), ()),
+    (("WHO分级", "WHO_grade", "WHO grade", "分级"), ("病理", "pathology")),
+    (("glioma_with_label", "胶质瘤"), ()),
+)
+
+
+def _promote_case_labels(out: dict[str, dict]) -> None:
+    """把序列级 / ROI 级子行里**取值一致**的**标签列**补进病例级（只补，不覆盖已有值）。
+
+    为什么需要：病例**只出现在**序列级 / ROI 级 sheet 里时（``检查级别`` sheet 没这一行），
+    病例记录是**空的** —— 而官方表同样把 ``Study->CLINICAL->病理结果`` 放在
+    **ROI 级别 sheet 的 AQ 列**。整条丢掉的表现是"这一例没有金标准"：
+    评测分母悄悄变小、还不报错。
+
+    为什么**只提标签列**、而不是把整行兜进去（试过，是错的）：
+        序列级 / ROI 级是"**一例多行**"，除标签外的列本来就**逐行不同**。实测复现数据里
+        同一病例的两条序列行 ``Signal_T2WI`` 分别是 ``High`` / ``Low`` —— 整行兜底会
+        **任取一行**当金标准，表现是"读到了值、而且是错的"，比读不到更难查。
+        所以这里：
+
+    * 只认**标签列**（病理结果 / WHO 分级 / Glioma）；
+    * 该列在本病例**所有**子行里的非空取值必须完全一致，不一致就整体不采纳并告警；
+    * ``检查级别`` sheet 已给非空值的（同末段列名）一律不动 —— 它才是权威（见 README §2.2）。
+    """
+    done: set[int] = set()
+    for rec in out.values():
+        if id(rec) in done:                                        # 同一记录有多个别名键
+            continue
+        done.add(id(rec))
+        rows = [r for key in LEVEL_NESTED_KEY.values() for r in (rec.get(key) or [])]
+        if not rows:
+            continue
+        for keywords, exclude in _CASE_LABEL_COLUMN_GROUPS:
+            values: set[str] = set()
+            col_name = ""
+            for row in rows:
+                col = _find_col(row, list(keywords),
+                                list(exclude) if exclude else None)
+                if not col:
+                    continue
+                col_name = col_name or col
+                text = str(row.get(col) if row.get(col) is not None else "").strip()
+                if text:
+                    values.add(text)
+            if not values:
+                continue
+            if len(values) > 1:                                    # 子行自相矛盾：不猜
+                print(f"[labels][告警] 子行里 {col_name!r} 取值不一致 "
+                      f"{sorted(values)}，不提升为病例级（避免任取一行当金标准）",
+                      flush=True)
+                continue
+            leaf = _column_leaf(col_name).casefold()
+            same_leaf = [k for k in rec
+                         if not _is_nested_key(k)
+                         and _column_leaf(k).casefold() == leaf]
+            if any(str(rec.get(k) or "").strip() for k in same_leaf):
+                continue                                           # 检查级别已给：权威
+            value = next(iter(values))
+            if same_leaf:
+                rec[same_leaf[0]] = value                          # 填掉同字段列的空格
+            else:
+                rec[col_name] = value
+
+
+def _sheet_plan(rows: list[list[str]], level: str, known_ids: set[str] | None,
+                ) -> tuple[list[str], int, int, str] | None:
+    """定出这张表的 ``(表头, 数据起始行, 行键列, 实际级别)``；认不出来返回 ``None``。
+
+    分两套走，因为各级别 sheet 的**行键不同**：
+
+    * ``case``：行键是**检查号** —— 先按取值比对磁盘目录名
+      （不看列名，最可靠），不行再退回按列名认；
+    * ``series`` / ``roi``：行键是**序列号 / ROI 名** —— 只能按列名认。
+      这两级 sheet 里没有检查号行键，若还按老逻辑"必须含检查号列"，
+      整张表会判成"找不到表头"→ 0 行。
+
+    返回的级别可能与入参 ``level`` 不同：工作表名认不出来（``unknown``）时，
+    这里会**按行键列名回退判级**（见下方 ``_FALLBACK_LEVELS``）。
+    调用方必须用返回的这个级别去决定"这行怎么挂" —— 工作表名只是线索，
+    表头列才是事实。
+    """
+    if level == "unknown":
+        # 工作表名认不出级别（``Sheet1`` / ``序列信息`` / ``病灶`` / 空名…）时，
+        # 按"这张表有哪种行键列"判级，顺序**由具体到宽泛**：
+        # ROI 级最具体（有 ROI 名）→ 序列级（有序列号）→ 检查级（只有检查号）。
+        #
+        # 顺序反了的代价：序列级 / ROI 级 sheet 里**同样有检查号列**（要把子行挂到
+        # 病例上），若先按检查号判成 case，同病例的多行会互相覆盖 ——
+        # 字段看着有值、实际只留最后一行，且不报任何错。
+        for cand in _FALLBACK_LEVELS:
+            found = _sheet_plan(rows, cand, known_ids)
+            if found is not None:
+                return found[0], found[1], found[2], cand
+        return None
+
+    if level == "case":
+        if known_ids:                                              # ① 按取值找检查号列
             found = _best_id_column_by_values(rows, known_ids)
             if found is not None:
                 id_col, first_data = found
                 head = _header_row_above(rows, first_data)
                 if head is not None:
-                    header = [str(c).strip() for c in rows[head]]
-                data_start = first_data
+                    return ([str(c).strip() for c in rows[head]], first_data, id_col,
+                            "case")
+        head = _detect_header(rows, level="case")                   # ② 按列名找
+        if head is None:
+            return None
+        header = [str(c).strip() for c in rows[head]]
+        id_name = _find_id_column(header)
+        if not id_name:
+            return None
+        return header, head + 1, header.index(id_name), "case"
 
-        # ② 退化：按列名找（离线单独解析、或表里本来就没有磁盘上的检查号时）
-        if data_start is None:
-            head = _detect_header(rows)
-            if head is None:
-                continue
-            header = [str(c).strip() for c in rows[head]]
-            id_name = _find_id_column(header)
-            if not id_name:
-                continue
-            id_col = header.index(id_name)
-            data_start = head + 1
+    key_cols = LEVEL_KEY_COLUMNS[level]
+    head = _detect_header(rows, level=level)
+    if head is None:
+        return None
+    header = [str(c).strip() for c in rows[head]]
+    key_col = _find_col_in_list(header, key_cols)
+    if key_col is None:
+        return None
+    return header, head + 1, key_col, level
 
+
+#: 工作表名判不出级别时的回退判级顺序（具体 → 宽泛，理由见 :func:`_sheet_plan`）。
+_FALLBACK_LEVELS: tuple[str, ...] = ("roi", "series", "case")
+
+
+def _find_case_column(rows: list[list[str]], header: list[str], key_col: int,
+                      known_ids: set[str] | None) -> tuple[int | None, bool]:
+    """在**序列级 / ROI 级**表里找"检查号列" → ``(列号, 是否可信)``。
+
+    找不到返回 ``(None, False)``，那批子行就只能是"挂不上病例"。
+
+    为什么两套、还带回一个"可信"标志：
+
+    * **按取值**（可信）：拿磁盘上的检查号去比对，不看列名 —— 命中了就是真检查号列，
+      用它建病例记录是安全的；
+    * **按列名**（不可信）：离线看表（没有 ``known_ids``）时的兜底，用的是
+      :data:`_CASE_COLUMN_STRICT` 这套**更严**的名字。既然只是猜的，就
+      **只挂到已存在的病例上**（``create=False``）—— 猜错时最多丢几行，
+      而不会凭 ``SeriesId`` 造出一批字段全空的假病例。
+
+    无论哪套都必须排除 ``key_col``：序列级表的 ``序列号`` 满足宽松关键词里的
+    ``id`` / ``编号``（包含匹配），一不小心就把行键当检查号。
+    """
+    if known_ids:
+        found = _best_id_column_by_values(rows, known_ids)
+        if found is not None and found[0] != key_col:
+            return found[0], True
+    col = _find_col_in_list(header, _CASE_COLUMN_STRICT)
+    if col is not None and col != key_col:
+        return col, False
+    return None, False
+
+
+def read_structured_table(path: str, known_ids: set[str] | None = None) -> dict[str, dict]:
+    """读结构化金标准表（csv 或 xlsx）→ ``{检查号: {列名: 值}}``。
+
+    同一文件里可能**按级别分成多张工作表**（``脑胶质瘤标注结果-训练集.xlsx``
+    就是 ``检查级别`` / ``序列级别`` / ``ROI级别`` 三张），四个坑各自有对策：
+
+    1. **表头行不固定**：排版是 ``标题行/索引信息 → 空行/说明 → 真正的表头``，
+       每个 sheet 还不一样（第 1 行、第 2 行、第 3 行都可能是索引信息），
+       而 ``pandas.read_excel`` 默认把第一行当表头 —— 列名成了"标题/Unnamed"、
+       检查号列认不出来，整表解析出 **0 行**。这里改为**扫描前若干行**找表头
+       （见 :func:`_detect_header`：必须含该级别的行键列，字段线索最多者胜），
+       不假设它在第几行。
+    2. **多工作表 + 级别判定**：默认只读第一个 sheet；这里遍历全部 sheet。
+       级别先按**工作表名**判（见 :func:`_sheet_level`），名字认不出来
+       （``Sheet1`` / ``序列信息`` / 空名）再按**表头列**回退判级
+       （ROI 名 → 序列号 → 检查号，见 :func:`_sheet_plan` 的 ``_FALLBACK_LEVELS``）。
+       只看工作表名是不够的：认不出时一张序列级 sheet 会被当成检查级别 ——
+       同病例的多行互相覆盖，字段看着有值、实际只留最后一行，且不报错。
+    3. **行键不同**：检查级别一例一行（键=检查号）、序列级别一例多行
+       （键=检查号+序列号）、ROI 级别更多行（键=+ROI 名）。全按检查号合并会让
+       同病例的后续行**互相覆盖** —— 字段看着有值，实际来自最后一行（序列级），
+       病例级字段全丢，且不报任何错误。所以序列级 / ROI 级的行**原样挂**在病例
+       记录的 ``__series_rows__`` / ``__roi_rows__`` 下，不参与字段映射。
+    4. **检查号大小写**：目录名是小写哈希、表里可能是大写，
+       因此大小写折叠后的键也一并登记。
+
+    一行都没解析出来时会打印告警（含表头预览 + 整表摊开），
+    而不是只给上层返回一个空字典。
+    """
+    out: dict[str, dict] = {}
+    sheets = _sheet_frames(path)
+    # 先给每张工作表"定级别 + 定表头"，再按**实际级别**排序：
+    # 检查级别先合并（病例级字段以它为准），序列 / ROI 级只做嵌套保留。
+    #
+    # 为什么排序也用实际级别：工作表名可能认不出来（``Sheet1`` / ``序列信息`` /
+    # 甚至空名），此时级别由表头列决定（见 :func:`_sheet_plan` 的回退判级）。
+    # 若排序仍按表名，认不出名字的**检查级别** sheet 会被排到序列级之后，
+    # 它的病例级字段只能"补空"（``_fill_gaps``）——权威取值被前一张表压住。
+    prepared: list[tuple[int, str, list[list[str]], str, tuple | None]] = []
+    for idx, (name, rows) in enumerate(sheets):
+        named = _sheet_level(name)
+        prepared.append((idx, name, rows, named,
+                         _sheet_plan(rows, named, known_ids) if rows else None))
+    ordered = sorted(prepared,
+                     key=lambda p: (_LEVEL_ORDER[p[4][3] if p[4] else p[3]], p[0]))
+    stats: list[str] = []
+    for _, sheet_name, rows, named_level, plan in ordered:
+        if not rows:
+            continue
+        label = sheet_name or f"sheet{len(stats)}"
+        if plan is None:
+            extra = ("（表名认不出级别，已按 ROI→序列→检查 顺序试过行键列）"
+                     if named_level == "unknown" else "")
+            stats.append(f"{label}={named_level}/表头未识别{extra}")
+            continue
+        header, data_start, key_col, level = plan
+        # 表名与表头列不一致时以表头列为准，并在统计里标出来（否则会让人以为走错了分支）
+        shown = level if level == named_level else f"{level}（表名判为 {named_level}）"
+        nested_key = LEVEL_NESTED_KEY.get(level)
+        # 序列级 / ROI 级：还得分清"哪一列是检查号"（好把子行挂到病例上）。
+        # 检查号列不可信时只挂已有病例（create=False），见 _find_case_column。
+        case_col: int | None = None
+        case_trusted = False
+        if nested_key is not None:
+            case_col, case_trusted = _find_case_column(rows, header, key_col, known_ids)
+
+        n_rows = n_dropped = 0
         for row in rows[data_start:]:
             if not any(str(c).strip() for c in row):
                 continue                                          # 跳过空行
-            record: dict[str, str] = {
-                col: (str(row[i]).strip() if i < len(row) else "")
-                for i, col in enumerate(header) if col
-            }
-            if not record:                                        # 表头认不出：用列号占位
-                record = {f"col{i}": (str(row[i]).strip() if i < len(row) else "")
-                          for i in range(len(row))}
-            value = str(row[id_col]).strip() if id_col < len(row) else ""
-            if not value:
+            key_value = str(row[key_col]).strip() if key_col < len(row) else ""
+            if not key_value:
                 continue
-            stripped = value.lstrip("0") or value
-            # 登记**归一化键**：目录名可能是 `C0E1F8F2-53BA-45BE`，表里是
-            # `c0e1f8f253ba45be`（或反之），只有原始形式会一条都查不到。
-            for key in {value, stripped, value.casefold(), stripped.casefold(),
-                        _id_key(value)}:
-                out[key] = record
+            record = _row_to_record(header, row)
+            if nested_key is None:
+                forms = _key_forms(key_value)
+                if not forms:                                     # 取值归一化后空：无意义行
+                    n_dropped += 1
+                    continue
+                for key in forms:
+                    if key not in out:
+                        out[key] = record
+                    else:
+                        _fill_gaps(out[key], record)
+            else:
+                attach = (str(row[case_col]).strip()
+                          if case_col is not None and case_col < len(row) else "")
+                target = (_case_record(out, attach, create=case_trusted)
+                          if attach else None)
+                if target is None:                                # 挂不上病例：不进结果
+                    n_dropped += 1
+                    continue
+                target.setdefault(nested_key, []).append(record)
+            n_rows += 1
+        stats.append(f"{label}={shown}/{n_rows} 行"
+                     + (f"（{n_dropped} 行挂不到病例）" if n_dropped else ""))
+
+    _promote_case_labels(out)
+
+    if stats:
+        print(f"[labels] {os.path.basename(path)} 分级解析：" + "，".join(stats)
+              + f" → {len({id(v) for v in out.values()})} 例", flush=True)
 
     if not out and path not in _WARNED_TABLES:
         _WARNED_TABLES.add(path)
         diag = _diagnose_id_columns(sheets, {_id_key(k) for k in (known_ids or ())})
         print(f"[labels][告警] {os.path.basename(path)} 未解析出任何行。\n"
-              f"  已尝试：按取值比对检查号列 → 按列名识别 → 跳过标题行 → 遍历全部工作表。\n"
+              f"  已尝试：按工作表名分级 → 按取值比对检查号列 → 按列名识别行键 → 跳过标题行。\n"
               + (diag + "\n" if diag else "")
               + f"  下面把表整个摊开，直接看它长什么样：\n{dump_table(path)}", flush=True)
     return out
 
 
-def _find_col(row: dict, keywords: list[str], exclude: list[str] | None = None) -> str | None:
-    """列名匹配：精确 → 前缀 → 包含；``exclude`` 用于排除干扰列（如 *_pattern）。
+def _is_nested_key(key: Any) -> bool:
+    """是不是"序列级 / ROI 级子行"挂载用的保留键（``__series_rows__`` 之类）。
 
-    早期版本直接"包含匹配"会让 ``t1wi_c_enhan`` 命中 ``tumor_t1wi_c_enhan_pattern``，
-    导致 Enhancement 字段永远拿不到金标准。
+    它们**不是真实列**，字段映射必须跳过：否则子行列表会被当成字段取值，
+    或反过来被 ``_find_col`` 的包含匹配命中（``__series_rows__`` 里就含 "series"）。
+    """
+    return str(key).startswith("__")
+
+
+def _find_col(row: dict, keywords: list[str], exclude: list[str] | None = None) -> str | None:
+    """列名匹配：**先按分层列名末段、再按整串**；每轮内部 精确 → 前缀 → 包含。
+
+    ``exclude`` 用于排除干扰列（如 ``*_pattern``）。早期版本直接"包含匹配"会让
+    ``t1wi_c_enhan`` 命中 ``tumor_t1wi_c_enhan_pattern``，Enhancement 永远拿不到金标准。
+
+    末段优先：官方表的列名是字段路径（``Study->CLINICAL->病理结果``），末段才是字段名；
+    整串匹配会让父段里的关键词抢列（见 :func:`_column_leaf`）。
     """
     ex = [e.lower() for e in (exclude or [])]
-    lower = {str(k).strip().lower(): k for k in row}
-    for kw in keywords:                                            # 1) 精确
-        if kw.lower() in lower:
-            return lower[kw.lower()]
-    for kw in keywords:                                            # 2) 前缀
-        for k in row:
-            kl = str(k).strip().lower()
-            if kl.startswith(kw.lower()) and not any(e in kl for e in ex):
-                return k
-    for kw in keywords:                                            # 3) 包含
-        for k in row:
-            kl = str(k).strip().lower()
-            if kw.lower() in kl and not any(e in kl for e in ex):
-                return k
+    items = [(str(k).strip(), k) for k in row if not _is_nested_key(k)]
+    full: dict[str, Any] = {text.lower(): key for text, key in items}
+    leaf: dict[str, Any] = {}
+    for text, key in items:
+        leaf.setdefault(_column_leaf(text).lower(), key)
+    for table in (leaf, full):                                     # 末段 → 整串
+        for kw in keywords:                                        # 1) 精确
+            if kw.lower() in table:
+                return table[kw.lower()]
+        for kw in keywords:                                        # 2) 前缀
+            for low, key in table.items():
+                if low.startswith(kw.lower()) and not any(e in low for e in ex):
+                    return key
+        for kw in keywords:                                        # 3) 包含
+            for low, key in table.items():
+                if kw.lower() in low and not any(e in low for e in ex):
+                    return key
     return None
 
 
@@ -845,7 +1257,7 @@ def _official_columns_to_fields(row: dict) -> dict[str, Any]:
     Morphology / Signal_T2WI / Signal_FLAIR / Location``，
     与模拟集的中文列名是两套东西。之前只写中文关键词，官方表自然一条也映射不出来。
     """
-    lower = {str(k).strip().lower(): k for k in row}
+    lower = {str(k).strip().lower(): k for k in row if not _is_nested_key(k)}
     out: dict[str, Any] = {}
     for column, field in OFFICIAL_FIELD_COLUMNS.items():
         key = lower.get(column.lower())
@@ -870,6 +1282,29 @@ def _official_columns_to_fields(row: dict) -> dict[str, Any]:
     return out
 
 
+def _grade_from_text(text: Any) -> str | None:
+    """从任意写法里抠 WHO 级别 → ``"1".."4"``（认不出返回 ``None``）。
+
+    同一件事在表里有四种写法：``4`` / ``4级`` / ``Ⅳ`` / ``IV``。只做精确匹配
+    （:data:`GRADE_MAP` 的 ``脑胶质瘤N级``）时，``胶质瘤WHO 4级`` 这类写法整条丢掉 ——
+    字段缺失会被静默当成"这一例没有金标准"，指标分母悄悄变小，看起来一切正常。
+    """
+    t = str(text if text is not None else "").strip()
+    if not t:
+        return None
+    m = re.search(r"([1-4])\s*级", t)                              # `4级` / `WHO 4 级`
+    if m:
+        return m.group(1)
+    m = re.search(r"([ⅠⅡⅢⅣ])", t)                                 # 全角 `Ⅳ级`
+    if m:
+        return _CIRCLED_GRADE[m.group(1)]
+    t2 = t.replace(".0", "").strip()                               # Excel 常读成 `4.0`
+    if t2 in _ROMAN_GRADE.values():
+        return t2
+    m = re.search(r"\b(iv|iii|ii|i)\b", t, re.IGNORECASE)          # 罗马数字 `IV`
+    return _ROMAN_GRADE[m.group(1).lower()] if m else None
+
+
 def structured_from_row(row: dict) -> dict:
     """金标准一行 → 规范字段（缺失字段不出现在结果里 → 训练时自动 mask 掉）。
 
@@ -887,8 +1322,24 @@ def structured_from_row(row: dict) -> dict:
         if patho in GRADE_MAP:
             out["WHO_Grade"] = GRADE_MAP[patho]
             out["TumorProbability"] = 1
+        elif "胶质瘤" in patho:
+            # 更松的写法：`胶质瘤WHO 4级` / `胶质瘤Ⅳ级` / 只写 `胶质瘤`（级别在另一列）。
+            # 先认病名（含"胶质瘤"就是阳性），级别能从文字里抠出来就顺手用上。
+            out["TumorProbability"] = 1
+            grade = _grade_from_text(patho)
+            if grade:
+                out["WHO_Grade"] = grade
         elif patho in NON_GLIOMA or any(k in patho for k in ("转移", "脓肿", "梗死", "无")):
             out["TumorProbability"] = 0
+
+    if "WHO_Grade" not in out:
+        # 级别单独占一列的表（`WHO分级` / `分级`，取值 1~4 或 I~IV）
+        grade_col = _find_col(row, ["WHO分级", "WHO_grade", "WHO grade", "分级"],
+                              exclude=["病理", "pathology"])
+        grade = _grade_from_text(row.get(grade_col)) if grade_col else None
+        if grade:
+            out["WHO_Grade"] = grade
+            out.setdefault("TumorProbability", 1)
 
     gl = row.get(_find_col(row, ["glioma_with_label", "胶质瘤"]) or "", "")
     if gl in ("是", "否"):
@@ -937,8 +1388,8 @@ norm_key = _norm_key
 def build_uid_index(series_types: dict | None) -> dict[str, str]:
     """``{(检查号, 序列号): 类型}`` → ``{序列号: 类型}``（UID 单键回退索引）。
 
-    为什么需要它：``3_serieslabel.xlsx`` 的**检查号列**与磁盘上的病例目录名并非
-    总能对上（平台匿名化口径不同、前导零、目录名是哈希而表里是原始检查号），
+    为什么需要它：类型表的**检查号列**与磁盘上的病例目录名并非总能对上
+    （平台匿名化口径不同、前导零、目录名是哈希而表里是原始检查号），
     而 **SeriesUid 与影像同源**，是两边唯一必然一致的键。精确键查不到时按 UID
     单键回退，能把整批"看起来没模态"的病例救回来。
 
@@ -978,19 +1429,19 @@ def lookup_series_type(series_types: dict | None, accession: str = "",
 def describe_modality_sources(root: str | os.PathLike | None = None) -> str:
     """一句话自检"模态来源现在什么状态"（专供报错文案，省掉一轮来回排查）。
 
-    形如 ``类型表 SeriesType.xlsx=<路径>；类型表 3_serieslabel.xlsx=<路径或"未找到">；
-    体素判别模型 <路径>=存在/缺失``。两种来源都不可用时，任何模态相关报错都会附带它
-    —— 用户立刻能分清是"表没接上"还是"体素模型没装"，不必猜。
+    形如 ``数据信息表 SeriesType.xlsx=<路径或"未找到">；体素判别模型 <路径>=存在/缺失``。
+    两者都不可用时，任何模态相关报错都会附带它 —— 用户立刻能分清是"表没接上"
+    还是"体素模型没装"，不必猜。
 
     ``root`` 传**病例目录**也行：候选目录含数据根/父/祖父，正好覆盖到
     ``training/annotation/``（``SeriesType.xlsx`` 与病例目录同层）。
     """
     found = [(name, find_named_table(name, root)) for name in SERIES_TYPE_FILENAMES]
-    table_desc = "；".join(f"类型表 {name}={path}" for name, path in found if path)
+    table_desc = "；".join(f"数据信息表 {name}={path}" for name, path in found if path)
     if not table_desc:
-        table_desc = ("类型表 SeriesType.xlsx / 3_serieslabel.xlsx=均未找到（已搜 "
-                      "$GLIOMA_LABELS_DIR、<工程>/labels、$WORKSPACE 下 3 层、数据根/父/祖父；"
-                      "平台数据里这张表与病例目录同层，叫 SeriesType.xlsx）")
+        table_desc = (f"数据信息表 {SERIES_TYPE_TABLE}=未找到（已搜 "
+                      "$GLIOMA_LABELS_DIR、<工程>/labels、$WORKSPACE 下 3 层、数据根/父/祖父"
+                      "+ 像标注容器的子目录；它就在数据里、与病例目录同层）")
     try:
         from .modality_model import DEFAULT_MODEL_PATH
         model_desc = (f"体素判别模型 {DEFAULT_MODEL_PATH}="
@@ -1021,6 +1472,92 @@ def has_strict_mask_hint(text: str) -> bool:
 _WARNED_SERIES_TYPE_DEP = False
 
 
+#: 类型表的列名候选（顺序即优先级；用**包含**匹配，故短词靠后）。
+_SERIES_TYPE_ALIASES: dict[str, tuple[str, ...]] = {
+    "acc": ("accessionnumber", "accession", "检查号", "检查编号", "病例号"),
+    "uid": ("seriesinstanceuid", "seriesuid", "序列号", "序列uid"),
+    "typ": ("seriestype", "type", "序列类型", "模态", "序列描述"),
+}
+
+#: "像模态取值"的前缀（用于**按取值**找类型列，见 :func:`_sniff_series_type_columns`）。
+#: 配上长度上限后，检查号 / 序列号这类长串一律不会命中。
+_MODALITY_VALUE_TOKENS = (
+    "t1", "t1c", "t1ce", "t1wi", "t1w", "t2", "t2w", "t2wi", "t2flair", "flair",
+    "其他", "其它", "other", "none", "无", "增强", "平扫", "adc", "dwi",
+)
+#: 模态取值的长度上限：``T1CE（增强）`` 也就 8 个字符，长串必不是模态。
+_MODALITY_VALUE_MAXLEN = 16
+
+
+def _looks_like_modality_value(value) -> bool:
+    """该单元格"看着像模态取值"吗（专供列名认不出时的取值嗅探）。"""
+    text = re.sub(r"[\s\-_/]+", "", str(value if value is not None else "")).casefold()
+    if not text or len(text) > _MODALITY_VALUE_MAXLEN:
+        return False
+    return any(text == tok or text.startswith(tok) for tok in _MODALITY_VALUE_TOKENS)
+
+
+def _looks_like_series_type_header(acc, uid, typ) -> bool:
+    """这三个取值是不是"类型表的表头行"。
+
+    多张工作表拼成一个 ``rows`` 后，**每张表都带一遍表头**；不跳过就会出现
+    ``(accessionnumber, seriesuid) → SeriesType`` 这种拿表头文字当数据的脏条目。
+    """
+    def _hit(value, keys: tuple[str, ...]) -> bool:
+        text = _norm_key(value)
+        return bool(text) and any(k in text for k in keys)
+
+    return (_hit(acc, _SERIES_TYPE_ALIASES["acc"])
+            and _hit(uid, _SERIES_TYPE_ALIASES["uid"])
+            and _hit(typ, _SERIES_TYPE_ALIASES["typ"]))
+
+
+def _sniff_series_type_columns(rows: list[list], max_scan: int = 300
+                               ) -> tuple[int, int, int] | None:
+    """**不看列名**，按取值找出 ``(检查号列, 序列号列, 类型列)``；认不出返回 ``None``。
+
+    为什么需要它：列名是唯一会被"改版"的东西 —— 前两列写成 ``序号/影像编号``、
+    加了索引列、或者干脆是 ``A/B/C``，按列名匹配就一条也读不到，
+    而**取值**不会变（检查号、DICOM UID、5 类模态取值）。
+
+    判据（全在取值上，不需要任何外部信息）：
+
+    * **类型列**：该列非空取值里"像模态取值"的比例最高且 ≥ 0.5；
+    * **序列号列**：剩下两列里，取值含 ``.``（DICOM UID）比例更高 /
+      平均更长的那个；
+    * **检查号列**：另一个。
+
+    找不到（例如整表只有两列、或该列取值是自由文本）就返回 ``None``，
+    绝不在没有把握时硬凑 —— 凑错会把整表挂到错误的键上，比读不到更难查。
+    """
+    body = [r for r in rows[:max_scan] if any(str(c).strip() for c in r)]
+    if len(body) < 3:
+        return None
+    width = max(len(r) for r in body)
+    if width < 3:
+        return None
+    cols = [[str(r[c]).strip() for r in body if c < len(r) and str(r[c]).strip()]
+            for c in range(width)]
+    ratio = [(sum(1 for v in vals if _looks_like_modality_value(v)) / len(vals)
+              if vals else 0.0) for vals in cols]
+    typ_col = max(range(width), key=lambda c: (ratio[c], len(cols[c])))
+    if ratio[typ_col] < 0.5:
+        return None
+    rest = [c for c in range(width) if c != typ_col and cols[c]]
+    if len(rest) < 2:
+        return None
+
+    def dotted(c: int) -> float:
+        return sum(1 for v in cols[c] if "." in v) / len(cols[c])
+
+    def mean_len(c: int) -> float:
+        return sum(len(v) for v in cols[c]) / len(cols[c])
+
+    rest.sort(key=lambda c: (dotted(c), mean_len(c)), reverse=True)
+    uid_col, acc_col = rest[0], rest[1]
+    return acc_col, uid_col, typ_col
+
+
 def read_series_types(root: str | os.PathLike,
                       labels_dir: str | os.PathLike | None = None
                       ) -> dict[tuple[str, str], str]:
@@ -1030,32 +1567,34 @@ def read_series_types(root: str | os.PathLike,
     探针会把整批序列归到 ``other``，训练侧直接报 ``无任何可用序列`` ——
     而病例数、目录结构看起来完全正常，极易被误判成数据损坏或路径写错。
 
-    两个来源都读，**数据集那份优先**（同名表放在哪都能找到，见 :func:`label_search_dirs`）：
+    **只读数据集自带的 ``SeriesType.xlsx``** —— 与病例目录**同层**
+    （训练集 ``<阶段>/annotation/``、验证集 ``<阶段>/original/``）；
+    ``training`` / ``verification`` 的数据里都有，``evaluation_*`` 评测期
+    **随测试数据一起下发**。列 ``AccessionNumber / SeriesUid / SeriesType``，
+    取值 5 类：``T1`` / ``T1CE（增强）`` / ``T2-Flair`` / ``T2WI`` / ``其他``。
+    它不只在数据根那一层 —— 数据根指成**某一病例目录**或**填高一层**时也要能找到，
+    所以统一按候选目录搜（数据根/父/祖父 + 像标注容器的子目录，含 ``original/``）。
 
-    1. **``SeriesType.xlsx``（权威，就在数据集里）** ——
-       ``<阶段>/annotation/SeriesType.xlsx``，与病例目录同层；
-       ``training`` / ``verification`` 已下发，``evaluation_*`` 评测期**随测试数据一起下发**。
-       列 ``SeriesType ∈ {T1, T1CE（增强）, T2-Flair, T2WI, 其他}``。
-       它不只在数据根那一层 —— 数据根指成**某一病例目录**或**填高一层**时也要能找到，
-       所以统一按候选目录搜（数据根/父/祖父 + 像标注容器的子目录）。
-    2. **``3_serieslabel.xlsx``（兜底）** —— 团队工作区 ``labels/`` 下那份，
-       ``SeriesLabel ∈ {T1CE,T2,FLAIR}``。它**不是赛道四数据集的内容**，只是列结构同构，
-       仅在①读不到时补缺（``setdefault``），**绝不覆盖**①的取值。
+    读取上**不假设任何排版**：表头行是哪一行由"能否凑齐三列名"扫出来
+    （实测第 1 行，带标题/索引行的版本同样能认）；列名一条都不命中时
+    还会按**取值**嗅探三列（见 :func:`_sniff_series_type_columns`），
+    所以列名改版、前两列是索引列都读得到。
 
-    顺序为什么不能反：工作区那份与数据集无关，若它恰好也覆盖同一批检查号、取值却更粗
-    （例如只写 ``T2`` 而数据集写 ``T2WI`` 或 ``T2-Flair``），反过来会**静默覆盖**权威取值 ——
-    表现是"模态看着都认出来了，通道里却是错的对比度"，比直接报错难查得多。
+    **工作区那份 ``3_serieslabel.xlsx`` 一律不读**：它不是本赛道数据集的内容，
+    且取值更粗（只有 ``T1CE``/``T2``/``FLAIR``），一旦参与合并就会把 ``T2WI`` /
+    ``T2-Flair`` 静默压平、把 ``其他`` 变成假 ``FLAIR`` ——
+    表现是"模态看着都认出来了、通道里却是错的对比度"，比直接报错难查得多。
 
-    缺文件不是错误；同一文件内同键冲突取值**直接失败**（规范 §21）。
+    缺文件不是错误（返回空表，由上层报错时附自检）；同一文件内同键冲突取值
+    **直接失败**（规范 §21）。
     """
     global _WARNED_SERIES_TYPE_DEP
 
     out: dict[tuple[str, str], str] = {}
 
-    # ---- ① SeriesType.xlsx（**赛道四数据集里的就是这张**，权威取值）----
     path = find_named_table(SERIES_TYPE_TABLE, root, labels_dir)
     if not path:
-        return _read_legacy_series_types(out, root, labels_dir)
+        return out                                                # 表没接上：交给上层自检
 
     rows: list[list] = []
     try:
@@ -1077,33 +1616,62 @@ def read_series_types(root: str | os.PathLike,
                 print(f"[probe][告警] 发现 {path} 但既没有 openpyxl 也没有 pandas，"
                       f"序列类型读不到 → UID 命名的序列会全部归到 other。"
                       f"请 pip install openpyxl（{exc}）", flush=True)
-            return _read_legacy_series_types(out, root, labels_dir)
+            return out
 
-    aliases = {
-        "acc": ("accessionnumber", "accession", "检查号", "检查编号", "病例号"),
-        "uid": ("seriesinstanceuid", "seriesuid", "序列号", "序列uid"),
-        "typ": ("seriestype", "type", "序列类型", "模态", "序列描述"),
-    }
-    seen_here: dict[tuple[str, str], str] = {}                     # 只用于检测本文件内的冲突
+    aliases = _SERIES_TYPE_ALIASES
+    # ① 先按**列名**找表头行：哪一行能凑齐三列就用哪一行，不假设第几行
+    #    （实测表头就在第 1 行；标题/索引行占位的版本也照样能认出来）。
     idx: dict[str, int] = {}
-    for row in rows:
+    data_start = 0
+    for i, row in enumerate(rows):
         header = [_norm_key(c) for c in row]
-        if not idx:
-            for want, keys in aliases.items():
-                for i, h in enumerate(header):
-                    if any(k in h for k in keys):
-                        idx[want] = i
-                        break
-            if set(idx) == {"acc", "uid", "typ"}:
-                continue                                          # 表头行本身不入表
-            idx = {}
+        if not any(header):
             continue
+        found: dict[str, int] = {}
+        for want, keys in aliases.items():
+            for j, h in enumerate(header):
+                if any(k in h for k in keys):
+                    found[want] = j
+                    break
+        if set(found) == {"acc", "uid", "typ"}:
+            idx, data_start = found, i + 1
+            break
+    sniffed = False
+    if not idx:
+        # ② 列名一条都没命中（改版 / 前两列是索引 / 英文缩写）→ 按**取值**嗅探三列。
+        #    这是唯一不依赖列名的手段：检查号、DICOM UID、5 类模态取值本身就有形态，
+        #    而"列名"是唯一会被改版改掉的东西（含空格、全角括号、加后缀…）。
+        sniff = _sniff_series_type_columns(rows)
+        if sniff is None:
+            if not _WARNED_SERIES_TYPE_DEP:
+                _WARNED_SERIES_TYPE_DEP = True
+                print(f"[probe][告警] {os.path.basename(path)} 里既没找到 "
+                      f"AccessionNumber/SeriesUid/SeriesType 三列、也没能按取值嗅探出它们"
+                      f"（{path}）→ 序列类型读不到。请把表头行原样贴出来。", flush=True)
+            return out
+        acc_col, uid_col, typ_col = sniff
+        idx = {"acc": acc_col, "uid": uid_col, "typ": typ_col}
+        data_start = 0
+        sniffed = True
+        print(f"[labels][告警] {os.path.basename(path)} 的列名未识别 → 已按取值定位："
+              f"检查号=第 {acc_col + 1} 列、序列号=第 {uid_col + 1} 列、"
+              f"类型=第 {typ_col + 1} 列（读到 {len(rows)} 行）。"
+              f"若取值明显不对，把表的前几行贴出来。", flush=True)
+
+    seen_here: dict[tuple[str, str], str] = {}                     # 只用于检测本文件内的冲突
+    for row in rows[data_start:]:
         try:
             acc, uid, typ = row[idx["acc"]], row[idx["uid"]], row[idx["typ"]]
         except IndexError:
             continue
         if acc in (None, "") or uid in (None, "") or typ in (None, ""):
             continue
+        if sniffed:
+            # 嗅探模式下靠取值过滤：表头行、说明行的"类型"取值不像模态
+            if not _looks_like_modality_value(typ):
+                continue
+        elif _looks_like_series_type_header(acc, uid, typ):
+            continue                                              # 多 sheet 拼接出的重复表头
         key = (_norm_key(acc), _norm_key(uid))
         value = str(typ).strip()
         if not value:
@@ -1113,37 +1681,10 @@ def read_series_types(root: str | os.PathLike,
                 f"SeriesType.xlsx 冲突：检查号={acc!r} 序列={uid!r} "
                 f"同时映射到 {seen_here[key]!r} 与 {value!r}（{path}）")
         seen_here[key] = value
-        out[key] = value                                          # 数据集那份 = 权威取值
+        out[key] = value
     if seen_here:
         print(f"[labels] 已读序列类型表 {os.path.basename(path)}：{len(seen_here)} 条"
               f"（{path}）", flush=True)
-    return _read_legacy_series_types(out, root, labels_dir)
-
-
-def _read_legacy_series_types(out: dict[tuple[str, str], str],
-                              root: str | os.PathLike,
-                              labels_dir: str | os.PathLike | None
-                              ) -> dict[tuple[str, str], str]:
-    """补读团队工作区那份 ``3_serieslabel.xlsx``：**只补缺，不覆盖** ``out``。
-
-    它**不是赛道四数据集的内容**（属工作区里另一个目标的产物），列结构恰好同构，
-    所以留作兜底；一旦数据集的 ``SeriesType.xlsx`` 给了同一个 ``(检查号, 序列号)``
-    的取值，就以数据集为准（``key not in out`` 判断）。
-    """
-    legacy = find_named_table(SERIES_TYPE_TABLE_LEGACY, root, labels_dir)
-    if not legacy:
-        return out
-    added = 0
-    for (acc, uid), value in read_serieslabel_table(legacy).items():
-        # 查表方统一用 _norm_key（去空白 + 大小写无关），这里也要归一化后再存，
-        # 否则"表里大写、目录里小写"会静默查不到
-        key = (_norm_key(acc), _norm_key(uid))
-        if key not in out:
-            out[key] = value
-            added += 1
-    if added:
-        print(f"[labels] 已读兼容类型表 {os.path.basename(legacy)}："
-              f"{added} 条（{legacy}；数据集里的 SeriesType.xlsx 优先）", flush=True)
     return out
 
 
@@ -1200,13 +1741,13 @@ def sidecar_desc(path: str | os.PathLike) -> str | None:
     return None
 
 
-#: 不是"结构化金标准"的表（按文件名排除）
 #: 非"字段金标准表"的文件名关键词（见 :func:`find_structured_tables`）。
-#: 两个序列类型表的命名（``SeriesType`` / ``3_serieslabel``）都在其中：
-#: 后者的列是 ``AccessionNumber/SeriesUid/SeriesLabel``，一行字段都映射不出来，
-#: 混进来只会让"解析出 N 行 / 有表但没解析出"这两句诊断互相矛盾。
-_NON_LABEL_TABLE_KW = ("seriestype", "series_type",          # 模态表（平台 + 团队两命名）
-                       "serieslabel", "series_label",        # 模态表（3_serieslabel.xlsx）
+#: 两个序列类型表的命名（数据集里的 ``SeriesType`` / 工作区那份 ``3_serieslabel``）
+#: 都在其中：它们的列是 ``AccessionNumber/SeriesUid/SeriesType|SeriesLabel``，
+#: 一行字段都映射不出来，混进来只会让"解析出 N 行 / 有表但没解析出"这两句诊断互相矛盾。
+#: （后者虽已不读，但仍要在**找表**时排除 —— 否则诊断计数还是会被它带偏。）
+_NON_LABEL_TABLE_KW = ("seriestype", "series_type",          # 模态表（数据集自带）
+                       "serieslabel", "series_label",        # 模态表（工作区那份，已不读）
                        "masklabel", "mask_label",            # 掩膜名表（4_masklabel.xlsx）
                        "gold", "duplicate", "folds")
 

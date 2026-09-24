@@ -7,13 +7,18 @@
 
 本脚本分三段，全部用"可验证的已知答案"：
 
-  A. 留一折集成划分   直接调用 16_finalize.sh --print-split（测**真实实现**），
-                      断言：评估 fold f 时用的折集合 == 全部折 − {f}。
+  A. 评估划分口径     直接调用 16_finalize.sh --print-split（测**真实实现**）：
+                      无验证集 → 断言 fold f 用的折集合 == 全部折 − {f}；
+                      注入合成验证集清单 → 断言切到 external 且用**全部折**（不做留一）。
   B. OOF 划分完整性   断言：各折 val 互不相交、并集为全部病例
                       （这是"每一例恰好被评估一次"的前提）。
   C. OOF 语义端到端   注入 mock 模型与 mock 数据，让**输出值本身编码划分是否正确**：
                       若某病例被"它的 val 折对应的模型"评估 → 输出 1.0，否则 0.0。
                       因此"所有病例都是 1.0"等价于"OOF 划分完全正确"。
+  D. external 语义    注入 mock 与合成验证集清单（2 折），断言：清单内每一例都被评估、
+                      且每例都由**全部折**的集成预测（输出值 == 折数），scope=external。
+  E. external 取数    断言分割评估在 external 下：病例取自 manifest_val（不读 folds）、
+                      报告标记 split=external、无掩码病例被跳过并计数。
 
 用法::
 
@@ -54,31 +59,90 @@ def warn(name: str, detail: str = "") -> None:
 
 
 # --------------------------------------------------------------------------- #
-# A. 留一折集成的划分（调用真实实现）
+# A. 评估划分（调用真实实现，两种口径都要能解释）
 # --------------------------------------------------------------------------- #
-def part_a() -> None:
-    print("\nA 留一折集成：评估 fold f 时必须排除 fold f 自身")
+def _run_print_split(env_extra: dict | None = None) -> tuple[int, str]:
     sh = os.path.join(ROOT, "scripts", "16_finalize.sh")
+    # PYTHON=当前解释器：16_finalize.sh 内部要用 python 探验证集清单，
+    # 开发机上不一定存在名为 `python` 的可执行文件。
+    env = {**os.environ, "PYTHON": sys.executable, **(env_extra or {})}
     try:
-        out = subprocess.run(["bash", sh, "--print-split"], cwd=ROOT,
+        out = subprocess.run(["bash", sh, "--print-split"], cwd=ROOT, env=env,
                              capture_output=True, text=True, timeout=120)
     except Exception as exc:                                        # noqa: BLE001
-        check("16_finalize.sh --print-split 可执行", False, f"{type(exc).__name__}: {exc}")
-        return
-    if out.returncode != 0:
-        check("--print-split 正常退出", False, (out.stderr or "")[-200:])
-        return
+        return 255, f"{type(exc).__name__}: {exc}"
+    return out.returncode, (out.stdout or "") + (out.stderr or "")
 
+
+def _parse_split(out: str) -> tuple[str, dict[str, list[str]], list[str]]:
+    """解析 ``--print-split`` 输出 → ``(口径, 留一划分, external 列表)``。"""
+    mode = ""
     mapping: dict[str, list[str]] = {}
-    for line in out.stdout.splitlines():
+    ext: list[str] = []
+    for line in out.splitlines():
+        m = re.match(r"^\s*split=(\S+)\s*$", line.strip())
+        if m:
+            mode = m.group(1)
         m = re.match(r"^\s*fold(\d+):\s*(.*)$", line.strip())
         if m:
             mapping[f"fold{m.group(1)}"] = [x.strip() for x in m.group(2).split(",") if x.strip()]
+        m = re.match(r"^\s*external:\s*(.*)$", line.strip())
+        if m:
+            ext = [x.strip() for x in m.group(1).split(",") if x.strip()]
+    return mode, mapping, ext
 
-    if not mapping:
-        check("解析到划分结果", False, f"输出={out.stdout.strip()[:120]}")
+
+def _synthetic_val_manifest() -> tuple[str, dict]:
+    """造一份**最小可用**的验证集清单（只用于自检口径切换，绝不参与训练）。"""
+    from src.utils.config import data_source_tag
+    tmp = tempfile.mkdtemp(prefix="glioma_val_split_")
+    path = os.path.join(tmp, "manifest_val.json")
+    json.dump({"cases": [{"accession": "V1", "images": {"t1c": {"path": "/x.nii.gz"}},
+                          "masks": {}, "labels": {}, "dir": tmp}],
+               "special": {},
+               "data_source": data_source_tag(tmp, phase="val"),
+               "data_root": tmp},
+              open(path, "w", encoding="utf-8"))
+    return tmp, path
+
+
+def part_a() -> None:
+    print("\nA 评估划分：有验证集 → 全折集成；无验证集 → 留一折集成")
+
+    rc, out = _run_print_split()
+    if rc != 0:
+        check("16_finalize.sh --print-split 可执行", False, out.strip()[-200:])
         return
-    check("解析到划分结果", True, f"{len(mapping)} 折：{sorted(mapping)}")
+    mode, mapping, ext = _parse_split(out)
+    check("解析到口径标记 split=...", mode in ("oof", "external"), f"mode={mode or '?'}")
+
+    # ---- ② 注入合成验证集清单 → 必须切到 external，且列出**全部折**（不做留一）----
+    tmp, val_path = _synthetic_val_manifest()
+    rc2, out2 = _run_print_split({"VAL_MANIFEST": val_path})
+    if rc2 != 0:
+        check("注入验证集清单后 --print-split 可执行", False, out2.strip()[-200:])
+        return
+    mode2, mapping2, ext2 = _parse_split(out2)
+    if mode2 != "external":
+        check("给验证集清单后切到 external 口径", False, f"mode={mode2 or '?'} 输出={out2.strip()[:120]}")
+        return
+    check("给验证集清单后切到 external 口径", True)
+
+    from src.utils.config import fold_ckpts
+    expect = [os.path.basename(os.path.dirname(p)) for p in fold_ckpts()]
+    check("external 口径用**全部折**（不排除任何折）",
+          sorted(ext2) == sorted(expect), f"期望={expect} 实际={ext2}")
+    check("external 口径不输出留一划分", not mapping2, f"不应有 foldN 行：{mapping2}")
+
+    # ---- ① 当前环境的真实口径（开发机多半是 oof）----
+    if mode == "external":
+        check("当前环境：已接入官方验证集（external）", True,
+              f"折={ext}")
+        return
+    if not mapping:
+        check("解析到留一划分结果", False, f"输出={out.strip()[:120]}")
+        return
+    check("解析到留一划分结果", True, f"{len(mapping)} 折：{sorted(mapping)}")
 
     folds = sorted(mapping)
     ok_self, ok_all = True, True
@@ -229,7 +293,7 @@ def part_c() -> None:
     try:
         spec.loader.exec_module(mod)
         argv = sys.argv
-        sys.argv = ["15_eval_special_dup.py"]                     # 默认 OOF，无 --limit
+        sys.argv = ["15_eval_special_dup.py", "--split", "oof"]   # 本段测 OOF 语义
         try:
             rc = mod.main()
         finally:
@@ -263,11 +327,232 @@ def part_c() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# D. external 语义：每例都过**全部折**（不做留一）
+# --------------------------------------------------------------------------- #
+def part_d() -> None:
+    print("\nD external 语义：清单内每一例都由全部折的集成预测")
+    import src.data.dataset as DS
+    import src.inference.pipeline as PIPE
+    import src.inference.sliding as SLD
+    import src.inference.writer as WRITER
+
+    n_cases, n_folds = 4, 2
+    accs = [f"E{i:02d}" for i in range(n_cases)]
+    tmp = tempfile.mkdtemp(prefix="glioma_ext_")
+    man_path = os.path.join(tmp, "manifest_val.json")
+    json.dump({"cases": [{"accession": a, "images": {"t1c": {"path": "/x.nii.gz"}},
+                          "masks": {}, "labels": {}, "dir": tmp} for a in accs],
+               "special": {"fake_cases": [accs[0]], "composition_cases": [],
+                           "gold_pairs": []},
+               "data_source": "local/extselftest/val", "data_root": tmp},
+              open(man_path, "w", encoding="utf-8"))
+    ckpt_dir = os.path.join(tmp, "checkpoints")           # 伪造折权重（只做存在性检查）
+    for f in range(n_folds):
+        d = os.path.join(ckpt_dir, f"g4_fold{f}")
+        os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, "best.pth"), "w", encoding="utf-8").close()
+
+    def fake_load(case, cfg, cache_dir=None, log=None):
+        return np.zeros((1, 8, 8, 8), np.float32), np.eye(4), {}
+
+    class _FakePipe:
+        def __init__(self, ckpts, device=None):
+            self.n = len(ckpts)
+            self.models = list(range(self.n))
+            self.device = "cpu"
+            self.gcfg = {"out": 8, "size_mm": 8}          # 与 8³ 数据的物理尺寸一致
+            self.thresholds = [0.5, 0.5]
+
+    def fake_forward(models, x, combos, dtype, tta_batch=1):
+        import torch
+        n = float(len(models))                            # 输出值 = 用了几个模型的权重
+        return {"special": torch.tensor([[n, n]] * x.shape[0]),
+                "embed": torch.zeros(x.shape[0], 4),
+                "cls": [torch.zeros(x.shape[0], 1)]}
+
+    spec = importlib.util.spec_from_file_location(
+        "eval_sd_external", os.path.join(ROOT, "scripts", "15_eval_special_dup.py"))
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+
+    orig = (DS.load_case_cached, DS.brain_center, DS.global_view, PIPE.GliomaPipeline,
+            SLD._forward_batch, WRITER.case_fingerprint,
+            os.environ.get("VAL_MANIFEST"), os.environ.get("CKPT_DIR"))
+    DS.load_case_cached = fake_load
+    # 预处理/指纹与"划分口径"无关：全零体在真实实现里没有脑中心可定位，
+    # 这里用恒等实现保证本段只考察**划分与集成成员数**。
+    DS.brain_center = lambda vol: np.zeros(3, np.float32)
+    DS.global_view = lambda vol, ctr, mm, size: np.ascontiguousarray(vol, np.float32)
+    WRITER.case_fingerprint = lambda case: {}
+    PIPE.GliomaPipeline = _FakePipe
+    SLD._forward_batch = fake_forward
+    os.environ["VAL_MANIFEST"] = man_path
+    os.environ["CKPT_DIR"] = ckpt_dir
+
+    rc: int | None = None
+    try:
+        spec.loader.exec_module(mod)
+        argv = sys.argv
+        sys.argv = ["15_eval_special_dup.py", "--split", "external"]
+        try:
+            rc = mod.main()
+        finally:
+            sys.argv = argv
+    except Exception as exc:                                        # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        check("external 流程可执行", False, f"{type(exc).__name__}: {exc}")
+        return
+    finally:
+        (DS.load_case_cached, DS.brain_center, DS.global_view, PIPE.GliomaPipeline,
+         SLD._forward_batch, WRITER.case_fingerprint) = orig[:6]
+        for k, v in (("VAL_MANIFEST", orig[6]), ("CKPT_DIR", orig[7])):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    check("external 流程可执行", rc == 0, f"rc={rc}")
+
+    snap = getattr(mod, "_LAST_PROBS", None) or {}
+    p_fake = snap.get("fake") or {}
+    check("external：清单内每一例都被评估", len(p_fake) == n_cases, f"{len(p_fake)}/{n_cases}")
+    check("external：每例都用**全部折**集成（不做留一）",
+          bool(p_fake) and all(abs(float(v) - n_folds) < 1e-6 for v in p_fake.values()),
+          f"应={float(n_folds)} 实际={sorted({float(v) for v in p_fake.values()})}")
+    check("external：scope 与权重数写入快照",
+          snap.get("scope") == "external" and snap.get("n_ckpt") == n_folds,
+          f"scope={snap.get('scope')} n_ckpt={snap.get('n_ckpt')}")
+
+
+# --------------------------------------------------------------------------- #
+# E. external 取数：分割评估读 manifest_val、跳无掩码病例
+# --------------------------------------------------------------------------- #
+def part_e() -> None:
+    print("\nE external 取数：分割评估的病例来自 manifest_val（不读 folds）")
+    import src.evaluation.evaluate as EV
+    import src.inference.pipeline as PIPE
+    import src.inference.writer as WRITER
+
+    n_cases, n_gt = 3, 2                                   # 3 例，其中 1 例无掩码
+    accs = [f"S{i}" for i in range(n_cases)]
+    tmp = tempfile.mkdtemp(prefix="glioma_eval_ext_")
+    man_path = os.path.join(tmp, "manifest_val.json")
+    blob = np.zeros((8, 8, 8), np.float32)
+    blob[4, 4, 4] = 1.0
+    json.dump({"cases": [{"accession": a, "images": {"t1c": {"path": "/x.nii.gz"}},
+                          # 清单里的掩码只是"有/无"标记（真实清单存路径）；
+                          # 掩码数组由下面的 mock 载入函数提供，保证清单可 JSON 序列化。
+                          "masks": ({"core": "gt_core.nii.gz",
+                                     "peri": "gt_peri.nii.gz"} if i < n_gt else {}),
+                          "labels": {}, "dir": tmp} for i, a in enumerate(accs)],
+               "special": {},
+               "data_source": "local/extselftest/val", "data_root": tmp},
+              open(man_path, "w", encoding="utf-8"))
+    ckpts = [os.path.join(tmp, "checkpoints", f"g4_fold{f}", "best.pth")
+             for f in range(2)]
+
+    def fake_load(case, cfg, cache_dir=None, log=None):
+        m = case.get("masks") or {}
+        return (np.zeros((1, 8, 8, 8), np.float32), np.eye(4),
+                ({"core": blob, "peri": blob} if m else {}))
+
+    class _FakePipe:
+        def __init__(self, ckpts_, device=None):
+            self.n = len(ckpts_)
+            self.thresholds = [0.5, 0.5]
+
+        def predict_prob(self, case, vol):
+            seg = np.zeros((2,) + tuple(vol.shape[1:]), np.float32)
+            seg[:, 4, 4, 4] = 1.0                          # 与 gt 完全一致 → Dice=1
+            return {"seg": seg, "embed": np.zeros(8, np.float32)}
+
+    orig = (EV.load_case_cached, EV.GliomaPipeline, EV.make_targets,
+            WRITER.case_fingerprint, PIPE.postprocess, os.environ.get("VAL_MANIFEST"))
+    EV.load_case_cached = fake_load
+    EV.GliomaPipeline = _FakePipe
+    EV.make_targets = lambda masks, shape: np.stack(
+        [np.asarray(masks["core"], np.float32), np.asarray(masks["peri"], np.float32)])
+    WRITER.case_fingerprint = lambda case: {}
+    PIPE.postprocess = lambda c, p, minv, sp: (np.asarray(c, bool), np.asarray(p, bool))
+    os.environ["VAL_MANIFEST"] = man_path
+
+    try:
+        cases, man, tag = EV.resolve_split("external", 0)   # 真实入口：不读 folds
+        check("external：取数走 manifest_val 且标记 external",
+              tag == "external" and len(cases) == n_cases,
+              f"tag={tag} cases={len(cases)}")
+        # 无掩码的例"只参与重复影像评估"这句只在**有**重复金标准时成立。官方验证集实测
+        # 只给 SeriesType.xlsx（没有字段金标准、也没有重复影像金标准）→ 这些例其实
+        # 哪个指标都不进，必须说清，别让人以为它们还贡献了重复影像那一项。
+        import contextlib
+        import io
+        _buf = io.StringIO()
+        with contextlib.redirect_stdout(_buf):
+            EV.resolve_split("external", 0)
+        check("external：无掩码且无重复金标准时明说'不参与任何指标'",
+              "不参与任何指标" in _buf.getvalue(),
+              _buf.getvalue().strip().splitlines()[-1][:56])
+        # 全量训练（--fold full）的**早停集只取带掩膜的例**：字段标签在 val 里不参与任何
+        # 计算（选模指标是 val_dice_peri），而没有掩膜的例会让 make_targets 产出全零 target
+        # —— Dice 在"预测也为空"时按 den==0 记成 1.0 的**假满分**，把 best 直接选歪。
+        # 官方验证集实测连字段金标准表都没有；若它同时没有掩膜，这种情况会全量命中。
+        import src.utils.config as CFG
+        import src.data.dataset as DS
+        _p_mix = os.path.join(tmp, "manifest_val_mix.json")
+        json.dump({"cases": [
+            {"accession": "M1", "images": {"t1c": {"path": "/x.nii.gz"}},
+             "masks": {"core": "c.nii.gz"}, "labels": {}},
+            {"accession": "L1", "images": {"t1c": {"path": "/x.nii.gz"}},
+             "masks": {}, "labels": {"WHO_Grade": "3"}},        # 只有标签、没有掩膜
+            {"accession": "N1", "images": {"t1c": {"path": "/x.nii.gz"}},
+             "masks": {}, "labels": {}}],
+            "special": {}, "data_source": "local/extselftest/val", "data_root": tmp},
+            open(_p_mix, "w", encoding="utf-8"))
+        os.environ["VAL_MANIFEST"] = _p_mix
+        _vc, _ = CFG.external_val_cases()
+        check("full 模式的早停集只取带掩膜的例（标签-only 不得混进 Dice 选模）",
+              [c["accession"] for c in _vc] == ["M1"],
+              f"val={[c['accession'] for c in _vc]}（应为 ['M1']）")
+        _mt = DS.make_targets({}, (4, 4, 4))
+        check("无掩膜病例的 target 全零 → 空预测会被记成 Dice=1.0 假满分",
+              _mt.shape == (2, 4, 4, 4) and float(np.abs(_mt).sum()) == 0.0,
+              f"shape={_mt.shape} sum={float(np.abs(_mt).sum())}")
+        os.environ["VAL_MANIFEST"] = man_path
+        rep = EV.eval_cases(cases, man, ckpts, tag=tag, fold=None)
+    except Exception as exc:                                        # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        check("external 分割评估可执行", False, f"{type(exc).__name__}: {exc}")
+        return
+    finally:
+        (EV.load_case_cached, EV.GliomaPipeline, EV.make_targets,
+         WRITER.case_fingerprint, PIPE.postprocess, _vm) = orig
+        (EV.load_case_cached, EV.GliomaPipeline, EV.make_targets,
+         WRITER.case_fingerprint, PIPE.postprocess) = orig[:5]
+        if _vm is None:
+            os.environ.pop("VAL_MANIFEST", None)
+        else:
+            os.environ["VAL_MANIFEST"] = _vm
+
+    check("external：分割评估可执行", True)
+    check("external：报告标记 split=external、fold=None",
+          rep.get("split") == "external" and rep.get("fold") is None,
+          f"split={rep.get('split')} fold={rep.get('fold')}")
+    check("external：无掩码病例被跳过并计数",
+          rep.get("n") == n_gt and rep.get("n_no_mask") == n_cases - n_gt,
+          f"n={rep.get('n')} n_no_mask={rep.get('n_no_mask')}")
+    check("external：有掩码病例的分割指标被计算",
+          abs(float(rep.get("dice_mean", -1)) - 1.0) < 1e-6,
+          f"dice_mean={rep.get('dice_mean')}")
+
+
+# --------------------------------------------------------------------------- #
 def main() -> int:
     print("=" * 74)
     print("评估划分逻辑自检（已知答案的可验证构造）")
     print("=" * 74)
-    for fn in (part_a, part_b, part_c):
+    for fn in (part_a, part_b, part_c, part_d, part_e):
         try:
             fn()
         except Exception as exc:                                    # noqa: BLE001

@@ -11,7 +11,13 @@ if [ -z "$PY" ]; then                          # 容器里常常只有 python3
 fi
 [ -n "$PY" ] || { echo "[01] 找不到 python3/python：请 export PY=<解释器路径>" >&2; exit 2; }
 ARGS=()
-[[ $# -ge 1 ]] && ARGS+=(--root "$1")
+for arg in "$@"; do                      # --val 透传成 --phase val；其余原样（多为数据根）
+    if [[ "$arg" == "--val" || "$arg" == "--phase=val" ]]; then
+        ARGS+=(--phase val)
+    else
+        ARGS+=("$arg")
+    fi
+done
 "$PY" -m src.data.probe "${ARGS[@]}"
 echo
 echo "[01] 请检查报告中的这些点（决定后续映射是否要改）："

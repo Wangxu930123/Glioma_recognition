@@ -11,12 +11,14 @@ raw:
   #   所以这两层填哪个都能跑通，见 README.md §2.2「数据布局」）
   # 可用环境变量覆盖：export DATASET_ROOT=/your/path
   track4: /2026aicompetition/datasets/training
-  # 官方验证集根目录（**可选**）：填了即启用"外部验证集"评估分支 ——
+  # 官方验证集根目录：填了即启用"外部验证集"评估分支 ——
   #   最终指标以官方验证集为准（全折集成，不做留一）；留空则回退折内 val（OOF）。
   #   验证集实测布局 `verification/original/`（影像/标注表/SeriesType.xlsx 同层），
   #   数据根填 `…/verification` 或 `…/verification/original` 都能扫通。
   # 可用环境变量覆盖：export VAL_ROOT=/your/path/verification
-  val: ""
+  # ⚠️ 已按平台路径填好（全量训练 `03_train.sh full` 的 val 就靠它 + data/manifest_val.json）。
+  #    只想用折内 val 时：把本行清空（val: ""），或删掉 data/manifest_val.json。
+  val: /2026aicompetition/datasets/verification
 
 uif_root: data/uif              # 统一中间格式（原图 + 掩码 + 标签）
 manifest: data/manifest.json    # 扫描清单（病例/序列/掩码/结构化）
@@ -24,7 +26,9 @@ manifest_val: data/manifest_val.json   # 官方验证集清单（bash scripts/01
                                 #   不存在=不启用外部验证集分支，见 raw.val 说明）
 folds: data/folds.json          # 多折划分
 preprocessed_root: data/preprocessed
-preprocess_cache: data/preprocess_cache   # 1mm 公共网格 + 整脑视图缓存（scripts/13_build_cache.py）
+# 1mm 公共网格 + 整脑视图缓存（scripts/13_build_cache.py）。
+# 放平台**私有存储**：容器删除后不丢（重建缓存很贵）；export CACHE_DIR=... 可覆盖。
+preprocess_cache: /2026aicompetition/workspace/cache
 logs_dir: logs                  # 平台环境自动切换为 {workspace}/logs（规范要求）
 checkpoints_dir: checkpoints
 runs_dir: runs

@@ -570,6 +570,54 @@ def find_official_labels(root: str | os.PathLike | None = None,
     return found
 
 
+def has_series_type_table(folder: str | os.PathLike | None) -> bool:
+    """该目录下是否**直接**放着序列类型表（大小写/全角无关）。
+
+    专供 :func:`src.data.probe.resolve_case_root` 判"这一层是不是病例层"用：
+    ``SeriesType.xlsx`` 随数据下发、与检查号目录**同层**，所以
+    "该层直接有这张表"就是确定性信号 —— 不依赖容器目录名
+    （训练集叫 ``annotation``、验证集叫 ``original``，评测集的名字还未知）。
+    """
+    if folder is None:
+        return False
+    return _find_file(Path(str(folder)), SERIES_TYPE_TABLE) is not None
+
+
+#: 数据目录里序列类型表可能待的位置：**与检查号目录同层**（平台契约），
+#: 容器名训练集是 ``annotation``、验证集是 ``original``。
+_DATA_TABLE_SUBDIRS = ("", "annotation", "original")
+
+
+def find_series_type_table_in_data(root: str | os.PathLike | None) -> str | None:
+    """**只在数据目录里**找序列类型表 → 路径或 ``None``。
+
+    为什么需要它（防**跨数据集串表**）：:func:`find_named_table` 的候选顺序是
+    ``$GLIOMA_LABELS_DIR → <工程>/labels → $WORKSPACE/**/labels → 数据根/父/祖父``。
+    若工作区的 ``labels/`` 里残留了一份**另一个数据集**的 ``SeriesType.xlsx``
+    （比如把训练集的表拷过去过），它会**先于**当前数据自己的表被命中 ——
+    表现正是"表读到了几千条、却一条都查不到"：拿训练集的检查号/序列号去查
+    验证集的数据（2026-09-24 排查过的故障形态），而且日志里表的路径指向
+    ``labels/`` 而不是数据目录，一眼看不出串了。
+
+    所以模态表**数据优先**：先查 ``root`` 本身、``root/annotation``、
+    ``root/original``、``root 的父目录``（都不在时才退回通用搜索）。
+    其余四张表（``1_abnormal`` 等）仍走通用搜索 —— 它们本来就在工作区。
+    """
+    if root is None:
+        return None
+    base = Path(str(root)).expanduser()
+    try:
+        base = base.resolve()
+    except OSError:
+        base = base.absolute()
+    for sub in _DATA_TABLE_SUBDIRS:
+        folder = base / sub if sub else base
+        hit = _find_file(folder, SERIES_TYPE_TABLE)
+        if hit:
+            return hit
+    return _find_file(base.parent, SERIES_TYPE_TABLE)
+
+
 #: 分层列名的分隔符：官方表的列名就是**字段路径**（``Study->CLINICAL->病理结果``）。
 #:
 #: ⚠️ 只认这两种箭头：普通连字符列名（``T2-Flair``、``t1wi_c_enhan``）不能拆。
@@ -671,8 +719,11 @@ def read_mask_table(path: str) -> dict[tuple[str, str], list[str]]:
 def read_duplicate_pairs(path: str) -> list[tuple[str, str]]:
     """读 ``2_duplicate.xlsx`` → ``[(src_img, desc_img), ...]``（重复影像正对）。
 
-    官方把重复金标准放在**标注表**里（两列检查号），而不是 ``duplicate/`` 目录下的
-    csv —— 只扫目录会得到 0 对，重复任务就没有正样本。
+    ⚠️ **这是兜底表，不是赛道四数据集的金标准**：格式说明写明金标准就在
+    ``annotation/duplicate/`` 目录下（每行 ``src_img, desc_img``，两个值是检查号），
+    由 :func:`src.data.probe.scan_special` 直接读取。``2_duplicate.xlsx`` 属于天坛
+    参考实现，检查号可能来自**别的数据集** —— 只在数据集里没有金标准文件时才用它
+    （见 :func:`src.data.probe.probe`）。
     """
     pairs: list[tuple[str, str]] = []
     src_kws = ("src_img", "src", "image1", "检查号1", "studyuid")
@@ -713,6 +764,51 @@ def read_abnormal_table(path: str) -> dict[tuple[str, str], str]:
     return {k: v[0].lower() for k, v in triples.items() if v}
 
 
+#: 读文本类表（csv/txt）时依次尝试的编码。
+#:
+#: 为什么不能只按 ``utf-8-sig`` 打开：中文 Windows / WPS / Excel 的
+#: 「CSV（逗号分隔）」默认写 **ANSI（GBK/GB18030）**、「Unicode 文本」写
+#: **UTF-16LE（带 BOM）**。这两种文件按 utf-8 解必然抛 ``UnicodeDecodeError``
+#: （实测报错形如 ``'utf-8' codec can't decode byte 0xcf in position 3``），
+#: 而表本身是完好的 —— 表现是"表就在磁盘上、读金标准却全部失败"，
+#: 训练侧等于**没有标签**（分类头学不到东西，且只在告警里出现一次）。
+#:
+#: 顺序有讲究：``utf-8-sig`` 必须排在 ``gb18030`` 之前。gb18030 能"成功"解码
+#: 绝大多数 UTF-8 字节序列，只是解成乱码 —— 先试它会把正常 UTF-8 表读成乱码，
+#: 行数对、值全错，比直接报错更难查。
+TEXT_ENCODINGS: tuple[str, ...] = ("utf-8-sig", "utf-8", "gb18030", "big5")
+
+#: 带 BOM 的编码靠嗅探识别（它们**不能**放进盲试列表：``utf-16`` 无 BOM 时会猜错字节序）。
+_BOM_ENCODINGS: tuple[tuple[bytes, str], ...] = (
+    (b"\xff\xfe", "utf-16"),                                       # Excel「Unicode 文本」
+    (b"\xfe\xff", "utf-16"),
+    (b"\xef\xbb\xbf", "utf-8-sig"),
+)
+
+
+def read_text_any_encoding(path: str) -> str:
+    """读文本表 → ``str``：**BOM 嗅探 + 多编码回退**（见 :data:`TEXT_ENCODINGS`）。
+
+    全部失败时抛出**列明试过哪些编码**的异常。绝不 ``errors="replace"`` 硬解：
+    那样中文会变成 ``锟斤拷``，行还在、值全错，比读不到难查得多
+    （与 :func:`_detect_header` 拒绝"猜表头"同一原则）。
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+    for bom, enc in _BOM_ENCODINGS:
+        if raw.startswith(bom):
+            return raw.decode(enc)
+    errors: list[str] = []
+    for enc in TEXT_ENCODINGS:
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError as exc:                           # noqa: PERF203
+            errors.append(f"{enc}: {exc}")
+    raise ValueError(
+        f"读表失败 {os.path.basename(path)}：试过 {'/'.join(TEXT_ENCODINGS)} 都解不开"
+        f"（把这个表另存为 UTF-8 或 .xlsx 即可正常读取）。首个错误：{errors[0]}")
+
+
 def _sheet_frames(path: str) -> list[tuple[str, list[list[str]]]]:
     """把 csv/xlsx 读成 ``[(工作表名, 原始行), ...]``（**不做任何表头假设**）。
 
@@ -726,17 +822,31 @@ def _sheet_frames(path: str) -> list[tuple[str, list[list[str]]]]:
     默认行为下列名会变成"标题/Unnamed"，检查号列认不出来，整表 0 行。
     工作表名要留着：它是"这张表是哪个级别"的**第一条线索**（见 :func:`_sheet_level`）；
     名字认不出来时级别由表头列决定（见 :func:`_sheet_plan`）。
+    csv 的编码见 :func:`read_text_any_encoding`（中文 Excel/WPS 导出的
+    ANSI(GBK) 与「Unicode 文本」(UTF-16) 都能读）。
     """
     if path.endswith((".xlsx", ".xls")):
         import pandas as pd
-        sheets = pd.read_excel(path, sheet_name=None, header=None, dtype=str)
+        try:
+            sheets = pd.read_excel(path, sheet_name=None, header=None, dtype=str)
+        except ImportError as exc:
+            # 读 `.xls` 要 xlrd、读 `.xlsx` 要 openpyxl。缺依赖时 pandas 的原文
+            # 只有一句 "Missing optional dependency"，分不清是"表坏了"还是
+            # "这张表格式本工程读不了"；这里把**怎么办**写进异常。
+            raise ImportError(
+                f"读表失败 {os.path.basename(path)}：缺少读取该格式的依赖（{exc}）。"
+                f"安装 requirements.txt 里的 xlrd / openpyxl，"
+                f"或把这张表另存为 .xlsx 再重试") from exc
         return [(str(name), [["" if v is None else str(v).strip() for v in row]
                              for row in frame.fillna("").values.tolist()])
-                for name, frame in sheets.items()]
+               for name, frame in sheets.items()]
     import csv
-    with open(path, encoding="utf-8-sig", newline="") as f:
-        return [(os.path.splitext(os.path.basename(path))[0],
-                 [[str(c).strip() for c in row] for row in csv.reader(f)])]
+    # 不写死 utf-8：中文 Excel 导出的 csv 多为 ANSI(GBK)，按 utf-8 解
+    # 直接 UnicodeDecodeError → 金标准整表读不到（训练侧表现为"没有标签"）。
+    text = read_text_any_encoding(path)
+    return [(os.path.splitext(os.path.basename(path))[0],
+             [[str(c).strip() for c in row]
+              for row in csv.reader(text.splitlines(True))])]
 
 
 def _sheet_rows(path: str) -> list[list[list[str]]]:
@@ -1401,6 +1511,53 @@ def _grade_from_text(text: Any) -> str | None:
     return _ROMAN_GRADE[m.group(1).lower()] if m else None
 
 
+# --------------------------------------------------------------------------- #
+# 病例级「跳过原因」：`STUDY->CLINICAL->备注`（《格式说明》赛道4 · 检查级别 sheet）
+# --------------------------------------------------------------------------- #
+#: 「备注」列的候选列名。官方列名是分层写法 ``STUDY->CLINICAL->备注``，
+#: 末段 ``备注`` 靠"末段优先"匹配即可命中（见 :func:`_column_leaf`）。
+SKIP_REASON_KEYWORDS: tuple[str, ...] = ("备注", "skip_reason", "remark", "comment", "note")
+
+#: 格式说明列出的跳过原因（第 7 类取值是 ``无`` = 未跳过，见 :data:`_NO_SKIP_VALUES`）。
+SKIP_REASONS: tuple[str, ...] = ("重点审核", "图像质量问题跳过", "序列缺失跳过",
+                                 "构建失败跳过", "报告缺失跳过", "阴性数据跳过")
+
+#: 表示"未跳过"的取值（含表格里常见的空 / nan 写法）。
+_NO_SKIP_VALUES = frozenset({"", "无", "none", "nan", "null", "na", "na/unk"})
+
+
+def skip_reason_of(row: dict) -> str:
+    """取一行的「备注」（缺失 / 为 ``无`` / 为空 → 返回 ``""``）。
+
+    这个字段值得单独接进来的原因：格式说明把它定义为**该检查是否被跳过**的唯一
+    标记（7 类取值），而工程里原先一处都没读 —— 线上按它剔除病例时，本地训练与
+    评测的分母和线上不一致，而且不报任何错。
+    """
+    col = _find_col(row, list(SKIP_REASON_KEYWORDS))
+    if not col:
+        return ""
+    text = str(row.get(col) if row.get(col) is not None else "").strip()
+    return "" if _fold(text) in _NO_SKIP_VALUES else text
+
+
+def is_hard_skip(reason: str) -> bool:
+    """该跳过原因是否意味着**影像不可用**（序列缺失 / 构建失败 / 图像质量）。
+
+    这三类病例在数据里往往缺序列，训练侧 ``pick_series`` 挑不出模态。
+    其余三类（重点审核 / 报告缺失 / 阴性数据）影像**是好的**，只是标注流程上被
+    官方跳过 —— `阴性数据` 还得当检测负样本用，不能跟着一起丢。
+    """
+    text = str(reason or "")
+    return any(k in text for k in ("序列缺失", "构建失败", "图像质量"))
+
+
+def _attach_skip_reason(out: dict[str, Any], row: dict) -> None:
+    """把「备注」挂进病例记录（键 ``SkipReason``；``无``/空**不挂** → 训练时自动 mask）。"""
+    reason = skip_reason_of(row)
+    if reason:
+        out["SkipReason"] = reason
+
+
 def structured_from_row(row: dict) -> dict:
     """金标准一行 → 规范字段（缺失字段不出现在结果里 → 训练时自动 mask 掉）。
 
@@ -1409,9 +1566,11 @@ def structured_from_row(row: dict) -> dict:
     """
     official = _official_columns_to_fields(row)
     if official:
+        _attach_skip_reason(official, row)
         return official
 
     out: dict[str, Any] = {}
+    _attach_skip_reason(out, row)
 
     patho = row.get(_find_col(row, ["病理结果", "pathology", "病理"]) or "", "")
     if patho:
@@ -1581,10 +1740,29 @@ _WARNED_SERIES_TYPE_DEP = False
 
 
 #: 类型表的列名候选（顺序即优先级；用**包含**匹配，故短词靠后）。
+#:
+#: ⚠️ 取值看**列位置**不看关键词顺序：:func:`read_series_types` 里是"逐列"扫，
+#: 第一个命中任一关键词的列即当选 —— 同表同时有 ``SeriesType`` 与描述列时，
+#: 位置靠前的那个生效（实测表只有 ``AccessionNumber/SeriesUid/SeriesType`` 三列，
+#: 不存在歧义；这里记一笔是给"以后多了个描述列"的情形留线索）。
 _SERIES_TYPE_ALIASES: dict[str, tuple[str, ...]] = {
     "acc": ("accessionnumber", "accession", "检查号", "检查编号", "病例号"),
     "uid": ("seriesinstanceuid", "seriesuid", "序列号", "序列uid"),
-    "typ": ("seriestype", "type", "序列类型", "模态", "序列描述"),
+    # 「序列描述」这一列是**格式说明里唯一还没被认的列名**，三种写法都要认：
+    #   * 官方口径 ``DetailDescription`` —— "序列描述；对于序列扫描期相的描述，
+    #     一般包含层厚和期相内容"；
+    #   * 数据集**实测拼写** ``SeriesDescription``（与 DICOM 标签 (0008,103E) 同名；
+    #     ROI 级别 sheet 的 Y 列）；
+    #   * 分层写法 ``Study->IMAGE->序列描述``（末段 ``序列描述`` 靠"包含"已能命中，
+    #     上面两种英文拼写则一条都命不中 → 整表读成 0 条）。
+    # 它承载的正是那 5 类模态取值（``T1`` / ``T2-FLAIR`` / ``T1CE（增强）`` / ``其他``），
+    # 认不出的表现是"表找到了、却是空的"，最容易被误判成数据损坏或路径写错。
+    # 注意**不要**收录裸 ``description``：它会命中 ``StudyDescription`` 这类与模态
+    # 无关的描述列，把整表的类型读成自由文本（模态全空，且不报错）。
+    # 末位 ``serisdescription``（少一个 ``e``）是**历史笔误**留下的兜底：实测表头并没有
+    # 这个拼法，留着是照 :data:`ID_COLUMN_KEYWORDS` 的惯例"拼写变体只增不减"。
+    "typ": ("seriestype", "type", "序列类型", "模态", "序列描述",
+            "detaildescription", "seriesdescription", "serisdescription"),
 }
 
 #: "像模态取值"的前缀（用于**按取值**找类型列，见 :func:`_sniff_series_type_columns`）。
@@ -1701,7 +1879,13 @@ def read_series_types(root: str | os.PathLike,
 
     out: dict[tuple[str, str], str] = {}
 
-    path = find_named_table(SERIES_TYPE_TABLE, root, labels_dir)
+    # ★ 数据优先：这张表随数据下发、与检查号目录同层。先在数据目录里直接找，
+    #   找不到才退回通用搜索（$GLIOMA_LABELS_DIR / <工程>/labels / $WORKSPACE…）。
+    #   顺序反了会串表：工作区 labels/ 里若残留另一份数据的 SeriesType.xlsx，
+    #   它会先被命中 → 拿训练集的键查验证集，一条都对不上（见
+    #   :func:`find_series_type_table_in_data`）。
+    path = (find_series_type_table_in_data(root)
+            or find_named_table(SERIES_TYPE_TABLE, root, labels_dir))
     if not path:
         return out                                                # 表没接上：交给上层自检
 
@@ -1827,6 +2011,55 @@ def nifti_stem(filename: str) -> str:
     return filename
 
 
+#: 官方掩膜文件名的后缀（《公共数据集格式说明》赛道四原文）：
+#: ``<检查号>/<序列UID>_<RoiName>_<RoiNumber>_mask.nii.gz``。
+#:
+#: ``RoiName`` / ``RoiNumber`` 取自 ``脑胶质瘤标注结果-训练集.xlsx`` 的
+#: ``ROI级别`` sheet 的 **AC / AD 列**（``瘤体`` / ``水肿`` / ``肿瘤瘤体`` /
+#: ``全肿瘤`` / ``异常信号`` … 与 ``1`` / ``2`` / ``3`` / ``4`` …）。
+#: 掩膜与影像**同目录**、只靠文件名区分。
+MASK_FILE_SUFFIX = "_mask"
+
+
+def is_official_mask_name(filename: str) -> bool:
+    """该文件名是否为官方掩膜命名（``…_mask.nii.gz``）。
+
+    **必须**按后缀判定，不能靠 ROI 名关键词：``RoiName`` 的取值是开放的
+    （"等等"），关键词表之外的取值会让掩膜掉进"认不出模态的序列"里 ——
+    评测期被体素模型猜成 ``t1c``/``t2`` 塞进输入通道，**标签当输入**且不报错。
+    有这条判据后，认不出角色的掩膜会被明确告警并跳过，而不是混进影像。
+
+    大小写/全角无关（``_MASK`` / 全角扩展名都认）。
+    """
+    return nifti_stem(filename).casefold().endswith(MASK_FILE_SUFFIX)
+
+
+def series_uid_candidates(stem: str) -> tuple[str, ...]:
+    """文件名主干 → 可能的序列 UID 候选（**按可靠度降序**）。
+
+    官方布局是**扁平**的：影像 ``<序列UID>.nii.gz`` 与掩膜
+    ``<序列UID>_<RoiName>_<RoiNumber>_mask.nii.gz`` 都直接躺在
+    ``<检查号>/`` 下。影像的主干就是裸 UID；掩膜的主干多带了
+    ``_RoiName_RoiNumber_mask``，**拿去查 ``SeriesType.xlsx`` 必然落空**。
+
+    DICOM UID 只含数字与点、**不含下划线**，所以第一个 ``_`` 之前就是序列 UID：
+    这里返回「整串 + 逐级剥短的各个前缀」，查询按序命中即停
+    （整串排最前，保证"影像主干恰好等于 UID"这一最常见情形优先命中）。
+
+    漏认这条的表现（**不报错**）：掩膜模态为 ``None`` → ``瘤体`` 被判成
+    **core**（规范里它是 FLAIR/T2 上的 peri）→ 掩膜进错任务空间，且几何
+    来自另一条序列 —— 只有指标会悄悄偏低。
+    """
+    s = unicodedata.normalize("NFKC", str(stem or "")).strip()
+    if not s:
+        return ()
+    out = [s]
+    if is_official_mask_name(s):
+        parts = s.split("_")
+        out.extend("_".join(parts[:i]) for i in range(len(parts) - 1, 0, -1))
+    return tuple(dict.fromkeys(x for x in out if x))
+
+
 def sidecar_desc(path: str | os.PathLike) -> str | None:
     """读同名 JSON sidecar 的序列描述（不存在或解析失败返回 None）。
 
@@ -1855,6 +2088,158 @@ def sidecar_desc(path: str | os.PathLike) -> str | None:
         if value not in (None, ""):
             return str(value)
     return None
+
+
+# --------------------------------------------------------------------------- #
+# "这一例能不能凑出输入通道"：训练中途崩的根因判据
+# --------------------------------------------------------------------------- #
+#: 输入通道**实际支持的模态**：与 ``configs/preprocess.yaml`` 的 ``channels``
+#: 及各自的 ``fallback`` 完全一致（``t1c``←t1,t2；``flair``←t2；``t2``；``t1``）。
+#:
+#: ``guess_modality`` 还会返回 ``dwi`` / ``adc`` / ``swi``，它们**不在**这里 ——
+#: 那三路序列再多也进不了输入通道。改动 ``channels`` 时这里必须同步。
+INPUT_CHANNEL_MODALITIES = frozenset({"t1", "t1c", "t2", "flair"})
+
+
+def has_input_modality(images: dict | None, unknown_series: list | None = None,
+                       channels: list | None = None) -> bool:
+    """该病例能否凑出**至少一个**输入通道（纯结构判断，不读体素、不调判别模型）。
+
+    必须单独有这条判据：``images`` 非空 ≠ 有可用通道，而两处"筛查"用的都是前者
+    （``probe.scan_real`` 的 ``if not images`` 与 ``GliomaDataset`` 的自检），于是
+    下面这类病例会一路活到取样那一刻：
+
+    * 数据信息表里**明写 ``其他``** 的病例 —— ``images`` 是 ``{"other": {...}}``
+      （非空！），而且被**刻意**排除在 ``unknown_series`` 之外（"其他"是权威排除、
+      不是"没认出来"，见 :func:`is_explicit_other`）；
+    * 只有 ``dwi`` / ``adc`` / ``swi`` 的病例（认得出模态，但都不是输入通道）。
+
+    两类都会让 ``dataset.pick_series`` 一个通道都挑不出。**注意口径**：全放开之后
+    这不再是失败 —— ``build_case_volume`` 会借该例任意一路影像的几何、把 4 个通道
+    置零，让这一例照常参与训练（一例数据不丢）。本判据因此退化成**诊断**：
+    训练侧据此**报数**（"有多少例输入侧是全空的"），不据此剔除。
+
+    ``unknown_series`` 非空时返回 True：认不出模态的序列还能靠体素判别模型
+    （``dataset.classify_unknown``）救回来 —— 只有"表里明写其他"的病例
+    （unknown 必为空）在这里必然是 False。
+    """
+    imgs = images or {}
+    chans = channels if channels is not None else [
+        {"name": m, "fallback": []} for m in sorted(INPUT_CHANNEL_MODALITIES)]
+    for ch in chans:
+        for name in [ch.get("name")] + list(ch.get("fallback") or []):
+            if name in imgs:
+                return True
+    return bool(unknown_series)
+
+
+# --------------------------------------------------------------------------- #
+# 序列描述（模态旁证）：`SeriesType.xlsx` 拿不到时的第二条路
+# --------------------------------------------------------------------------- #
+#: 「序列描述」列的候选列名。与 :data:`_SERIES_TYPE_ALIASES` 的 ``typ`` 同源：
+#: 那一列**本身就是模态取值**（``T1`` / ``T2-Flair`` / ``T1CE（增强）`` / ``其他``），
+#: 所以当类型表整个缺失时，标注表里的这一列可以顶上。
+#:
+#: 三种写法都是实测过的：官方口径 ``DetailDescription``（格式说明原文）、
+#: 数据集实测拼写 ``SeriesDescription``（ROI 级别 sheet 的 Y 列）、
+#: 分层写法 ``Study->IMAGE->序列描述``（末段靠"包含"命中）。
+#: **不要**收录裸 ``description``：那会命中 ``StudyDescription`` 这类与模态无关的列。
+SERIES_DESC_KEYWORDS: tuple[str, ...] = (
+    "seriesdescription", "serisdescription", "detaildescription",
+    "seriestype", "序列描述", "序列类型", "模态",
+)
+
+#: 序列 UID 的形态：DICOM UID 只含**数字与点**（``2.25.9002``）。
+#: 这条是"UID 列被认成描述列"的兜底判据 —— :func:`_find_col` /
+#: :func:`_find_col_in_list` 的"前缀 / 包含"轮里，``series`` 会命中
+#: ``SeriesDescription`` **自己**，于是 uid_col == desc_col、取值互相顶替；
+#: 加了形态校验后最坏也只是"这一列没用上"。
+_SERIES_UID_RE = re.compile(r"^\d[\d.]*$")
+
+
+def _is_series_uid(value: Any) -> bool:
+    """该取值像**序列 UID** 吗（数字 + 点；纯数字也认）。"""
+    text = unicodedata.normalize("NFKC", str(value if value is not None else "")).strip()
+    return len(text) >= 3 and bool(_SERIES_UID_RE.match(text))
+
+
+def _is_modality_desc(value: Any) -> bool:
+    """该取值像**模态**吗（``T1`` / ``T2-Flair`` / ``其他`` …）。
+
+    必须卡这道：列名认错时（如把 ``StudyDescription`` 当描述列）整列都是自由文本，
+    照单全收会把散文塞进"模态"位；过滤后最坏也只是"这一列没用上"。
+    """
+    text = str(value if value is not None else "").strip()
+    return bool(text) and (guess_modality(text) is not None
+                           or _looks_like_modality_value(text))
+
+
+def desc_index_from_records(records) -> dict[str, str]:
+    """从 :func:`read_structured_table` 的结果里抽 ``{序列UID: 序列描述}``。
+
+    为什么不重读一遍表：标注表的三个 sheet 已经被 ``read_structured_table``
+    解析成病例记录了，序列级 / ROI 级的行**原样**挂在
+    :data:`LEVEL_NESTED_KEY` 的两个键下（见那里的说明）。再读一次既慢，
+    又要重新处理"表头行不固定"那一整套坑 —— 复用已解析的行最省事也最一致。
+
+    ``SeriesType.xlsx`` 到手之前（或干脆没有它）这可能是**唯一**能判模态的线索：
+    行键就是 ``序列UID``，与磁盘上的文件名主干同源，所以能直接对上。
+    返回的键走 :func:`_norm_key`（与 ``lookup_series_type`` 同一套归一化），
+    两侧口径不一致就是"表里有、却一条都查不到"的静默错配。
+    """
+    out: dict[str, str] = {}
+    seen: set[int] = set()
+    for rec in (records or []):
+        if not isinstance(rec, dict) or id(rec) in seen:
+            continue
+        seen.add(id(rec))
+        for key_name in LEVEL_NESTED_KEY.values():
+            for row in (rec.get(key_name) or []):
+                if not isinstance(row, dict):
+                    continue
+                uid_col = _find_col(row, list(LEVEL_KEY_COLUMNS["series"]))
+                desc_col = _find_col(row, list(SERIES_DESC_KEYWORDS))
+                if not uid_col or not desc_col or uid_col == desc_col:
+                    continue
+                uid, desc = row.get(uid_col), row.get(desc_col)
+                if _is_series_uid(uid) and _is_modality_desc(desc):
+                    out.setdefault(_norm_key(uid), str(desc).strip())
+    return out
+
+
+def read_series_desc_index(path: str | os.PathLike) -> dict[str, str]:
+    """**直接读文件**抽 ``{序列UID: 序列描述}``（离线用；在线走
+    :func:`desc_index_from_records` 以免重复解析）。
+
+    专为"``SeriesType.xlsx`` 拿不到、但标注表的 ROI 级别 sheet 有 ``SeriesDescription``"
+    这一情形准备：那一列承载的正是 5 类模态取值，是模态的第二条可靠来源。
+    表头行不固定（第 1~3 行都可能是索引信息），所以仍然逐行扫"哪一行能同时凑出
+    序列号列与描述列"，不假设位置。
+    """
+    out: dict[str, str] = {}
+    for _name, rows in _sheet_frames(str(path)):
+        idx: tuple[int, int] | None = None
+        start = 0
+        for i, row in enumerate(rows):
+            header = [str(c).strip() for c in row]
+            if not any(header):
+                continue
+            uid_col = _find_col_in_list(header, LEVEL_KEY_COLUMNS["series"])
+            desc_col = _find_col_in_list(header, list(SERIES_DESC_KEYWORDS))
+            # 两列**必须不同**：列名认错时它们会落到同一列上（见 :data:`_SERIES_UID_RE`）。
+            if uid_col is not None and desc_col is not None and uid_col != desc_col:
+                idx, start = (uid_col, desc_col), i + 1
+                break
+        if idx is None:
+            continue
+        uid_col, desc_col = idx
+        for row in rows[start:]:
+            if max(uid_col, desc_col) >= len(row):
+                continue
+            uid, desc = row[uid_col], row[desc_col]
+            if _is_series_uid(uid) and _is_modality_desc(desc):
+                out.setdefault(_norm_key(uid), str(desc).strip())
+    return out
 
 
 #: 非"字段金标准表"的文件名关键词（见 :func:`find_structured_tables`）。

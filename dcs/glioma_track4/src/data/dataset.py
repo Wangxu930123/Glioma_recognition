@@ -28,7 +28,7 @@ from torch.utils.data import Dataset
 
 from ..utils.config import load_config, resolve
 from .labels import (SERIES_TYPE_TABLE, describe_modality_sources, guess_modality,
-                     mask_role_for)
+                     has_input_modality, mask_role_for)
 
 # --------------------------------------------------------------------------- #
 # 几何：公共网格 / 重采样（nibabel.processing，affine 直连，无轴序陷阱）
@@ -181,6 +181,46 @@ def classify_unknown(case: dict, cfg: dict, log: list | None = None) -> dict[str
     return out
 
 
+#: 默认预处理配置缓存：``has_input_channel`` 在折划分/建数据集时会**每例**调用一次，
+#: 每次都走一遍 ``load_config`` 没有必要。
+_CH_CFG: dict | None = None
+
+
+def _channel_cfg() -> dict:
+    """默认预处理配置（首次调用时读入并缓存）。"""
+    global _CH_CFG
+    if _CH_CFG is None:
+        _CH_CFG = load_config("preprocess.yaml")
+    return _CH_CFG
+
+
+def has_input_channel(case: dict, cfg: dict | None = None) -> bool:
+    """该病例能否填上**至少一个真输入通道**（不读体素、不调判别模型）。
+
+    **这是诊断判据，不是过滤判据**（全放开口径下不再据此剔除任何病例，见
+    :func:`build_case_volume`）。它回答的是"这一例的输入侧是不是全空"：
+
+    * 数据信息表里**明写 ``其他``** 的病例 —— ``images`` 是 ``{"other": {...}}``
+      （非空！），而且被**刻意**排除在 ``unknown_series`` 之外（"其他"是权威排除、
+      不是"没认出来"，见 :func:`labels.is_explicit_other`）；
+    * 只有 ``dwi`` / ``adc`` / ``swi`` 的病例。
+
+    两类返回 ``False``：它们走的是"**全零通道 + 借该例影像几何**"这条路 ——
+    照常进训练（一例数据不丢），但输入是常数、回传近噪声梯度，所以训练侧**必须报数**，
+    不能静默（见 README §7.2）。
+
+    判据本体在 :func:`labels.has_input_modality`；这里只负责把 ``channels`` 从配置里
+    取出来传进去，**让配置当唯一事实来源** —— 以后改 ``preprocess.yaml`` 的通道或
+    fallback，这里自动跟着走。
+    """
+    imgs = case.get("images") or {}
+    if not imgs:
+        return False
+    c = cfg if cfg is not None else _channel_cfg()
+    return has_input_modality(imgs, case.get("unknown_series"),
+                              (c.get("channels") or None))
+
+
 def pick_series(case: dict, cfg: dict, log: list | None = None) -> dict[str, dict]:
     """按 channels 定义（含 fallback）决定每个通道实际使用的序列。
 
@@ -216,6 +256,28 @@ def _mask_variants(role_entry: Any) -> list[dict]:
     return []
 
 
+def _geometry_source(case: dict) -> dict | None:
+    """取该例**任意一路影像**的 meta（顺序：影像 → 未知序列 → 掩膜），找不到返回 ``None``。
+
+    用途：4 个输入通道一路都填不上时，公共网格仍需要一个参考几何（方向 / 原点 /
+    spacing），否则连掩膜都无处重采样。而**几何与模态无关** —— 一路被标成 `其他`
+    的序列、甚至一个掩膜文件，它的 affine/shape 都照样能把网格建出来。
+
+    这是"全放开"能成立的前提：不再因为没有通道就丢掉整例。
+    """
+    for meta in (case.get("images") or {}).values():
+        if isinstance(meta, dict) and meta.get("path"):
+            return meta
+    for meta in (case.get("unknown_series") or []):
+        if isinstance(meta, dict) and meta.get("path"):
+            return meta
+    for entry in (case.get("masks") or {}).values():
+        for meta in _mask_variants(entry):
+            if meta.get("path"):
+                return meta
+    return None
+
+
 def build_case_volume(case: dict, cfg: dict, log: list | None = None
                       ) -> tuple[np.ndarray, np.ndarray, dict]:
     """返回 ``(vol[C,D,H,W] float32 z-score, 公共网格 affine, 该网格上的掩码 dict)``。
@@ -227,32 +289,52 @@ def build_case_volume(case: dict, cfg: dict, log: list | None = None
     """
     ch_defs = cfg["channels"]
     picked = pick_series(case, cfg, log)
-    if not picked:
-        # 报出"清单里到底有哪些序列键"：键全为 other/空，说明模态没认出来
-        # （靠数据自带的数据信息表 SeriesType.xlsx —— 工作区那份 3_serieslabel.xlsx
-        # 已不参与），而不是这张检查真的没影像。
-        # 顺带自检两种模态来源的可用性，并给出可直接粘贴的两条命令 —— 见
-        # README.md §7.2「病例数正常，但报"无任何可用序列"（模态全是 other）」。
-        imgs = case.get("images") or {}
-        raise RuntimeError(
-            f"病例 {case['accession']} 无任何可用序列"
-            f"（清单里的序列键={sorted(imgs)[:8]}；"
-            f"未知序列 {len(case.get('unknown_series') or [])} 路）。"
-            f"模态来源自检：{describe_modality_sources(case.get('dir'))}。"
-            f"按顺序试：① export GLIOMA_LABELS_DIR=<含数据信息表 "
-            f"{SERIES_TYPE_TABLE} 的目录>（或 ln -s 到 <工程>/labels），数据的表就在 "
-            f"annotation/ 下、与病例目录同层；然后重跑 bash scripts/01_probe.sh 与 "
-            f"bash scripts/02_build_dataset.sh；"
-            f"② 没有类型表时训练体素判别模型："
-            f"python3 scripts/31_train_modality_model.py --root <数据根>"
-            f"（产出 data/modality_model.json）；"
-            f"③ 详见 README.md §7.2「病例数正常，但报无任何可用序列」"
-        )
-
     # 参考序列优先级：t1c → flair → t2 → t1 → 其它（决定公共网格方向与原点）
-    ref_key = next((k for k in ("t1c", "flair", "t2", "t1") if k in picked),
-                   next(iter(picked)))
-    ref_arr, ref_aff = load_nii(picked[ref_key]["path"])
+    ref: dict | None = None
+    if picked:
+        ref_key = next((k for k in ("t1c", "flair", "t2", "t1") if k in picked),
+                       next(iter(picked)))
+        ref = picked[ref_key]
+    else:
+        # ★ **全放开**（口径：一例数据都不丢）：4 个通道一路都填不上时**不再抛错**，
+        #   改成"**全零通道 + 借该例任意一路影像的几何**"。这类病例的成因是数据信息表
+        #   把这一例**所有**序列都标成了 `其他`（或只有 DWI/ADC/SWI）—— 它们既不属于
+        #   那 4 个通道，也（按口径）不交给体素模型猜。
+        #
+        #   为什么还得借几何：公共网格要有方向/原点/spacing，掩膜也要重采样到它上面；
+        #   没有任何参考几何就没法建网格。所以退而取"该例任意一路真实序列"（画像的
+        #   几何与模态无关，`其他` 序列的 affine 一样能用）。
+        #
+        #   代价（**已知并接受**）：这一例的输入是常数，掩膜却是真值 → 它回传的是
+        #   近噪声的梯度。所以照训的同时**必须报数**（见 :func:`has_input_channel`
+        #   与训练侧的 `无真通道病例` 计数），而不是静默。
+        #
+        #   只有"这个检查连一个影像文件都没有"时仍然失败 —— 那不是模态问题，
+        #   是数据缺失（`inference.pipeline` 会把这里的异常转成 per-case 兜底答案）。
+        ref = _geometry_source(case)
+        if ref is None:
+            imgs = case.get("images") or {}
+            raise RuntimeError(
+                f"病例 {case['accession']} 没有任何可用的影像文件"
+                f"（清单里的序列键={sorted(imgs)[:8]}；"
+                f"未知序列 {len(case.get('unknown_series') or [])} 路）。"
+                f"模态来源自检：{describe_modality_sources(case.get('dir'))}。"
+                f"注意：**只有 `其他` 序列/只有 DWI 的病例不算这一类** —— 那种情况会"
+                f"全零通道照训（全放开口径）。这里失败说明连几何都借不到。"
+                f"按顺序试：① export GLIOMA_LABELS_DIR=<含数据信息表 "
+                f"{SERIES_TYPE_TABLE} 的目录>（或 ln -s 到 <工程>/labels），数据的表就在 "
+                f"annotation/ 下、与病例目录同层；然后重跑 bash scripts/01_probe.sh 与 "
+                f"bash scripts/02_build_dataset.sh；"
+                f"② 没有类型表时训练体素判别模型："
+                f"python3 scripts/31_train_modality_model.py --root <数据根>"
+                f"（产出 data/modality_model.json）；"
+                f"③ 详见 README.md §7.2"
+            )
+        if log is not None:
+            log.append(f"{case['accession']}: 4 个通道都填不上"
+                       f"（序列键={sorted(case.get('images') or {})}）→ **全零通道**，"
+                       f"几何借用 {os.path.basename(str(ref.get('path')))}")
+    ref_arr, ref_aff = load_nii(ref["path"])
     shape, aff = target_grid(tuple(ref_arr.shape), ref_aff, cfg)
 
     planes, used = [], {}
@@ -520,11 +602,22 @@ def build_volume_from_arrays(available: dict[str, tuple[np.ndarray, np.ndarray]]
                 picked[ch["name"]] = (cand, np.asarray(item[0]), np.asarray(item[1], float))
                 break
     if not picked:
-        raise RuntimeError("没有任何可用序列（t1c/flair/t2/t1 全部缺失）")
-
-    ref_key = next((k for k in ("t1c", "flair", "t2", "t1") if k in picked),
-                   next(iter(picked)))
-    ref_arr, ref_aff = picked[ref_key][1], picked[ref_key][2]
+        # 与 :func:`build_case_volume` **同一口径（全放开）**：没有任何通道时改借
+        # "任意一路可用数组"的几何、4 个通道全零，而不是丢掉整例。
+        # 只有"连一个数组都没有"才失败（那种情况没有可对齐的几何）。
+        _any = next(((k, v) for k, v in available.items()
+                     if v is not None and v[0] is not None), None)
+        if _any is None:
+            raise RuntimeError(
+                "没有任何可用序列（t1c/flair/t2/t1 全部缺失，且没有任何影像数组）")
+        if log is not None:
+            log.append(f"4 个通道都填不上（可用模态={sorted(available)}）→ **全零通道**，"
+                       f"几何借用 {_any[0]}")
+        ref_arr, ref_aff = np.asarray(_any[1][0]), np.asarray(_any[1][1], float)
+    else:
+        ref_key = next((k for k in ("t1c", "flair", "t2", "t1") if k in picked),
+                       next(iter(picked)))
+        ref_arr, ref_aff = picked[ref_key][1], picked[ref_key][2]
     shape, aff = target_grid(tuple(ref_arr.shape), ref_aff, cfg)
 
     planes, used = [], {}
@@ -660,6 +753,26 @@ class GliomaDataset(Dataset):
                  pos_ratio: float = 0.7, pre_cfg: dict | None = None, label_fields: list | None = None,
                  seed: int = 42, aug_cfg: dict | None = None, cache_size: int = 8,
                  cache_dir: str | None = None):
+        # ⚠️ 这里**不**按 `images` 过滤病例。`_SpecialSupervised`
+        # （`tasks/_common/training/helpers.py`）用**同一个下标**同时索引本数据集
+        # 与它自己那份病例清单（`self.cases[i % len(self.cases)]`）：在这里悄悄
+        # 少收几例，两者的第 i 例就**错位**了 —— special / 配对标签会挂到另一例上，
+        # 训练照跑、精度悄悄坏掉（本工程最忌讳的失效形态）。
+        # 无可用序列的病例已在**清单源头**剔除（`data.probe.scan_real`），
+        # 这里只做一次快速校验：拿到旧清单时当场说清楚，而不是取样时崩。
+        # **全放开**后这里只拦"连一个影像文件都没有"的病例（那不是模态问题，是数据缺失，
+        # 连公共网格的参考几何都借不到）。"没有**真**通道但**有**影像"的病例照常进：
+        # `build_case_volume` 会用零通道 + 借几何把它建出来。
+        # 判据与 `build_case_volume` 的取几何逻辑**同源**（`_geometry_source`），
+        # 不会出现"这里放行、那里抛错"的口径分裂。
+        unusable = [c for c in cases if _geometry_source(c) is None]
+        if unusable:
+            raise ValueError(
+                f"{len(unusable)}/{len(cases)} 例**连一个影像文件都没有**（如 "
+                f"{unusable[0].get('accession')}）：没有参考几何，`build_case_volume` 会抛 "
+                f"RuntimeError 中断整跑，不能进数据集。"
+                f"清单由 `bash scripts/01_probe.sh` + `02_build_dataset.sh` 生成，"
+                f"重跑即可剔除它们（见 README §7.2）")
         self.cases = cases
         self.train = train
         self.patch = tuple(patch)
@@ -815,7 +928,9 @@ class SpecialImageDataset(_WholeViewMixin, Dataset):
                  pre_cfg: dict | None = None, aug_cfg: dict | None = None,
                  seed: int = 42, n_per_epoch: int = 1024, cache_size: int = 64,
                  pos_ratio: float = 0.5):
-        self.cases = [c for c in cases if c.get("images")]
+        # 与 `build_case_volume` **同源**判据：只要能借到几何就收（全放开口径 ——
+        # "没有真通道但有影像"的病例也会建出全零整脑视图，照常参与特殊影像监督）。
+        self.cases = [c for c in cases if _geometry_source(c)]
         self.by_acc = {c["accession"]: c for c in self.cases}
         self.pos_fake = [a for a in pos_fake if a in self.by_acc]
         self.pos_comp = [a for a in pos_composition if a in self.by_acc]
@@ -858,7 +973,9 @@ class DuplicatePairDataset(_WholeViewMixin, Dataset):
     def __init__(self, cases: list[dict], gold_pairs: list[list[str]], n_neg_per_pos: int = 3,
                  seed: int = 42, pre_cfg: dict | None = None, aug_cfg: dict | None = None,
                  cache_size: int = 128):
-        self.by_acc = {c["accession"]: c for c in cases if c.get("images")}
+        # 同上：配对嵌入也走整脑视图（`build_case_volume`），用**同源**判据收，
+        # 全放开口径（只要有影像就收）。
+        self.by_acc = {c["accession"]: c for c in cases if _geometry_source(c)}
         self.gold = [[a, b] for a, b in gold_pairs if a in self.by_acc and b in self.by_acc]
         self.accs = sorted(self.by_acc)
         self.n_neg = max(1, int(n_neg_per_pos))
@@ -924,6 +1041,17 @@ def build_folds(manifest_path: str, n_folds: int = 5, val_ratio: float = 0.2,
     with open(resolve(manifest_path), encoding="utf-8") as f:
         man = json.load(f)
     cases = man["cases"]
+    # **全放开口径：一例都不剔除**，这里只把"4 个通道都填不上"的病例**报数**出来
+    # （成因：整例序列被数据信息表标为 `其他`，或只有 DWI/ADC/SWI）。
+    # 它们照常进折划分与训练 —— `build_case_volume` 会借该例任意一路影像的几何、
+    # 把 4 个通道置零，掩膜仍是真值、任务空间不受影响。代价是这一例回传近噪声梯度，
+    # 所以**数量必须看得见**，不能静默（见 README §7.2）。
+    _no_ch = [c["accession"] for c in cases if not has_input_channel(c)]
+    if _no_ch:
+        print(f"[folds] 提示：{len(_no_ch)} 例**没有真输入通道**（例如 {_no_ch[:3]}）——"
+              f"序列被数据信息表标为 `其他`（或只有 DWI/ADC/SWI）。按**全放开**口径"
+              f"照常进训练（4 通道全零、几何借用该例影像），不剔除；"
+              f"成因与代价见 README §7.2", flush=True)
     out = resolve(os.path.join(os.path.dirname(manifest_path), "folds.json"))
     all_accs = {c["accession"] for c in cases}
 

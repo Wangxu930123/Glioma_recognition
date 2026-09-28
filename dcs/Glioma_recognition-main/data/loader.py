@@ -268,12 +268,15 @@ def _read_series_types(root: Path) -> dict[tuple[str, str], str]:
     try:
         # ① 按**列名**扫表头行：哪一行能凑齐三列就用哪一行，不假设它在第几行
         #    （第 1~3 行都可能是索引信息）。列名走别名子串匹配，中英文表头都认。
+        #    ⚠️ 必须先 ``list()`` 物化再遍历：read-only 工作表的 ``iter_rows`` 是惰性
+        #    生成器，提前 ``break`` 会让它攥着底层 zip 句柄不放 —— Windows 上表现为
+        #    "另一个程序正在使用此文件"，测试的临时目录都删不掉（Linux 上无害但句柄
+        #    同样没释放）。
         header: tuple[Any, int, dict[str, int]] | None = None
         for worksheet in workbook.worksheets:
-            for row_number, row in enumerate(
-                worksheet.iter_rows(max_row=_HEADER_SCAN_ROWS, values_only=True),
-                start=1,
-            ):
+            head_rows = list(worksheet.iter_rows(max_row=_HEADER_SCAN_ROWS,
+                                                 values_only=True))
+            for row_number, row in enumerate(head_rows, start=1):
                 columns = _match_header_row(row)
                 if columns is not None:
                     header = (worksheet, row_number, columns)
@@ -310,10 +313,11 @@ def _read_series_types(root: Path) -> dict[tuple[str, str], str]:
         worksheet, header_row, columns = header
         sniffed = header_row == 0
         series_types: dict[tuple[str, str], str] = {}
-        for row_number, row in enumerate(
-            worksheet.iter_rows(min_row=header_row + 1, values_only=True),
-            start=header_row + 1,
-        ):
+        # 物化数据行（同上：中途 raise 冲突时惰性生成器会被异常回溯攥住，
+        # 文件句柄随异常对象一直不释放）。
+        data_rows = list(worksheet.iter_rows(min_row=header_row + 1,
+                                             values_only=True))
+        for row_number, row in enumerate(data_rows, start=header_row + 1):
             values = {
                 name: row[index] if index < len(row) else None
                 for name, index in columns.items()

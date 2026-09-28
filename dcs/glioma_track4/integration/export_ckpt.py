@@ -61,9 +61,15 @@ def discover_weights(src: Path, folds: list[str] | None = None) -> dict[str, Pat
                 out.setdefault(tag, path)                         # 同 tag 先到先得
         return out
 
-    found = _collect(("g4_fold*/best.pth", "g4L_fold*/best.pth"))
+    # ⚠️ `g4_full*` 必须**一起**收：全量训练（`03_train.sh full`）的产物在
+    # ``checkpoints/g4_full/``，它不含 `fold` 字样。只 glob `g4_fold*` 时，
+    # "只训了全量模型"的项目里 `--folds g4_full` 会一条都找不到 →
+    # 报"未找到 g4_fold*/best.pth，先训练"（磁盘上明明有训好的权重）。
+    # `g4_full*` 顺带覆盖多 seed 的全量 tag（`g4_full43`）。
+    found = _collect(("g4_fold*/best.pth", "g4L_fold*/best.pth", "g4_full*/best.pth"))
     if not found:
-        found = _collect(("g4_fold*/last.pth", "g4L_fold*/last.pth"))
+        found = _collect(("g4_fold*/last.pth", "g4L_fold*/last.pth",
+                          "g4_full*/last.pth"))
     return found
 
 

@@ -19,6 +19,7 @@
 | 数据搬迁、数据根怎么填 | 本文 §2；单点排查 [`docs/DATASET_ROOT_TROUBLESHOOT.md`](docs/DATASET_ROOT_TROUBLESHOOT.md) |
 | 全流程命令速查 | 本文 §3（逐节指向手册） |
 | 要不要交叉验证 / 能不能全量训练 + 验证集 | 本文 §4；**验证集没有金标准怎么办** → 手册 §8 |
+| **全量训练全流程**（数据准备 → 训练 → 验证 → 交付） | [`docs/FULL_TRAIN_GUIDE.md`](docs/FULL_TRAIN_GUIDE.md) |
 | 评估口径（external / 折内留一、OOF） | 本文 §5 |
 | 配置项含义（paths / train / preprocess） | 本文 §6 |
 | 报错怎么修 | 手册 §16 报错对照表；本文 §7 常见问题 |
@@ -156,15 +157,18 @@ glioma_track4/
 ```text
 <阶段>/annotation/
 ├── SeriesType.xlsx                                  ★ 数据信息路径（模态表）
-├── 脑胶质瘤标注结果-训练集.xlsx                       ★ 数据信息路径（结构化字段金标准，训练集才有）
-├── <32位检查号>/                                    ★ 数据路径（影像）：每个检查号一个病例目录
-│   └── <2.25.* 序列UID>/<序列UID>.nii.gz
+├── 脑胶质瘤标注结果-训练集.xlsx                       ★ 数据信息路径（字段金标准；RoiName / RoiNumber 也来自它的 `ROI级别` sheet，训练集才有）
+├── <32位检查号>/                                    ★ 数据路径（影像）：影像与掩膜**同目录**，只靠文件名区分
+│   ├── <2.25.* 序列UID>.nii.gz                      ← 影像
+│   └── <2.25.* 序列UID>_<RoiName>_<RoiNumber>_mask.nii.gz   ← 掩膜（**同属数据路径**，别漏搬）
 └── {fake, compositing, duplicate}/                  特殊影像 / 重复影像金标准
 ```
 
 | 项 | 位置 |
 |---|---|
-| **影像数据** | `<阶段>/annotation/<32位检查号>/<2.25.* 序列UID>/<序列UID>.nii.gz` |
+| **影像数据** | `<阶段>/annotation/<32位检查号>/<2.25.* 序列UID>.nii.gz` |
+| **掩膜数据** | `<阶段>/annotation/<32位检查号>/<2.25.* 序列UID>_<RoiName>_<RoiNumber>_mask.nii.gz`（与影像**同目录**） |
+| **`RoiName` / `RoiNumber`** | `脑胶质瘤标注结果-训练集.xlsx` 的 `ROI级别` sheet，**AC / AD 列**（`瘤体`/`水肿`/`肿瘤瘤体`/`全肿瘤`/`异常信号`… 与 `1`/`2`/`3`/`4`…）。代码**只解析文件名、不读这两列**：同一角色的多个掩膜取并集，故 `RoiNumber` 无需参与 |
 | **数据信息（序列类型）** | `<阶段>/annotation/SeriesType.xlsx`（**与病例目录同层**） |
 | 列 / 取值 | `AccessionNumber` + `SeriesUid` + `SeriesType` ∈ {`T1`, `T1CE（增强）`, `T2-Flair`, `T2WI`, `其他`} |
 | 取值 → 通道 | `T1`→t1、`T1CE（增强）`→t1c、`T2-Flair`→flair、`T2WI`→t2、`其他`→**排除** |
@@ -173,16 +177,20 @@ glioma_track4/
 
 - **数据根填阶段目录即可**：`DATASET_ROOT=/2026aicompetition/datasets/training`（代码会自动下钻到 `annotation/`，也可直接填 `.../training/annotation`）。填 `/2026aicompetition/datasets` 这类**多阶段父目录**会被 `ValueError` 拦住——停在上层不会当场报错，而是把阶段名当检查号、清单里出现假病例、金标准一张都对不上。
 - `annotation/{fake,Composition,duplicate}` **不是**检查号目录，扫描时跳过；其中病例只作为**特殊影像正样本**补进清单。
+- **掩膜靠文件名后缀认**（`…_mask.nii.gz`），且**角色语义依赖它所在序列的模态**：`肿瘤瘤体`→core；`瘤体`/`水肿`/`全肿瘤`→ FLAIR/T2 上为 peri；`异常信号`按所在序列归位。掩膜与影像同目录，所以**不能**拿"所在目录名"当序列 UID —— 掩膜的序列 UID 只到主干里**第一个 `_` 之前**（DICOM UID 只含数字与点、不含下划线），代码按候选逐级剥短去查 `SeriesType.xlsx`。
+  漏这一步是**静默**错：掩膜查不到模态 → `瘤体` 被判成 **core**（规范里它是 FLAIR/T2 上的 peri）→ 任务B 的掩膜并进任务A，且几何来自另一条序列，指标只会悄悄偏低。
+- 判不出角色的掩膜（`RoiName` 在关键词表之外，如你描述里的"等等"）会被探针**告警 + 跳过**：既不算掩膜、也**不进输入通道**（否则会被体素模型猜成 t1c/t2，标签当输入）；`瘤体` 在模态确实未知时按 core 兜底，并同样告警。
 - 序列目录/文件名是 DICOM UID，**靠关键词猜不出模态**，必须靠 `SeriesType.xlsx`；探针按候选目录搜该表（`$GLIOMA_LABELS_DIR` → `<工程>/labels` → `$WORKSPACE` 下 3 层 → 数据根/父/祖父），所以数据根填哪一层都能命中。
-- `SeriesType=其他` 是**权威排除**，探针直接跳过（报告里的 `cases_with_declared_other_series` 是它的计数，非 0 属正常）。
+- `SeriesType=其他` 是**权威排除**：探针**不会**把它交给体素模型猜模态（报告里的 `cases_with_declared_other_series` 是它的计数，非 0 属正常）。**整例都是 `其他`** 时这例就一个真通道都填不上 → 按**全放开**口径 4 通道全零照训（见 §7.2.1），一例不丢。
 - **`3_serieslabel.xlsx` 不是本赛道数据集的内容**（属工作区里另一个目标的产物），**与赛道四数据集没有关系**：它取值粗（只写 `T2`），混用会把 `T2WI`/`T2-Flair` 静默覆盖成 `T2`。模态只认数据集自带的 `SeriesType.xlsx`。
 - 字段金标准 `annotation/脑胶质瘤标注结果-训练集.xlsx` 有 **3 张工作表**（`检查级别`/`序列级别`/`ROI级别`）：**病例级字段只取 `检查级别`**；序列级/ROI 级的行按病例嵌套保留（`__series_rows__`/`__roi_rows__`）但**不写进 `manifest.json`**（一例多行，按检查号硬合并会覆盖病例级字段且不报错）。
   **唯一例外**：某病例在 `检查级别` 里没有行、只出现在序列级/ROI 级表里时，若该病例**所有子行的标签列**（`病理结果` / `WHO分级` / `Glioma`）取值**完全一致**，就把这一个值补进病例级；不一致则告警且**不采纳**。只放开标签列是因为只有丢它们会静默缩小评测分母——整行兜底会**任取一行**（实测同一病例两条序列行的 `Signal_T2WI` 分别是 `High`/`Low`），比读不到更难查。
 - `检查级别` 的**实测排版**（别按"第一行就是表头"去读）：**表头在第 2 行**（第 1 行是标题），第 **H** 列 `StudyUid`、第 **I** 列 `AccessionNumber`（行键取**它**、**不是** `StudyUid`），第 **N** 列 `Study->CLINICAL->病理结果`（列名是**字段路径**，末段才是字段名）。取值形如 `脑胶质瘤2级` / `脑胶质瘤4级` / `其他肿瘤或病变` / `病因不明`。
   代码对这三点的处理：表头在前 20 行里扫描（不写死行号）；`AccessionNumber` 的拼写变体（历史排版里出现过 `Accessionumber`/`AccessioNumber`）与 `->`/`→` 分层列名都按**归一化/末段**匹配（拼写改版或分层都不会串列）。
-- `ROI级别` 的**实测排版**：表头同样在**第 2 行**，第 **H** 列 `StudyUid`、第 **I** 列 `AccessionNumber`（行键取它）、第 **Y** 列 `SerisDescription`（`T1` / `T2-FLAIR` / `T1CE（增强）` / `其他`）、第 **AB** 列 `ROIUid`、第 **AC** 列 `RoiName`（`瘤体` / `水肿` / `肿瘤瘤体` / `全肿瘤`）、第 **AQ** 列 `Study->CLINICAL->病理结果`（同上，用于病例只在这张表里时兜底）。
+- `ROI级别` 的**实测排版**：表头同样在**第 2 行**，第 **H** 列 `StudyUid`、第 **I** 列 `AccessionNumber`（行键取它）、第 **Y** 列 `SeriesDescription`（**序列描述**列；`T1` / `T2-FLAIR` / `T1CE（增强）` / `其他`。⚠️ 格式说明里的官方列名是 `DetailDescription`，表头实际拼写以实测为准，**代码三种写法都认**）、第 **AB** 列 `ROIUid`、第 **AC** 列 `RoiName`（`瘤体` / `水肿` / `肿瘤瘤体` / `全肿瘤` / `异常信号`）、第 **AQ** 列 `Study->CLINICAL->病理结果`（同上，用于病例只在这张表里时兜底）。
   行键必须落在 `RoiName` 上：只写 `roi` 前缀的话会先撞上位置更靠前的 AB 列 `ROIUid`，ROI 名（**掩膜角色 core/peri 的唯一来源**）就退化成普通列了。
 - 级别/病名支持多种写法：列名 `WHO_grade` 或 `WHO分级`，取值 `4` / `4.0` / `4级` / `Ⅳ` / `IV` 都认；`病理结果` 写 `胶质瘤`（不带级数）也算阳性；`其他肿瘤或病变` / `病因不明` 这类**非胶质瘤取值映射为 `TumorProbability=0`**（不是"没有金标准"——否则指标分母会悄悄变小）。
+- **格式说明赛道四那一节里，有两类字段当前不参与任何逻辑**（照格式说明准备数据时容易以为它们在起作用）：① ROI 级的测量值列 `RoiVolume` / `RoiVoxelCount` / `RoiHUMaxValue` 等 90%CI 在内共 8 列 / `CrossSectionalAreaMaxValue` —— 只在 `__roi_rows__` 里**原样保留**，既不用于挑掩膜也不进特征；② `STUDY->CLINICAL->备注`（7 类跳过原因：`重点审核` / `图像质量问题跳过` / `序列缺失跳过` / `构建失败跳过` / `报告缺失跳过` / `阴性数据跳过` / `无`）—— **全工程零引用**，若线上按它剔除病例，本地训练与评测的分母会和线上不一致。
 - 看某张表的真实列名与行数：`python scripts/30_inspect_table.py <表文件> --rows 3`（表放哪都行，离线也能看；表在**数据根上一级**时探针同样能扫到）。
 
 ### 2.3 搬迁数据
@@ -203,7 +211,7 @@ mkdir -p /目标/datasets && ln -s /源路径/training /目标/datasets/training
 
 - [ ] `<阶段>/annotation/SeriesType.xlsx` 存在（**必须与病例目录同层**；漏搬的表现是"病例数正常、却报无任何可用序列"）
 - [ ] 病例目录数与源一致：`ls <阶段>/annotation | grep -E '^[0-9a-f]{32}$' | wc -l`
-- [ ] 每个病例目录下有序列子目录，且 `<序列UID>.nii.gz` 与目录名一致
+- [ ] 每个病例目录下**影像与掩膜平铺在同一层**：`<序列UID>.nii.gz` 与 `<序列UID>_<RoiName>_<RoiNumber>_mask.nii.gz`
 - [ ] 训练集额外有 `脑胶质瘤标注结果-训练集.xlsx`（结构化字段监督用）
 - [ ] 磁盘空间足够（原始 NIfTI 数百 GB，预处理缓存另算）
 
@@ -370,7 +378,9 @@ python scripts/13_build_cache.py --workers 8
 
 ### 4.4 全量训练怎么跑（B / C）
 
-> 命令细节、期望输出与失败处理见 [`docs/TRACK4_RUNBOOK.md`](docs/TRACK4_RUNBOOK.md) §8（本表只做索引）。
+> 📄 **完整分步文档（数据准备 → 训练 → 验证 → 交付，含判据与验收清单）：[`docs/FULL_TRAIN_GUIDE.md`](docs/FULL_TRAIN_GUIDE.md)。** 下面只做索引。
+>
+> 命令细节、期望输出与失败处理另见 [`docs/TRACK4_RUNBOOK.md`](docs/TRACK4_RUNBOOK.md) §8（本表只做索引）。
 
 | 想干什么 | 命令 | 照抄版 |
 |---|---|---|
@@ -534,7 +544,7 @@ python scripts/13_build_cache.py --workers 8
 
 ### 7.2 病例数正常，但报"无任何可用序列"（模态全是 `other`）
 
-说明 `SeriesType.xlsx` 没被找到。
+先看是**哪一种**：探针报告里 `series_type_rows`、`series_desc_rows`、`cases_without_input_channel` 三个数就能分开。
 
 ```bash
 python scripts/30_inspect_table.py --root $DATASET_ROOT --rows 3   # 确认表在不在、列名对不对
@@ -542,7 +552,50 @@ export GLIOMA_LABELS_DIR=<表所在目录>                               # 显�
 bash scripts/01_probe.sh                                            # 看 series_type_rows / modality_counts
 ```
 
-注意只认数据集自带的 `SeriesType.xlsx`；`3_serieslabel.xlsx` 与本赛道无关（会把 `T2WI`/`T2-Flair` 覆盖成 `T2`）。
+模态共**四级**来源，前面拿不到才走后面（探针会报每级的命中量）：
+
+| 级 | 来源 | 看哪个数 |
+|---|---|---|
+| ① | 数据集自带的 `SeriesType.xlsx`（列 `AccessionNumber` / `SeriesUid` / `SeriesType`） | `series_type_rows` |
+| ② | **标注表 `ROI级别` sheet 的「序列描述」**（列名 `DetailDescription` / `SeriesDescription` / `序列描述`，值就是那 5 类模态；行键是 `序列Uid`） | `series_desc_rows` |
+| ③ | 同名 `.json` sidecar 的 `SeriesType` / `SeriesDescription` 等键 | — |
+| ④ | 文件名 / 目录名关键词（模拟集、公开数据） | — |
+| ⑤ | 都不行 → 交给体素判别模型（`scripts/31_train_modality_model.py` → `data/modality_model.json`） | `unknown_series_total` |
+
+- **`series_type_rows=0` 但有 `series_desc_rows>0`**：类型表没到手，②级已顶上（探针会打印"已用标注表的「序列描述」作模态旁证：N 路 / M 例"）。这是**正常兜底**，不是错误。
+- **两级都是 0**：模态只能靠 ⑤ 体素判别；先训练那个模型，否则整批 `unknown`。
+- 注意只认数据集自带的 `SeriesType.xlsx`；`3_serieslabel.xlsx` 与本赛道无关（会把 `T2WI`/`T2-Flair` 覆盖成 `T2`）。
+
+#### 7.2.1 只有 `其他` 序列 / 只有 DWI 的病例：**全放开，照训**
+
+`SeriesType` 里明写 `其他`（或只有 DWI/ADC/SWI）的检查，会一路走到"**4 个输入通道都填不上**"。
+口径是**一例数据都不丢**：
+
+- **掩膜照收**，且与 `SeriesType` 无关（靠文件名 `_mask` 后缀 + ROI 名认）—— 这类病例的掩膜照样进 core / peri 任务空间；
+- 训练时 `build_case_volume` **借该例任意一路影像的几何**建公共网格，把 4 个通道**全零**；掩膜是真值 → 该例照常参与分割监督；
+- 推理端同样保留（要按原始几何写出合规空掩码；缺目录 = 整例 0 分）；
+- 定位数看探针报告的 `cases_without_input_channel`（`build_folds` 与全量模式也会打印这个数）。
+
+代价（**已知并接受**）：这一例的输入是常数，回传的梯度接近噪声；验证集里若有这类例，Dice 基本恒 0，会把选模指标往下拖。所以数量必须看得见，不能静默。
+
+**三条链要分开看**（最容易被揉成一句"SeriesType 决定一切"）：
+
+| 链 | 依赖什么 | 与 `SeriesType` |
+|---|---|---|
+| ① 掩膜**能不能认出来** | 文件名后缀 `_mask` + ROI 名 | **无关** |
+| ② 掩膜**归哪个任务空间**（core / peri） | 它**所在序列的模态** | **有关** |
+| ③ 这一例**能不能进训练/推理** | **输入通道**能否填上（通道取值就是那 4 类） | **有关** |
+
+"崩"只会发生在 ③，而且原因只是**输入侧全空**，与掩膜无关：掩膜一直在、也一直在正确的任务空间里。
+
+#### 7.2.2 四份输入各自"拿不到"时的退路
+
+| 输入 | 拿不到时的退路 | 已接的位置 |
+|---|---|---|
+| `SeriesType.xlsx` | ①→⑤ 逐级降（见上表）；**②级就是为这条准备的** | `probe` 四级链 + 体素模型 |
+| `annotation/{fake, compositing, duplicate}/` | 目录名两套写法都认（`Composition` / `compositing`）；目录不在 → 目标一/二无正样本，**告警但不阻断**；重复金标准退到工作区 `2_duplicate.xlsx` 并**告警可能串表** | `probe.scan_special` / `merge_special_cases` |
+| 标注表的 `检查级别` sheet | 表头行位置不固定 → 前 20 行扫表头；整表认不出 → 打印表头预览 + 整表摊开；验证集**本来就没有**字段金标准表（labels 全空属预期） | `read_structured_table` / `labels_hint` |
+| 验证集 `verification/original/` | 容器名两套（`annotation` / `original`）+ 一条**名字无关**兜底（"唯一子目录里直接有 `SeriesType.xlsx`"就下钻）；`04_eval.sh --split external` 不可用时自动回退折内 val 并告警 | `resolve_case_root` / `external_val_manifest` |
 
 ### 7.3 显存不足
 

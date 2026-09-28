@@ -24,6 +24,11 @@ from typing import Any
 
 import numpy as np
 
+# 控制台编码兜底：本包（导出/桥接）会打印 ✗ / ⚠️ 这类字符，**GBK 控制台上
+# `print` 会直接抛 UnicodeEncodeError**。导入 config 即生效（见其
+# `_make_std_streams_unicode_safe`）；这里只是把它拉进本包的导入图。
+from src.utils import config as _config_unicodesafe                # noqa: F401
+
 # ---- 团队异常类型（独立测试时降级为同名本地异常）----------------------------- #
 try:                                                              # pragma: no cover
     from core.exceptions import InvalidInputError, MissingSeriesError
@@ -38,6 +43,11 @@ except Exception:                                                 # noqa: BLE001
 
 #: 本工程根目录（integration/ 的上一层）
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+#: 认不出模态的序列在 ``available`` / ``uid_by_mod`` 里的键（全放开口径，见
+#: :func:`build_available_map`）。它**不是**一个输入通道：`build_volume_from_arrays`
+#: 只认 `t1c/flair/t2/t1`，这个键的作用是**保住几何与 uid**，让掩膜有地方写回去。
+OTHER_MODALITY = "other"
 
 #: 团队约定的 checkpoint 根目录（规范 §5.2）
 WORKSPACE = Path(os.environ.get("COMPETITION_WORKSPACE", "/2026aicompetition/workspace"))
@@ -76,21 +86,34 @@ def build_available_map(study: Any) -> tuple[dict[str, tuple[np.ndarray, np.ndar
 
     同一模态出现多条序列时保留**第一条**（团队 Loader 已按 series_uid 确定性排序），
     并在返回值中记录实际采用的 series_uid，供掩码写回时定位。
+
+    **全放开口径**（与 ``src/data/dataset.build_case_volume`` 一致，见 README §7.2.1）：
+    **认不出模态的序列不再被丢掉**。整例都被数据信息表标成 `其他`（或只有 DWI/ADC/SWI）
+    时，这里把**第一路**这样的序列挂在键 :data:`OTHER_MODALITY` 下 —— 它进不了任何
+    输入通道（`build_volume_from_arrays` 只认那 4 类，会全零通道），但它的
+    **几何与 uid 必须留着**：掩膜没有"对应模态的源序列"可写回时退到它上面，
+    至少保证每例都产出合规文件（缺文件 = 整例 0 分）。
+
+    只有"**连一路 3D 影像都没有**"时才抛 ``MissingSeriesError`` —— 那时没有可对齐的
+    几何；团队 Runner 会把它转成该例的兜底答案。这与"没有目标模态"是两回事。
     """
     available: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     uid_by_mod: dict[str, str] = {}
     for series in study.series:
-        mod = _guess_modality_from_series(series)
-        if mod is None or mod in available:
-            continue
         image = np.asarray(series.image)
         if image.ndim != 3:
             continue
-        available[mod] = (image, np.asarray(series.affine, dtype=float))
-        uid_by_mod[mod] = str(series.series_uid)
+        # 认不出模态 → 挂 `other`（**不丢**）；同键只取第一条
+        key = _guess_modality_from_series(series) or OTHER_MODALITY
+        if key in available:
+            continue
+        available[key] = (image, np.asarray(series.affine, dtype=float))
+        uid_by_mod[key] = str(series.series_uid)
     if not available:
         raise MissingSeriesError(
-            f"study {getattr(study, 'accession_number', '?')!r} 未识别出任何可用 MRI 序列"
+            f"study {getattr(study, 'accession_number', '?')!r} 没有任何可用 3D 影像"
+            f"（共 {len(study.series)} 条序列）。注意：**只有 `其他` 序列 / 只有 DWI 的"
+            f"病例不算这一类** —— 那种情况会全零通道照走"
         )
     return available, uid_by_mod
 

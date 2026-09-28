@@ -8,6 +8,7 @@ SimpleITK>=2.3             # 重采样/几何（世界坐标桥接）
 scikit-image>=0.21
 pandas>=2.0
 openpyxl>=3.1              # 读金标准 .xlsx（ROI 统计表）
+xlrd>=2.0                  # 读金标准 .xls（Excel 97-2003）；找表时 .xls 也在候选里，缺它即"表在却读不了"
 pyyaml>=6.0
 fastapi>=0.110             # 推理服务（/call + /health）
 uvicorn>=0.29

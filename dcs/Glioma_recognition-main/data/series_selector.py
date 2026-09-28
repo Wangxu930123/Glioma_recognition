@@ -68,8 +68,8 @@ def select(study: Study, wanted: Iterable[str]) -> dict[str, Series]:
 
     **兜底判断（只在"要报错"时生效）**：一个好序列都挑不出来，说明上层马上要抛
     「无任何可用序列」（规范 §9.1 不可降级）或被迫降级推理——此时自动转模态识别：
-    用官方 ``3_serieslabel.xlsx`` 给认不出模态的序列重贴描述后再挑一次
-    （:func:`data.modality_fallback.recover_study`，含工作区搜索与 UID 回退）。
+    用数据集自带的 ``SeriesType.xlsx`` 给认不出模态的序列重贴描述后再挑一次
+    （:func:`data.modality_fallback.recover_study`，含 UID 单键回退）。
     重挑仍为空 → 返回空，让上层按**原逻辑**报错；**挑到了就继续**。
 
     挑得到序列时整个兜底不触发：不读盘、零额外开销，行为与改动前一致

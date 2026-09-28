@@ -90,10 +90,18 @@ _WARNED_NO_OPENPYXL = False
 _WARNED_SERIES_TYPE_DEP = False
 
 #: 类型表的列名候选（顺序即优先级；用**包含**匹配，故短词靠后）。
+#:
+#: 「序列描述」列三种写法都认：格式说明写 ``DetailDescription``、数据集实测拼写是
+#: ``SeriesDescription``（与 DICOM 标签 (0008,103E) 同名）、另有分层写法
+#: ``Study->IMAGE->序列描述``。这是官方列名里原先唯一没被认的一条，
+#: 漏掉即"表找到了、却整表 0 条"。末位 ``serisdescription`` 是历史笔误的兜底。
+#: 与算法工程 ``glioma_track4/src/data/labels.py`` 的同名表**逐字一致**：
+#: 两条路线对同一份数据必须给出同样的模态，别名表分叉就是静默的模态错位。
 _SERIES_TYPE_ALIASES: dict[str, tuple[str, ...]] = {
     "acc": ("accessionnumber", "accession", "检查号", "检查编号", "病例号"),
     "uid": ("seriesinstanceuid", "seriesuid", "序列号", "序列uid"),
-    "typ": ("seriestype", "type", "序列类型", "模态", "序列描述"),
+    "typ": ("seriestype", "type", "序列类型", "模态", "序列描述",
+            "detaildescription", "seriesdescription", "serisdescription"),
 }
 
 #: 表头行扫描行数。**不要假设表头在第几行**：实测数据里第 1~3 行都可能是
@@ -217,16 +225,21 @@ def read_series_types(root: Path) -> dict[tuple[str, str], str]:
     """
     global _WARNED_NO_OPENPYXL, _WARNED_SERIES_TYPE_DEP
 
-    from shared.official_labels import find_named_table
+    from shared.official_labels import (find_named_table,
+                                        find_series_type_table_in_data)
 
     out: dict[tuple[str, str], str] = {}
 
     # 位置与影像同层：`<阶段>/annotation/SeriesType.xlsx`（训练/验证集已下发，
-    # 评测集在正式测试时随测试数据一起下发）。早期这里写的是
-    # `Path(root) / "SeriesType.xlsx"`：只认数据根那一层，于是数据根指成
-    # annotation/ 的上一层（或表被放进容器子目录）时，表就在磁盘上却读不到 ——
-    # 现在与其它表走同一批候选目录（数据根/父/祖父 + 像标注容器的子目录）。
-    hit = find_named_table("SeriesType.xlsx", root)
+    # 评测集在正式测试时随测试数据一起下发）。
+    # ★ **数据优先**：先在数据目录里直接找（root 本身 / annotation/ / original/
+    #   父目录），找不到才退回通用搜索（$GLIOMA_LABELS_DIR / <工程>/labels /
+    #   $WORKSPACE/**/labels）。顺序反了会**串表**：工作区 labels/ 里若残留
+    #   另一份数据的 SeriesType.xlsx（如训练集的拷贝），它会先被命中 ——
+    #   拿训练集的检查号/序列号去查验证集，一条都对不上
+    #   （见 shared.official_labels.find_series_type_table_in_data）。
+    hit = (find_series_type_table_in_data(root)
+           or find_named_table("SeriesType.xlsx", root))
     path = Path(hit) if hit else None
     if path is None:
         return out
@@ -407,23 +420,46 @@ _NON_CASE_DIRS = (frozenset({"annotation", "original", "cache", "runs", "folds",
 def resolve_case_root(root):
     """把"填高了一层"的数据根下钻到真正含病例目录的那一层。
 
-    平台实测结论见 ``glioma_track4/docs/CLOUD_DESKTOP_RUNBOOK.md`` §3.2：
-    ``/2026aicompetition/datasets/training`` 下**只有** ``annotation/``，
-    影像与 ``SeriesType.xlsx`` 都在 ``training/annotation/``。
+    平台实测（2026-09-24）——**训练集与验证集的中间层名字不同**：
+
+    ```text
+    /2026aicompetition/datasets/training/annotation/<检查号>/…      ← 容器叫 annotation
+    /2026aicompetition/datasets/verification/original/<检查号>/…    ← 容器叫 original
+    ```
 
     填高一层不报错、只静默扫到 0 例（训练照常启动、损失照常不动）。
-    规则与提交工程 ``data/loader.py::_resolve_dataset_root`` 一致：
-    仅当"下一层唯一候选"时下钻并告警，候选多于一个时交给
-    :func:`assert_case_root` 报错。
+    规则与算法工程 ``src/data/probe.py::resolve_case_root`` 一致：
+
+    1. 唯一子目录是"容器"（已知容器名，**或其内直接放着 SeriesType.xlsx**）
+       → 下钻并告警 —— 后半条**不依赖容器名**，评测集 ``evaluation_*``
+       的容器叫什么都覆盖；
+    2. 本层存在"非白名单"的子目录 → 病例层（本地模拟集、无表的布局）；
+    3. 已知容器名的唯一候选 → 下钻。
+
+    多阶段父目录交给 :func:`assert_case_root` 报错，不下钻、不猜。
     """
     root = Path(root)
     if not root.is_dir():
         return root
-    if any(p.is_dir() and p.name.lower() not in _NON_CASE_DIRS for p in root.iterdir()):
-        return root                                       # 本层已经有病例目录
     children = sorted(p for p in root.iterdir() if p.is_dir())
+    if not children:
+        return root
+
+    def _is_container(p: Path) -> bool:
+        if p.name.casefold() in _DESCEND_DIRS:
+            return True
+        # 名字无关的判定：容器里直接放着数据信息表（与检查号目录同层）
+        return (p / "SeriesType.xlsx").is_file()
+
+    if len(children) == 1 and _is_container(children[0]):     # ① 唯一子目录是容器
+        print(f"[data][告警] 数据根 {root} 下没有病例目录，已自动下钻到 "
+              f"{children[0].name}/（若不对请用 --data / GLIOMA_DATASET_ROOT 指定）",
+              flush=True)
+        return children[0]
+    if any(p.name.lower() not in _NON_CASE_DIRS for p in children):
+        return root                                       # ② 本层已经有病例目录
     cands = [p for p in children if p.name.casefold() in _DESCEND_DIRS]
-    if len(cands) == 1:
+    if len(cands) == 1:                                   # ③ 已知容器名的唯一候选
         print(f"[data][告警] 数据根 {root} 下没有病例目录，已自动下钻到 "
               f"{cands[0].name}/（若不对请用 --data / GLIOMA_DATASET_ROOT 指定）",
               flush=True)
@@ -584,13 +620,40 @@ def discover_cases(dataset_root: Path, limit: int | None = None) -> list[dict]:
     ):
         from shared.official_labels import describe_modality_sources
 
+        # ★ 查表失败只有三种成因：检查号对不上 / 序列号对不上 / 列认错了。
+        #   把"表里的键"和"磁盘上的名字"**各抽几个摆在一起**，一眼就能看出是哪种；
+        #   不摆出来就只能反复猜（2026-09-24 验证集就栽在这里：表读到了 1735 条，
+        #   但自检只说"未找到"，看不出键对没对上）。
+        _tbl_keys = [k for k in series_types if isinstance(k, tuple)][:3]
+        _tbl_accs = sorted({k[0] for k in series_types
+                            if isinstance(k, tuple) and k[0]})[:2]
+        _tbl_uids = sorted({k[1] for k in series_types
+                            if isinstance(k, tuple) and len(k) > 1})[:2]
+        _disk_accs = [c["accession"] for c in cases[:2]]
+        _disk_uids = [s.get("uid") for c in cases[:2]
+                      for s in (c.get("series") or [])][:3]
+        _acc_hit = sum(1 for c in cases[:50]
+                       if _norm_key(c["accession"]) in
+                       {k[0] for k in series_types if isinstance(k, tuple)})
+        _uid_hit = sum(1 for c in cases[:50] for s in (c.get("series") or [])
+                       if _norm_key(s.get("uid") or "") in
+                       {k[1] for k in series_types if isinstance(k, tuple)})
         print("[data] ⚠️ 没有任何序列能识别出模态（前 50 例逐条试过：目录名/文件名不含关键词，"
               "数据信息表也没给出 T1CE/T2-Flair 这类取值）。\n"
               f"       自检：{describe_modality_sources(root)}\n"
-              "       继续训练会在取数时报「无任何可用序列」。\n"
-              "       处理：先 find $WORKSPACE -name SeriesType.xlsx 定位（表与病例目录同层）；"
-              "表若本来就在，说明清单/标注有问题（把自检行与报错原文一起贴出来）；"
-              "确实在非常规位置就 export GLIOMA_LABELS_DIR=<它所在目录>（或软链到 <工程>/labels）",
+              f"       表已读 {len(series_types)} 条：检查号样例 {_tbl_accs}、"
+              f"序列号样例 {_tbl_uids}（首键 {_tbl_keys[:1]}）\n"
+              f"       磁盘样例：检查号 {_disk_accs}、序列目录 {_disk_uids}\n"
+              f"       键命中（前 50 例）：检查号 {_acc_hit} 例 / 序列号 {_uid_hit} 路\n"
+              "       → 命中为 0 的两种成因：\n"
+              "         ① **串表**（拿另一份数据的表查本批数据，如训练集表查验证集 ——"
+              " 看上面表路径是不是指向 labels/ 而不是本数据目录）；\n"
+              "         ② 键口径不一致（表里检查号/序列号列与磁盘目录名对不上，"
+              "把上面两行样例贴出来即可定位）。\n"
+              "         命中不少却仍认不出 = 表的取值不是 T1/T1CE/T2-Flair/T2WI（贴几行取值）。\n"
+              "       继续训练会在取数时报「无任何可用序列」。"
+              "处理：表就在数据里、与病例目录同层（training→annotation、verification→original）；"
+              "确实在非常规位置就 export GLIOMA_LABELS_DIR=<它所在目录>",
               flush=True)
     return cases
 

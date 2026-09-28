@@ -555,6 +555,27 @@ def main() -> int:
                   and _lst4(_t4, _acc3.upper(), _u3["w"]) == _t4[(_acc3, _u3["w"])],
                   f"{_lst4(_t4, _acc3, _u3['w'])!r}")
 
+            # 「序列描述」列：格式说明写 `DetailDescription`，数据集实测拼写是
+            # `SeriesDescription`（与 DICOM 标签 0008,103E 同名）。两者原先都**认不出** ——
+            # 只能靠"按取值嗅探"兜住，等于把"表头改版"这件事交给运气。
+            # 这里锁三种写法都能**按列名**读出类型。
+            # 自带临时目录：否则新表会被上面"父/祖父回退"的搜索捞到，把 _t4 的条数带偏。
+            with tempfile.TemporaryDirectory(prefix="desc_col_") as _dtmp:
+                for _hdr in (["AccessionNumber", "SeriesUid", "DetailDescription"],
+                             ["AccessionNumber", "SeriesUid", "SeriesDescription"],
+                             ["AccessionNumber", "SeriesUid", "Study->IMAGE->序列描述"]):
+                    _dwb = _WB3()
+                    _dws = _dwb.active
+                    _dws.append(["脑胶质瘤数据信息"])                   # 行1 标题（表头不在首行）
+                    _dws.append(_hdr)
+                    _dws.append([_acc3, _u3["w"], "T2WI"])
+                    _dwb.save(Path(_dtmp) / "SeriesType.xlsx")
+                    _d4, _d5 = _t4rst3(_dtmp), _rst3(Path(_dtmp))
+                    check(f"序列描述列写法 {_hdr[-1]} 按列名就能读出来（不靠取值嗅探）",
+                          _d4.get((_acc3, _u3["w"])) == "T2WI"
+                          and _d5.get((_acc3, _u3["w"])) == "T2WI",
+                          f"track4={dict(_d4)} goals={dict(_d5)}")
+
             # 兜底已**彻底移除**（两条路线一致）：把数据集那张表移走，即使
             # 3_serieslabel.xlsx 就躺在旁边，也必须读到空表 —— 宁可响亮地报
             # series_type_rows=0，也不静默换粗粒度取值顶上（T2WI/T2-Flair → T2）。
@@ -577,6 +598,17 @@ def main() -> int:
                   f"unknown={_c3.get('unknown_series')}")
             check("『其他』被显式标记（报告里可区分「缺表」与「权威排除」）",
                   (_c3["images"].get("other") or {}).get("declared_other") is True)
+            # 清单源头：**组不出序列**的病例不进清单。原先它们留在清单里，
+            # 训练取样时由 `build_case_volume` 抛 RuntimeError 中断整跑
+            # （官方备注里的 `序列缺失跳过` / `构建失败跳过` 正是这类）。
+            # 造一个"只有掩膜、没有影像"的病例，把剔除行为锁成回归。
+            with tempfile.TemporaryDirectory(prefix="nomasks_") as _ntmp:
+                _nd = Path(_ntmp) / "ACC9002"
+                _nd.mkdir()
+                (_nd / "core.nii.gz").write_bytes(b"")
+                _cn = _scan3(str(_ntmp))
+                check("无影像（只有掩膜）的病例不进清单（原先取样时才 RuntimeError）",
+                      _cn == [], f"清单={[c['accession'] for c in _cn]}")
         finally:
             if _env3 is not None:
                 os.environ["GLIOMA_LABELS_DIR"] = _env3
@@ -670,6 +702,57 @@ def main() -> int:
         _ws2.append(["ACC0001", "脑胶质瘤3级"])
         _wb2.save(_hp2)
         check("数据在第二个工作表也能读到", bool(_rst(str(_hp2)).get("ACC0001")))
+        # 编码：中文 Excel/WPS 的「CSV（逗号分隔）」默认 ANSI(GBK)、「Unicode 文本」
+        # 是 UTF-16(带 BOM)。原先一律按 `utf-8-sig` 打开 → UnicodeDecodeError →
+        # **整表读不到**，训练侧表现为"没有标签"（loss 只统计有 mask 的样本，
+        # 照样跑完），只在探针里留一行告警。用**真字节**写两种编码，锁住"能读出来"。
+        # 放独立临时目录：这里的 csv 会被"表搜索"（数据根及其上级）捞到，
+        # 混进 _tmpl 会把后面几条"找到哪张表"的断言带偏。
+        with tempfile.TemporaryDirectory(prefix="enc_csv_") as _etmp:
+            for _enc, _tag in (("gb18030", "ANSI(GBK)"),
+                               ("utf-16", "Unicode 文本(UTF-16)")):
+                _cp = Path(_etmp) / f"labels_{_enc}.csv"
+                _cp.write_text("检查号,病理结果\nACC9001,脑胶质瘤4级\n", encoding=_enc)
+                _crow = (_rst(str(_cp)) or {}).get("ACC9001") or {}
+                check(f"金标准 csv 为 {_tag} 时也能读出（原先 UnicodeDecodeError）",
+                      "脑胶质瘤4级" in str(_crow), f"读到={_crow}")
+            try:
+                (Path(_etmp) / "labels_gb18030.csv").read_text(encoding="utf-8-sig")
+                _old_bad = False
+            except UnicodeDecodeError:
+                _old_bad = True
+            check("复现旧缺陷：ANSI(GBK) 表按 utf-8(sig) 读会 UnicodeDecodeError",
+                  _old_bad)
+
+        # 「备注」= 官方列名 `STUDY->CLINICAL->备注`：格式说明里"该检查是否被跳过"
+        # 的唯一标记（7 类取值），工程里原先**一处都没读** → 线上按备注剔除病例时，
+        # 本地分母与线上不一致、且不报任何错。三条都锁：`无` 不入库、分层列名能命中、
+        # 「影像不可用」与「仅流程跳过」必须能分开（`阴性数据` 还要当检测负样本用）。
+        from src.data.labels import is_hard_skip as _ihs                  # noqa: PLC0415
+        from src.data.labels import skip_reason_of as _sko                # noqa: PLC0415
+        check("「备注」取值 `无` / 空视为未跳过，其余原样取出",
+              _sko({"备注": "无"}) == "" and _sko({}) == ""
+              and _sko({"STUDY->CLINICAL->备注": "序列缺失跳过"}) == "序列缺失跳过")
+        check("跳过原因分「影像不可用」与「仅流程跳过」两类",
+              _ihs("序列缺失跳过") and _ihs("构建失败跳过") and _ihs("图像质量问题跳过")
+              and not _ihs("阴性数据跳过") and not _ihs("无"))
+        check("备注接进病例字段（`无` 不挂键 → 训练侧自动 mask）",
+              structured_from_row({"检查号": "ACC1", "病理结果": "脑胶质瘤3级",
+                                   "备注": "序列缺失跳过"}).get("SkipReason")
+              == "序列缺失跳过"
+              and "SkipReason" not in structured_from_row({"检查号": "ACC1", "备注": "无"}))
+
+        # 训练集入口：拿到**旧清单**（仍含无序列病例）必须当场报错 —— 取样到它才崩
+        # 等于训练跑到一半中断、前面白烧 GPU；而在这里悄悄过滤会让
+        # `_SpecialSupervised` 的两份清单**错位**（同一下标索引两份清单）。
+        from src.data.dataset import GliomaDataset as _GDS                # noqa: PLC0415
+        try:
+            _GDS([{"accession": "ACC9003", "dir": str(_tmpl), "images": {}}])
+            _gds_bad = False
+        except ValueError:
+            _gds_bad = True
+        check("GliomaDataset 拒收没有可用序列的病例（旧清单当场报错）", _gds_bad)
+
         # 计数用唯一记录数（同一行会有多个别名键，直接 len() 会翻倍）
         _p_src = (_TRACK4 / "src/data/probe.py").read_text(encoding="utf-8")
         check("n_structured_rows 按唯一记录计数",
@@ -700,7 +783,7 @@ def main() -> int:
         _wsA.append(["20240102", "", "", "", "", "", "", "1.2.3.bbb", _ACC_B,
                      "", "", "", "", "其他肿瘤或病变"])
         # 序列级 / ROI 级的表头同样在第 2 行。ROI 级的列位置实测为：
-        # Y 列 `SerisDescription`（T1 / T2-FLAIR / T1CE（增强）/ 其他）、AB 列 `ROIUid`、
+        # Y 列 `SeriesDescription`（T1 / T2-FLAIR / T1CE（增强）/ 其他）、AB 列 `ROIUid`、
         # AC 列 `RoiName`（瘤体 / 水肿 / 肿瘤瘤体 / 全肿瘤）、
         # AQ 列 `Study->CLINICAL->病理结果`（与检查级别同字段，用于"病例只在这张表里"时兜底）。
         # 曾经的错法：ROI 行键靠 `roi` **前缀**匹配，命中位置更靠前的 AB 列 `ROIUid`，
@@ -717,7 +800,7 @@ def main() -> int:
         _ACC_C = "3c4d5e6f708192a3b4c5d6e7f8091a2b"      # 只出现在 ROI 级 sheet 的病例
         _wsR = _wb4.create_sheet("ROI级别")
         _wsR.append(["脑胶质瘤标注结果（训练集）"])                        # 行1 标题
-        _put(_wsR, 2, {8: "StudyUid", 9: "AccessioNumber", 25: "SerisDescription",
+        _put(_wsR, 2, {8: "StudyUid", 9: "AccessioNumber", 25: "SeriesDescription",
                        28: "ROIUid", 29: "RoiName", 43: "Study->CLINICAL->病理结果"})
         for _i, (_rn, _sd) in enumerate([("瘤体", "T1"), ("水肿", "T2-FLAIR"),
                                          ("肿瘤瘤体", "T1CE（增强）"),
@@ -756,9 +839,9 @@ def main() -> int:
         _roles = [_gmr(_r.get("RoiName", "")) for _r in _roi_rows]
         check("真实排版：ROI 名 → 掩膜角色（瘤体/肿瘤瘤体=core，水肿/全肿瘤=peri）",
               _roles == ["core", "peri", "core", "peri"], f"roles={_roles}")
-        check("真实排版：ROI 级子行保留序列描述（SerisDescription）",
-              any(_r.get("SerisDescription") == "T1CE（增强）" for _r in _roi_rows),
-              f"描述={[_r.get('SerisDescription') for _r in _roi_rows]}")
+        check("真实排版：ROI 级子行保留序列描述（SeriesDescription）",
+              any(_r.get("SeriesDescription") == "T1CE（增强）" for _r in _roi_rows),
+              f"描述={[_r.get('SeriesDescription') for _r in _roi_rows]}")
         # 病例只在 ROI 级 sheet 里时（检查级别没有这一行），AQ 列的病理结果必须落到病例上：
         # 否则这一例"没有金标准"，评测分母悄悄变小且不报错。
         _tr_ids = _rst(str(_rp), {_ACC_A, _ACC_B, _ACC_C, _ACC_D})      # 带磁盘检查号
@@ -942,6 +1025,222 @@ def main() -> int:
         check("列名认不出时仍能按取值解析出字段",
               "WHO_Grade" in _rep3["label_field_counts"],
               f"keys={sorted(_rep3['label_field_counts'])[:4]}")
+
+    # ---------------------------------------------------------------- #
+    _section("⑭c 官方掩膜命名（扁平布局）：`<UID>_<RoiName>_<RoiNumber>_mask` 的角色判定")
+    # 格式说明原文：影像 `<检查号>/<序列UID>.nii.gz`、掩膜
+    # `<检查号>/<序列UID>_<RoiName>_<RoiNumber>_mask.nii.gz` —— **同目录**，靠文件名区分
+    # （`RoiName`/`RoiNumber` 取自 `脑胶质瘤标注结果-训练集.xlsx` 的 `ROI级别` sheet AC/AD 列）。
+    # 旧实现把**文件名主干**当序列 UID 去查类型表：
+    #   影像 → 裸 UID → 命中 ✔
+    #   掩膜 → `<UID>_瘤体_2_mask` → 精确键与 SUID 单键回退**两轮全落空** → 模态 None
+    # 而 `瘤体` 的角色**依赖模态**（FLAIR/T2→peri、T1/T1CE→core）→ 落成 core。
+    # 错的是**任务空间**：任务B 的掩膜并进任务A，几何还来自另一条序列 ——
+    # 不报错、只是指标偏低，所以必须用**行为**验证（源码里看不出来）。
+    from openpyxl import Workbook as _WB2                          # noqa: PLC0415
+    from src.data.labels import is_official_mask_name as _is_official   # noqa: PLC0415
+    from src.data.labels import series_uid_candidates as _uid_cands     # noqa: PLC0415
+    from src.data.probe import scan_real as _scan_flat             # noqa: PLC0415
+
+    check("掩膜判据 = 文件名后缀 `_mask`（大小写/全角无关），影像不算掩膜",
+          all(_is_official(n) for n in ("2.25.x_瘤体_2_mask.nii.gz",
+                                        "UID_水肿_３_MASK.nii", "a_mask.nii.gz"))
+          and not _is_official("2.25.x.nii.gz"),
+          "RoiName 取值开放（'等等'），只能靠后缀认掩膜")
+    check("能从未知 RoiName 的掩膜名里剥出裸 UID",
+          _uid_cands("2.25.9002_未知Roi名_5_mask")[-1] == "2.25.9002",
+          f"candidates={_uid_cands('2.25.9002_未知Roi名_5_mask')}")
+
+    with tempfile.TemporaryDirectory() as _ftmp:
+        _froot = Path(_ftmp) / "annotation"
+        _facc = "7f1e2d3c4b5a69788796a5b4c3d2e1f0"
+        _U_T1C, _U_FL, _U_OTH = "2.25.9001", "2.25.9002", "2.25.9003"
+        _tiny_nii(_froot / _facc / f"{_U_T1C}.nii.gz")
+        _tiny_nii(_froot / _facc / f"{_U_T1C}_肿瘤瘤体_1_mask.nii.gz")
+        _tiny_nii(_froot / _facc / f"{_U_FL}.nii.gz")
+        _tiny_nii(_froot / _facc / f"{_U_FL}_瘤体_2_mask.nii.gz")       # ← 依赖模态：应为 peri
+        _tiny_nii(_froot / _facc / f"{_U_FL}_水肿_3_mask.nii.gz")
+        _tiny_nii(_froot / _facc / f"{_U_FL}_全肿瘤_4_mask.nii.gz")
+        _tiny_nii(_froot / _facc / f"{_U_OTH}.nii.gz")
+        _tiny_nii(_froot / _facc / f"{_U_OTH}_未知Roi名_5_mask.nii.gz")   # 关键词表之外的取值
+        _wbm = _WB2()
+        _wsm = _wbm.active
+        _wsm.append(["AccessionNumber", "SeriesUid", "SeriesType"])
+        _wsm.append([_facc, _U_T1C, "T1CE（增强）"])
+        _wsm.append([_facc, _U_FL, "T2-Flair"])
+        _wsm.append([_facc, _U_OTH, "其他"])
+        _wbm.save(_froot / "SeriesType.xlsx")
+
+        _fc = _scan_flat(str(_froot), limit_cases=1)[0]
+        _paths = {role: set(e["paths"]) for role, e in (_fc["masks"] or {}).items()}
+        _names = lambda role: sorted(os.path.basename(p) for p in _paths.get(role, ()))  # noqa: E731
+        check("扁平布局：影像按裸 UID 查表得模态（'其他' 仍为权威排除）",
+              sorted(_fc["images"]) == ["flair", "other", "t1c"],
+              f"images={sorted(_fc['images'])}")
+        check("扁平布局：掩膜与影像同 UID，主干未污染 series_uid",
+              _fc["images"]["flair"]["series_uid"] == _U_FL
+              and _fc["images"]["t1c"]["series_uid"] == _U_T1C,
+              f"flair={_fc['images']['flair']['series_uid']}")
+        check("扁平布局：T1CE 上的 `肿瘤瘤体` → core",
+              f"{_U_T1C}_肿瘤瘤体_1_mask.nii.gz" in _names("core"),
+              f"core={_names('core')}")
+        check("扁平布局：FLAIR 上的 `瘤体` → **peri**（修复前会落成 core）",
+              f"{_U_FL}_瘤体_2_mask.nii.gz" in _names("peri")
+              and f"{_U_FL}_瘤体_2_mask.nii.gz" not in _names("core"),
+              f"peri={_names('peri')}")
+        check("掩膜所在序列的模态解析出来了（不是按 core 兜底）",
+              {m.get("modality") for e in (_fc["masks"] or {}).values()
+               for m in e["metas"]} == {"t1c", "flair"},
+              f"metas={sorted({str(m.get('modality')) for e in (_fc['masks'] or {}).values() for m in e['metas']})}")
+        check("认不出角色的掩膜被**跳过**（不进掩膜、也不当影像进通道/未知序列）",
+              all("未知Roi名" not in os.path.basename(p)
+                  for _ps in _paths.values() for p in _ps)
+              and all("未知Roi名" not in (m.get("file") or "")
+                      for m in _fc["images"].values())
+              and all("未知Roi名" not in (u.get("file") or "")
+                      for u in (_fc.get("unknown_series") or [])),
+              "否则体素模型会把它猜成 t1c/t2，标签当输入")
+
+    # ---------------------------------------------------------------- #
+    _section("⑭d 模态的两条来源 + 「没有真输入通道」的病例（**全放开**）")
+    # 两件事原先都是**静默**出事，只能靠行为验证：
+    #   ① `SeriesType.xlsx` 拿不到（或表里缺这个 UID）时，模态只能一路降到"认不出"
+    #      → 训练报「无任何可用序列」，人只会去反复改 DATASET_ROOT / 重配 labels_dir。
+    #      但标注表的 `ROI级别` sheet 有「序列描述」列（DetailDescription /
+    #      SeriesDescription / 序列描述），**取值就是那 5 类模态**，行键是 `序列UID`
+    #      （与磁盘文件名主干同源）→ 这是第二条能**批量**判模态的正规线索。
+    #   ② 类型表里**明写 `其他`** 的病例（或只有 DWI/ADC/SWI 的），4 个输入通道
+    #      **一个都填不上**。注意：它的**掩膜照收**（掩膜靠文件名认，与 SeriesType 无关）
+    #      —— 空的是**输入侧**。口径是**全放开**：`build_case_volume` 借该例任意一路
+    #      影像的几何把 4 通道置零，该例照常参与训练（一例不丢）；只在报告里报数。
+    from src.data.dataset import build_folds as _bfolds           # noqa: PLC0415
+    from src.data.dataset import has_input_channel as _has_ch     # noqa: PLC0415
+    from src.data.labels import has_input_modality as _has_mod     # noqa: PLC0415
+
+    check("判据：`其他` / DWI 凑不出输入通道；T1/T2/FLAIR/T1CE 可以",
+          (not _has_mod({"other": {"path": "x"}}, None)
+           and not _has_mod({"dwi": {"path": "x"}}, None)
+           and _has_mod({"flair": {"path": "x"}}, None)),
+          "`images` 非空 ⇒ 有通道：这条错误假设就是「训练中途随机崩」的根因")
+    check("判据：未知序列（unknown_series）仍算有通道（体素模型可能救回来）",
+          _has_mod({"other": {"path": "x"}}, [{"path": "y"}]),
+          "类型表明写 `其他` 的病例 unknown_series 必为空 → 必然被判 False")
+
+    # 现场一：**只有标注表、没有 SeriesType.xlsx**（"类型表拿不到"）
+    with tempfile.TemporaryDirectory() as _dtmp:
+        _droot = Path(_dtmp) / "annotation"
+        _dacc = "1a2b3c4d5e6f708192a3b4c5d6e7f809"
+        _DU_T1, _DU_FL = "2.25.7001", "2.25.7002"
+        _tiny_nii(_droot / _dacc / f"{_DU_T1}.nii.gz")
+        _tiny_nii(_droot / _dacc / f"{_DU_FL}.nii.gz")
+        _wbd = _WB2()
+        _wsc = _wbd.active
+        _wsc.title = "检查级别"
+        _wsc.append(["AccessionNumber", "Study->CLINICAL->病理结果"])
+        _wsc.append([_dacc, "脑胶质瘤4级"])
+        _wsr = _wbd.create_sheet("ROI级别")
+        _wsr.append(["AccessionNumber", "SeriesUid", "RoiName", "SeriesDescription"])
+        _wsr.append([_dacc, _DU_T1, "肿瘤瘤体", "T1CE（增强）"])
+        _wsr.append([_dacc, _DU_FL, "瘤体", "T2-Flair"])
+        _wbd.save(_droot / "脑胶质瘤标注结果-训练集.xlsx")
+
+        _dout = _probe(str(_droot), limit_cases=8)
+        _dr, _dcases = _dout["report"], _dout["cases"]
+        check("现场①：确实没有类型表（series_type_rows == 0）",
+              _dr["series_type_rows"] == 0, f"rows={_dr['series_type_rows']}")
+        check("标注表「序列描述」被读成模态旁证（2 条序列 UID）",
+              _dr["series_desc_rows"] == 2, f"desc_rows={_dr['series_desc_rows']}")
+        check("模态靠旁证认出 → 影像进 t1c / flair 两个输入通道",
+              bool(_dcases) and sorted(_dcases[0]["images"]) == ["flair", "t1c"],
+              f"images={sorted(_dcases[0]['images']) if _dcases else '∅'}"
+              f"（旧实现整批落进 unknown_series → 训练报「无任何可用序列」）")
+
+    # 现场二：`其他` 病例与正常病例同目录 → 只剔没通道的那一例
+    with tempfile.TemporaryDirectory() as _otmp:
+        _oroot = Path(_otmp) / "annotation"
+        _OACC, _OU = "ffff0000111122223333444455556666", "2.25.8001"    # 只有 `其他`
+        _GACC, _GU = "aaaa1111222233334444555566667777", "2.25.8002"    # 正常 T1CE
+        _tiny_nii(_oroot / _OACC / f"{_OU}.nii.gz")
+        _tiny_nii(_oroot / _GACC / f"{_GU}.nii.gz")
+        _wbo = _WB2()
+        _wso = _wbo.active
+        _wso.append(["AccessionNumber", "SeriesUid", "SeriesType"])
+        _wso.append([_OACC, _OU, "其他"])
+        _wso.append([_GACC, _GU, "T1CE（增强）"])
+        _wbo.save(_oroot / "SeriesType.xlsx")
+
+        _oout = _probe(str(_oroot), limit_cases=8)
+        _by = {c["accession"]: c for c in _oout["cases"]}
+        check("现场②：只有 `其他` 的病例**留在清单里**（全放开口径：一例不丢）",
+              set(_by) == {_OACC, _GACC}, f"清单={sorted(_by)}")
+        check("它被标记「没有真输入通道」并单独计数（报数，不静默）",
+              bool(_by.get(_OACC, {}).get("no_input_channel"))
+              and _oout["report"]["cases_without_input_channel"] == 1,
+              f"n_no_input={_oout['report']['cases_without_input_channel']}")
+        check("`has_input_channel` 对该病例为 False（诊断用；不再据此剔除）",
+              not _has_ch(_by[_OACC]) and _has_ch(_by[_GACC]),
+              f"images={sorted(_by[_OACC]['images'])}")
+        _oman = Path(_otmp) / "manifest.json"
+        _oman.write_text(json.dumps({"cases": list(_by.values())}, ensure_ascii=False),
+                         encoding="utf-8")
+        _ofolds = _bfolds(str(_oman), n_folds=2, force=True)
+        _ocover = {a for e in _ofolds.values() for a in (e.get("val") or [])}
+        check("全放开口径：`build_folds` **一例都不剔**（两例都在折划分里）",
+              _ocover == {_OACC, _GACC}, f"val 覆盖={sorted(_ocover)}")
+
+    # 现场三：检查号**两边口径不一致**（目录名是哈希、表里是另一串）→ 序列级/ROI 级的行
+    # 挂不到任何病例上、`struct` 是空的。但 `序列UID → 序列描述` **与检查号无关**
+    # （UID 两边同源），所以"直读表"这一路必须还能把模态救回来。
+    with tempfile.TemporaryDirectory() as _mtmp:
+        _mroot = Path(_mtmp) / "annotation"
+        _macc, _MU = "deadbeef00112233445566778899aabb", "2.25.7501"
+        _tiny_nii(_mroot / _macc / f"{_MU}.nii.gz")
+        _wbm = _WB2()
+        _wsm2 = _wbm.active
+        _wsm2.title = "ROI级别"
+        _wsm2.append(["AccessionNumber", "SeriesUid", "RoiName", "SeriesDescription"])
+        _wsm2.append(["9999999999", _MU, "肿瘤瘤体", "T1CE（增强）"])    # 检查号对不上磁盘
+        _wbm.save(_mroot / "脑胶质瘤标注结果-训练集.xlsx")
+
+        _mout = _probe(str(_mroot), limit_cases=8)
+        check("现场③：子行挂不上病例时，「序列描述」**直读**仍认出模态",
+              bool(_mout["cases"]) and sorted(_mout["cases"][0]["images"]) == ["t1c"],
+              f"desc_rows={_mout['report']['series_desc_rows']} "
+              f"（旧实现：模态 None → 整批 unknown → 训练报「无任何可用序列」）")
+
+    # 现场四：回答"有数据、有掩膜，为什么还会崩" ——
+    #   掩膜**与 SeriesType 无关**（靠文件名后缀 + ROI 名认，照收不误）；
+    #   崩的不是掩膜，是**输入通道**：`t1c/flair/t2/t1` 一个都填不上，
+    #   分割训练的"输入"这一侧是空的。所以现场四要**同时**钉住两件事。
+    from src.data.dataset import build_case_volume as _bcv          # noqa: PLC0415
+    from src.utils.config import load_config as _lc                 # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as _xtmp:
+        _xroot = Path(_xtmp) / "annotation"
+        _xacc, _XU = "00112233445566778899aabbccddeeff", "2.25.6001"
+        _tiny_nii(_xroot / _xacc / f"{_XU}.nii.gz")
+        _tiny_nii(_xroot / _xacc / f"{_XU}_肿瘤瘤体_1_mask.nii.gz")
+        _wmx = _WB2()
+        _wsx = _wmx.active
+        _wsx.append(["AccessionNumber", "SeriesUid", "SeriesType"])
+        _wsx.append([_xacc, _XU, "其他"])
+        _wmx.save(_xroot / "SeriesType.xlsx")
+
+        _xout = _probe(str(_xroot), limit_cases=8)
+        _xc = _xout["cases"][0]
+        check("现场④：`其他` 序列上的掩膜**照收**（这一点与 SeriesType 无关）",
+              list(_xc["masks"]) == ["core"], f"masks={list(_xc['masks'])}")
+        check("现场④：但 4 个输入通道一个都填不上（`images` 只有 `other`）",
+              sorted(_xc["images"]) == ["other"] and not _has_ch(_xc),
+              f"images={sorted(_xc['images'])}")
+        # 全放开之后的关键行为：**不抛错**，建出"全零 4 通道 + 借该例几何"的体数据，
+        # 掩膜照样在公共网格上（真值不丢）—— 这一例能照常参与训练。
+        _xvol, _xaff, _xms = _bcv(_xc, _lc("preprocess.yaml"))
+        check("现场④：全放开 → **不抛错**，4 通道全零 + 掩膜仍在（该例能照训）",
+              _xvol.shape[0] == 4 and not _xvol.any() and "core" in _xms
+              and _xms["core"].shape == _xvol.shape[1:],
+              f"vol={tuple(_xvol.shape)} 全零={not bool(_xvol.any())} "
+              f"masks={sorted(_xms)}")
 
     # ---------------------------------------------------------------- #
     _section("⑯ 研发侧（glioma_goals）官方标注对接")
@@ -1227,6 +1526,9 @@ def main() -> int:
         ("README.md", "★ 数据路径（影像）", "数据路径显式标注"),
         ("README.md", "★ 数据信息路径", "数据信息路径显式标注"),
         ("README.md", "脑胶质瘤标注结果-训练集.xlsx", "字段金标准表名"),
+        # 掩膜路径原先通篇没有（只写了影像）—— 布局写错会让人照着搬错目录，
+        # 而搬错的后果是"掩膜一颗都认不出"，演练照常跑完、指标全 0。
+        ("README.md", "_<RoiName>_<RoiNumber>_mask.nii.gz", "掩膜数据路径"),
     ]
     for _rel, _needle, _what in _doc_expect:
         _p = _TRACK4 / _rel
@@ -1235,6 +1537,20 @@ def main() -> int:
     _mg = (_TRACK4 / "README.md").read_text(encoding="utf-8")
     check("文档明确那 5 张表与赛道四数据集无关（别再去配它们的路径）",
           "与赛道四数据集没有关系" in _mg)
+    # 全量训练全流程文档：关键命令/前置条件必须在（文档也是交付物的一部分，
+    # 命令改了却不改文档 → 下一个人照着跑不通，且不会有任何报错）。
+    _full_doc = _TRACK4 / "docs" / "FULL_TRAIN_GUIDE.md"
+    _ftxt = _full_doc.read_text(encoding="utf-8") if _full_doc.is_file() else ""
+    check("docs/FULL_TRAIN_GUIDE.md 存在（全量训练全流程）", _full_doc.is_file())
+    for _needle, _what in (
+        ("bash scripts/03_train.sh full", "全量训练命令"),
+        ("bash scripts/01_probe.sh --val", "验证集清单前置"),
+        ("FOLDS=full bash scripts/16_finalize.sh", "全量收尾命令"),
+        ("mask_role_counts", "验证集掩膜判据"),
+        ("checkpoints/g4_full", "全量权重路径"),
+    ):
+        check(f"全量指南含{_what}（{_needle!r}）", _needle in _ftxt)
+    check("README 指向全量指南", "docs/FULL_TRAIN_GUIDE.md" in _mg)
 
     # ---------------------------------------------------------------- #
     print("\n" + "=" * 66)

@@ -25,37 +25,72 @@ sys.path.insert(0, str(ROOT))
 IMG_NAMES = ("t1c.nii.gz", "flair.nii.gz", "t2.nii.gz", "t1.nii.gz")
 
 
+def _stem(name: str) -> str:
+    """``x.nii.gz`` / ``x.nii`` → ``x``。"""
+    low = name.lower()
+    for ext in (".nii.gz", ".nii"):
+        if low.endswith(ext):
+            return name[: -len(ext)]
+    return name
+
+
 def build_eval_dataset(src_root: Path, dst_root: Path, n: int) -> list[str]:
-    """构造**只含影像**的测试集（团队 Loader 会把含 mask/seg/label/roi 的文件排除，
-    但本工程的合成数据掩码是中文名，必须显式只复制影像）。"""
+    """构造**只含影像**的测试集，**两种布局都要认**：
+
+    * **官方扁平布局**：``<检查号>/<序列UID>.nii.gz``（掩膜
+      ``<序列UID>_<RoiName>_<N>_mask.nii.gz`` 与影像**同目录**，必须排除）；
+    * **本地旧模拟集**：``<检查号>/<序列目录>/<模态名>.nii.gz``。
+
+    团队 Loader 会把含 mask/seg/label/roi 的文件排除，但本工程的合成数据掩码是**中文名**
+    （``肿瘤瘤体.nii.gz``），所以这里**显式**只复制影像 —— 漏了这步就是把标签当输入。
+    另外团队 Loader 要求每个 series 目录内**只有一个** NIfTI 且与目录同名，
+    因此统一落成 ``<序列UID>/<序列UID>.nii.gz``。
+
+    ⚠️ 只认旧布局时，官方扁平布局下这里会**一个病例都收不到**（所有条目都不是目录），
+    自测随即报 "no readable NIfTI images" —— 看着像数据缺失，其实是夹具没跟上布局。
+    """
+    from src.data.labels import is_official_mask_name              # 与探针同一套判据
+
     if dst_root.exists():
         shutil.rmtree(dst_root)
     dst_root.mkdir(parents=True)
-    accs = []
+    accs: list[str] = []
     for entry in sorted(src_root.iterdir()):
         if len(accs) >= n:
             break
         if not entry.is_dir() or entry.name == "annotation":
             continue
-        copied = False
+        out_dir = dst_root / entry.name
+        copied = 0
+        # ① 旧布局：<检查号>/<序列目录>/<模态名>.nii.gz
         for series_dir in sorted(entry.iterdir()):
             if not series_dir.is_dir():
                 continue
-            target = dst_root / entry.name / series_dir.name
             for name in IMG_NAMES:
                 source = series_dir / name
                 if source.is_file():
+                    target = out_dir / series_dir.name
                     target.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source, target / name)
-                    copied = True
-        # 团队 Loader 要求每个 series 目录内**只有一个** NIfTI 且与目录同名，
-        # 因此把 <mod>.nii.gz 重命名为 <series_uid>.nii.gz
-        if copied:
-            for series_dir in (dst_root / entry.name).iterdir():
-                files = list(series_dir.glob("*.nii.gz"))
-                if len(files) == 1 and files[0].stem != series_dir.name:
-                    files[0].rename(series_dir / f"{series_dir.name}.nii.gz")
-            accs.append(entry.name)
+                    copied += 1
+        # ② 官方扁平布局：<检查号>/<序列UID>.nii.gz（带 `_mask` 后缀的是掩膜 → 排除）
+        for f in sorted([*entry.glob("*.nii.gz"), *entry.glob("*.nii")]):
+            if is_official_mask_name(f.name):
+                continue
+            target = out_dir / _stem(f.name)
+            target.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, target / f.name)
+            copied += 1
+        if not copied:
+            if out_dir.exists():
+                shutil.rmtree(out_dir)                              # 空病例不留（下游会当无影像处理）
+            continue
+        # 团队 Loader 要求每个 series 目录内**只有一个** NIfTI 且与目录同名
+        for series_dir in out_dir.iterdir():
+            files = [*series_dir.glob("*.nii.gz"), *series_dir.glob("*.nii")]
+            if len(files) == 1 and files[0].stem != series_dir.name:
+                files[0].rename(series_dir / f"{series_dir.name}.nii.gz")
+        accs.append(entry.name)
     return accs
 
 

@@ -96,8 +96,13 @@ class SegmentationTask(StudyTask[Goal5Result]):
         used = payload["used"]
         common_aff = payload["common_affine"]
 
-        # 实际采用的模态（例如 T1C 缺失时用 T1/T2 顶替）→ 决定掩码写回哪条源序列
-        core_mod = used.get("t1c") or used.get("t1") or next(iter(used.values()))
+        # 实际采用的模态（例如 T1C 缺失时用 T1/T2 顶替）→ 决定掩码写回哪条源序列。
+        # **全放开**：4 个通道一个都没填上时 `used` 是**空的**（原写法 `next(iter(...))`
+        # 会抛 StopIteration），此时退到 `available` 里任意一路序列 —— 认不出模态的
+        # 序列也会以 `other` 键留在那里（见 `common.build_available_map`），
+        # 它至少提供了可写回的几何，保证每例都产出合规文件（缺文件 = 整例 0 分）。
+        fallback_mod = next(iter(used.values()), None) or next(iter(available), None)
+        core_mod = used.get("t1c") or used.get("t1") or fallback_mod
         flair_mod = used.get("flair") or used.get("t2") or core_mod
         core_uid = uid_by_mod[core_mod]
         flair_uid = uid_by_mod[flair_mod]

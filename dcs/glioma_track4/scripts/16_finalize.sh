@@ -4,6 +4,9 @@
 #
 #   FOLDS="0 1 2" bash scripts/16_finalize.sh
 #   FOLDS="0 1 2 3" SKIP_MOCK=1 bash scripts/16_finalize.sh
+#   FOLDS="full"    bash scripts/16_finalize.sh      # **全量训练**的收尾（需已接入验证集）
+#       ↑ `full` 会被映射到 checkpoints/g4_full；external 口径与折数无关，
+#         全量单模型同样是"全部权重 × 全部验证集病例"。多 seed 全量写 g4_full43。
 #
 # 评估口径（是否接官方验证集，取决于是不是配了 VAL_ROOT / raw.val 并跑过
 #   `bash scripts/01_probe.sh --val`）：
@@ -28,26 +31,44 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 PY="${PYTHON:-python}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-FOLDS=(${FOLDS:-0 1 2})
-EXIST=()
-for f in "${FOLDS[@]}"; do
-  [[ -f "checkpoints/g4_fold$f/best.pth" ]] && EXIST+=("$f") \
-    || echo "[finalize] 跳过 fold$f（无 checkpoints/g4_fold$f/best.pth）"
-done
-[[ ${#EXIST[@]} -gt 0 ]] || { echo "[finalize] ✗ 没有任何可用折，先训练"; exit 2; }
+#: 折号 / 全量 tag → checkpoints 目录名。
+#: `FOLDS=full`（或 `FOLDS=g4_full43`）即可让**全量训练**的产物走同一套收尾 ——
+#: external 口径本来就不依赖"多折"：全量单模型一样是"全部权重 × 全部验证集病例"。
+_tag_of() {
+  case "$1" in
+    full)       echo "g4_full" ;;      # 全量训练产物固定叫 checkpoints/g4_full
+    g4_*|g4L_*) echo "$1" ;;           # 已是完整 tag
+    *)          echo "g4_fold$1" ;;    # 折号
+  esac
+}
 
-_all() {   # 全部折的绝对路径（逗号分隔）
+FOLDS=(${FOLDS:-0 1 2})
+EXIST=()   # 折号（或全量 tag 原样）—— 供 `--fold N` 这类按折号的调用
+TAGS=()    # 与 EXIST 一一对应的 checkpoints 目录名
+for f in "${FOLDS[@]}"; do
+  _t="$(_tag_of "$f")"
+  if [[ -f "checkpoints/$_t/best.pth" ]]; then
+    EXIST+=("$f"); TAGS+=("$_t")
+  else
+    echo "[finalize] 跳过 $f（无 checkpoints/$_t/best.pth）"
+  fi
+done
+[[ ${#TAGS[@]} -gt 0 ]] || {
+  echo "[finalize] ✗ 没有任何可用权重（checkpoints/g4_fold*/ 或 g4_full*/），先训练"; exit 2; }
+
+_all() {   # 全部权重的绝对路径（逗号分隔）
   local out=""
-  for f in "${EXIST[@]}"; do out="${out:+$out,}$(realpath "checkpoints/g4_fold$f/best.pth")"; done
+  for t in "${TAGS[@]}"; do out="${out:+$out,}$(realpath "checkpoints/$t/best.pth")"; done
   echo "$out"
 }
-_except() {  # 排除第 $1 折的其余折（留一集成）
-  local skip="$1" out=""
-  for f in "${EXIST[@]}"; do
-    [[ "$f" == "$skip" ]] && continue
-    out="${out:+$out,}$(realpath "checkpoints/g4_fold$f/best.pth")"
+_except() {  # 排除第 $1 项对应的权重，其余（留一集成）
+  local skip out=""
+  skip="$(_tag_of "$1")"
+  for t in "${TAGS[@]}"; do
+    [[ "$t" == "$skip" ]] && continue
+    out="${out:+$out,}$(realpath "checkpoints/$t/best.pth")"
   done
-  [[ -n "$out" ]] && echo "$out" || realpath "checkpoints/g4_fold$skip/best.pth"
+  [[ -n "$out" ]] && echo "$out" || realpath "checkpoints/$skip/best.pth"
 }
 
 # ---- 官方验证集（可选链路）--------------------------------------------------
@@ -55,7 +76,11 @@ _except() {  # 排除第 $1 折的其余折（留一集成）
 #   有 → external（最终指标 = 官方验证集）；没有 → oof（折内 val）
 # 说明：`assert_data_source` 的合规告警是 **stdout** 的普通 print，
 # 会和探针结果混在一起，所以这里用 `VALMETA ` 前缀把机器可读行挑出来。
-VAL_META="$("$PY" -c 'import sys
+# ⚠️ 探针输出**不许静默丢弃**：一旦它异常（实测踩过：控制台是 GBK 时，
+# `assert_data_source` 的告警文案含 ⚠️ → `print` 抛 UnicodeEncodeError），
+# 原来会退化成"未接入验证集"并一路走折内口径 —— 清单与掩膜都在，口径却评错了。
+# 所以这里连 stderr 一起抓回：拿不到 VALMETA 行就把原文打出来（不再演戏）。
+VAL_RAW="$("$PY" -c 'import sys
 sys.path.insert(0, ".")
 try:
     from src.utils.config import external_val_manifest
@@ -63,8 +88,16 @@ try:
     n = sum(1 for c in man.get("cases") or [] if c.get("images")) if man else 0
     print("VALMETA %d %d %s" % (1 if man else 0, n, path))
 except Exception:
-    print("VALMETA 0 0 -")' 2>/dev/null | sed -n 's/^VALMETA //p' | tail -1 || true)"
+    import traceback
+    traceback.print_exc()                      # → stderr（被 2>&1 抓走）；不产出 VALMETA 行' 2>&1 || true)"
+VAL_META="$(printf '%s\n' "$VAL_RAW" | sed -n 's/^VALMETA //p' | tail -1)"
 HAS_VAL=0
+if [[ -z "$VAL_META" ]]; then
+  echo "[finalize] ⚠️ 验证集探针**没有产出结果**（不是'验证集不存在'）：下面的原文之后"
+  echo "[finalize]    会按'未接入'继续 —— 若与预期不符，先修这一段再谈口径。"
+  printf '%s\n' "$VAL_RAW" | tail -8 | sed 's/^/    | /'
+  VAL_META="0 0 -"
+fi
 if [[ "$VAL_META" == 1* ]]; then
   HAS_VAL=1
   echo "[finalize] 官方验证集：${VAL_META#1 }"
@@ -74,16 +107,30 @@ else
   echo "[finalize]   想接入：export VAL_ROOT=<验证集目录> && bash scripts/01_probe.sh --val"
 fi
 
+# 折内（OOF / 留一）口径只对**折权重**成立；全量 tag（full / g4_full43）进来时
+# 必须走 external（全量没有"本折 val"这回事），否则 `--fold full` 会让 argparse 直接崩。
+# ⚠️ 这段必须在 `--print-split` **之前**：那条路径会提前 exit，放在后面等于没拦 ——
+#    表现是输出一行无意义的 `foldfull: g4_full`，看着像"划分算出来了"。
+if [[ "$HAS_VAL" != "1" ]]; then
+  case "${EXIST[0]}" in
+    *[!0-9]*)
+      echo "[finalize] ✗ 折内（OOF/留一）口径只适用于折权重，但当前权重是 '${EXIST[0]}'。"
+      echo "[finalize]   全量训练的最终口径是 external，请先接入验证集："
+      echo "[finalize]     export VAL_ROOT=<验证集目录> && bash scripts/01_probe.sh --val"
+      exit 2 ;;
+  esac
+fi
+
 # 自检用（由 scripts/24_verify_eval_split.py 调用）：
 # 只打印"用哪些权重评哪些病例"的划分，不跑任何推理。
 #   bash scripts/16_finalize.sh --print-split
-# 输出（external）： split=external / external: g4_fold0,g4_fold1  ← 全部折
+# 输出（external）： split=external / external: g4_fold0,g4_fold1  ← 全部权重
 # 输出（oof）：      split=oof      / fold0: g4_fold1,g4_fold2     ← 排除 fold0 自身
 if [[ "${1:-}" == "--print-split" ]]; then
   if [[ "$HAS_VAL" == "1" ]]; then
     echo "split=external"
     names=""
-    for f in "${EXIST[@]}"; do names="${names:+$names,}g4_fold$f"; done
+    for t in "${TAGS[@]}"; do names="${names:+$names,}$t"; done
     echo "external: $names"
   else
     echo "split=oof"
@@ -143,7 +190,7 @@ fi
 
 echo
 echo "==================== 4/5 按规范 §5.2 导出提交权重 ===================="
-TAG_CSV="$(printf 'g4_fold%s,' "${EXIST[@]}")"; TAG_CSV="${TAG_CSV%,}"
+TAG_CSV="$(printf '%s,' "${TAGS[@]}")"; TAG_CSV="${TAG_CSV%,}"
 bash scripts/09_export_submission.sh "$TAG_CSV"
 
 if [[ "${SKIP_MOCK:-0}" != "1" ]]; then

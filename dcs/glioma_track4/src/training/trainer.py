@@ -31,7 +31,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from ..data.dataset import (DuplicatePairDataset, GliomaDataset, SpecialImageDataset,
-                            build_case_volume, build_folds, make_targets)
+                            build_case_volume, build_folds, has_input_channel,
+                            make_targets)
 from ..models.unet3d import build_model, cls_spec_from_config
 from ..utils.config import (assert_data_source, data_source_tag, external_val_cases,
                             load_config, load_paths, resolve)
@@ -189,6 +190,16 @@ def make_loaders(cfg: dict, fold: int | None):
     man = _load_manifest(paths["manifest"])
     assert_data_source(man, phase="train")                        # 数据源合规闸门
     cases = man["cases"]
+    # ★ **全放开口径：一例都不剔除。** 这里只把"4 个通道都填不上"的病例**报数**出来
+    #   （整例序列被数据信息表标为 `其他`，或只有 DWI/ADC/SWI）。它们照常进训练：
+    #   `build_case_volume` 借该例任意一路影像的几何、把 4 个通道置零；掩膜是真值，
+    #   任务空间不受影响。代价是这一例回传近噪声梯度 —— 所以数量必须看得见。
+    _no_ch = [c["accession"] for c in cases if not has_input_channel(c)]
+    if _no_ch:
+        print(f"[trainer] 提示：{len(_no_ch)} 例**没有真输入通道**（例如 {_no_ch[:3]}）——"
+              f"序列被数据信息表标为 `其他`、或只有 DWI/ADC/SWI；按**全放开**口径"
+              f"照常训练（4 通道全零 + 借用该例几何），不剔除（成因见 README §7.2）",
+              flush=True)
     if fold is None:
         va, vpath = external_val_cases()
         if not va:
@@ -204,6 +215,15 @@ def make_loaders(cfg: dict, fold: int | None):
                 f"  · {_why}（清单：{vpath}）\n"
                 "  · 首次生成：export VAL_ROOT=<验证集根> && bash scripts/01_probe.sh --val\n"
                 "  · 用不了验证集时请用折内 val：bash scripts/03_train.sh 0")
+        # 验证集同样**全放开**（不剔除）。要盯的点：这类病例输入侧是全零，预测基本为空，
+        # 而掩膜是真值 → Dice 基本恒 0，会把 `checkpoint_metric=val_dice_peri` 往下拖。
+        # 所以只报数、不静默（想干净就自己在验证集清单里去掉这几例）。
+        _va_no_ch = [c["accession"] for c in va if not has_input_channel(c)]
+        if _va_no_ch:
+            print(f"[trainer] 提示：验证集有 {len(_va_no_ch)} 例没有真输入通道"
+                  f"（例如 {_va_no_ch[:3]}）—— 输入全零 → 这些例的 Dice 基本恒 0，"
+                  f"会把选模指标往下拖；在意的话从验证集清单里去掉它们（见 README §7.2）",
+                  flush=True)
         tr = cases
         print(f"[trainer] 全量模式：train={len(tr)}（清单全部病例） "
               f"val={len(va)}（官方验证集 {vpath}；无掩膜的例已剔除——选模只用 Dice）",

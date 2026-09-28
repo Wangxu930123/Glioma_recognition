@@ -38,10 +38,16 @@ if [[ -z "$FOLDS" ]]; then
   # 排除 smoke/bench 等临时折，只取正式训练折
   FOLDS="$(ls -d checkpoints/g4_fold*/ 2>/dev/null | xargs -r -n1 basename | paste -sd, -)"
   if [[ -z "$FOLDS" ]]; then
-    echo "[09] ✗ 未找到 checkpoints/g4_fold*/best.pth，请先训练"
+    # 只训了**全量模型**时（`03_train.sh full` → checkpoints/g4_full/）默认导出它：
+    # 否则这里报"请先训练"，而磁盘上明明有训好的全量权重 —— 演练时极易误判成训练失败。
+    FOLDS="$(ls -d checkpoints/g4_full*/ 2>/dev/null | xargs -r -n1 basename | paste -sd, -)"
+    [[ -n "$FOLDS" ]] && echo "[09] 未找到折权重，改用全量权重：$FOLDS"
+  fi
+  if [[ -z "$FOLDS" ]]; then
+    echo "[09] ✗ 未找到 checkpoints/g4_fold*/best.pth 或 checkpoints/g4_full*/best.pth，请先训练"
     exit 2
   fi
-  echo "[09] 自动选择正式折：$FOLDS"
+  echo "[09] 自动选择正式权重：$FOLDS"
 fi
 
 # 逐折确认权重存在，缺折直接失败（避免导出半套权重）
@@ -52,6 +58,8 @@ for tag in "${arr[@]}"; do
   [[ -z "$tag" ]] && continue
   case "$tag" in
     *fold*) ;;                            # 已含 fold（g4_fold0 / g4L_fold3）→ 原样
+    full) tag="g4_full" ;;                # 全量训练产物固定叫 g4_full
+    g4_*|g4L_*) ;;                        # 已是完整 tag（g4_full / g4_full43）→ 原样
     *) tag="g4_fold$tag" ;;               # 只给了折号 → 补前缀
   esac
   [[ -f "checkpoints/$tag/best.pth" ]] || { echo "[09] ✗ 缺少 checkpoints/$tag/best.pth"; exit 2; }

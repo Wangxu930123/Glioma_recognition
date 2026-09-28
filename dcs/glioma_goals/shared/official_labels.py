@@ -43,6 +43,43 @@ OFFICIAL_LABEL_FILES = {
 #: 环境变量（对应官方 config 的 ``paths.labels_dir``）
 LABELS_DIR_ENV = "GLIOMA_LABELS_DIR"
 
+#: 序列类型表（数据集自带的数据信息）的文件名。
+SERIES_TYPE_TABLE = "SeriesType.xlsx"
+
+#: 数据目录里序列类型表可能待的位置：**与检查号目录同层**（平台契约），
+#: 容器名训练集是 ``annotation``、验证集是 ``original``。
+_DATA_TABLE_SUBDIRS = ("", "annotation", "original")
+
+
+def find_series_type_table_in_data(root: str | os.PathLike | None) -> str | None:
+    """**只在数据目录里**找序列类型表 → 路径或 ``None``。
+
+    为什么需要它（防**跨数据集串表**）：:func:`find_named_table` 的候选顺序是
+    ``$GLIOMA_LABELS_DIR → <工程>/labels → $WORKSPACE/**/labels → 数据根/父/祖父``。
+    若工作区的 ``labels/`` 里残留了一份**另一个数据集**的 ``SeriesType.xlsx``
+    （比如把训练集的表拷过去过），它会**先于**当前数据自己的表被命中 ——
+    表现正是"表读到了几千条、却一条都查不到"：拿训练集的检查号/序列号去查
+    验证集的数据，而且日志里表的路径指向 ``labels/`` 而不是数据目录。
+
+    所以模态表**数据优先**：先查 ``root`` 本身、``root/annotation``、
+    ``root/original``、``root 的父目录``（都不在时才退回通用搜索）。
+    其余四张表（``1_abnormal`` 等）仍走通用搜索 —— 它们本来就在工作区。
+    """
+    if root is None:
+        return None
+    base = Path(str(root)).expanduser()
+    try:
+        base = base.resolve()
+    except OSError:
+        base = base.absolute()
+    for sub in _DATA_TABLE_SUBDIRS:
+        folder = base / sub if sub else base
+        candidate = folder / SERIES_TYPE_TABLE
+        if candidate.is_file():
+            return str(candidate)
+    return str(base.parent / SERIES_TYPE_TABLE) \
+        if (base.parent / SERIES_TYPE_TABLE).is_file() else None
+
 #: 官方 ``5_characteristics.xlsx`` 列名 → 我们的规范字段名
 OFFICIAL_FIELD_COLUMNS = {
     "Glioma": "TumorProbability",            # No / Yes
@@ -288,12 +325,19 @@ def describe_modality_sources(root: str | os.PathLike | None = None) -> str:
 
     只报这一张表：模态**只有一个来源**（工作区那份 ``3_serieslabel.xlsx`` 已不再被读，
     列出来只会误导排查方向）。
+
+    查找顺序与 :func:`read_series_types` 完全一致（**数据优先**，见
+    :func:`find_series_type_table_in_data`）—— 自检报的必须是真正会用到的那张表，
+    否则"自检说找到了、实际读的是另一张"会把排查带偏。
     """
-    path = find_named_table("SeriesType.xlsx", root)
+    path = (find_series_type_table_in_data(root)
+            or find_named_table("SeriesType.xlsx", root))
     if path:
         return f"数据信息表 SeriesType.xlsx={path}"
-    return ("数据信息表 SeriesType.xlsx=未找到（已搜 $GLIOMA_LABELS_DIR、<工程>/labels、"
-            "$WORKSPACE 下 3 层、数据根/父/祖父；平台数据里这张表与病例目录同层）")
+    return ("数据信息表 SeriesType.xlsx=未找到（已按数据优先搜过 "
+            "<数据根>/SeriesType.xlsx、annotation/、original/、父目录，"
+            "再退 $GLIOMA_LABELS_DIR、<工程>/labels、$WORKSPACE 下 3 层；"
+            "平台数据里这张表与病例目录同层）")
 
 
 # --------------------------------------------------------------------------- #

@@ -67,7 +67,8 @@ def build_volume(study: Study, cfg: Goal5Config) -> PreparedVolume:
             f"（共 {len(study.series)} 条；uid/描述前几条={seen}）。"
             f"若 uid 是哈希或 DICOM UID，说明序列类型没读到："
             f"确认数据根下有 SeriesType.xlsx 或同名 .json sidecar"
-            f"（已自动尝试转模态识别：{describe_sources()}）"
+            f"（已自动尝试转模态识别："
+            f"{describe_sources([s.source_path for s in study.series])}）"
         )
 
     # 1) 选参考网格：优先 1mm 附近的模态，且必须在实际存在的序列中选择

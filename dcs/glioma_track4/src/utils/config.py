@@ -10,9 +10,32 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from typing import Any
 
 import yaml
+
+# --------------------------------------------------------------------------- #
+# 控制台编码兜底：**只防止"打印就崩"**，不改任何业务行为
+# --------------------------------------------------------------------------- #
+# 诊断文案里带 ✗ / ⚠️ / ✓ 这类字符，在 **GBK 控制台**（Windows 中文环境）上
+# ``print`` 会抛 ``UnicodeEncodeError``。危险的不是"少打一行"，而是它**打在了
+# 关键路径上**：
+#   · ``assert_data_source`` 的"数据源标识不一致（**仅告警**）"会变成硬失败；
+#   · ``16_finalize.sh`` 的验证集探针把任何异常吞成"未接入"→ **验证集配好了却
+#     静默回退折内口径**（实测踩过：清单在、掩膜在，评估却一路走 OOF）；
+#   · 探针的 ``[probe][告警]`` 系列同理。
+# 因此导入本模块时把两个标准流的错误策略置为 ``replace``：非 UTF-8 终端上那些
+# 字符退化成 ``?``，其余内容照常输出。UTF-8 环境下行为完全不变。
+def _make_std_streams_unicode_safe() -> None:
+    for name in ("stdout", "stderr"):
+        try:
+            getattr(sys, name).reconfigure(errors="replace")      # Python 3.7+
+        except Exception:                                        # noqa: BLE001
+            pass                                                 # 被重定向/无此 API 时忽略
+
+
+_make_std_streams_unicode_safe()
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 CONFIG_DIR = os.path.join(PROJECT_ROOT, "configs")

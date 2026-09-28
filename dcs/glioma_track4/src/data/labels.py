@@ -322,7 +322,7 @@ def _find_id_column(header) -> str | None:
 #: |---|---|---|
 #: | ``1_abnormal.xlsx`` | AccessionNumber, SeriesUid, **Label** ∈ {true,fake,compositing,duplicate} | 目标一/二的正样本（**逐序列**） |
 #: | ``2_duplicate.xlsx`` | src_img, desc_img | 重复影像 pair |
-#: | ~~``3_serieslabel.xlsx``~~ | ~~AccessionNumber, SeriesUid, SeriesLabel~~ | **已删除，不再读**（模态只认数据集里的 ``SeriesType.xlsx``；读它只会把 ``T2WI``/``T2-Flair`` 静默压平成 ``T2``） |
+#: | ~~``工作区兼容表``~~ | ~~AccessionNumber, SeriesUid, SeriesLabel~~ | **已删除，不再读**（模态只认数据集里的 ``SeriesType.xlsx``；读它只会把 ``T2WI``/``T2-Flair`` 静默压平成 ``T2``） |
 #: | ``4_masklabel.xlsx`` | AccessionNumber, SeriesUid, **Maskname** | 掩膜文件名（任意名，关键词认不出） |
 #: | ``5_characteristics.xlsx`` | AccessionNumber + 14 个英文列 | 结构化字段金标准（**兼容**；数据集里那份是中文表头的 ``脑胶质瘤标注结果-训练集.xlsx``） |
 #:
@@ -331,7 +331,7 @@ def _find_id_column(header) -> str | None:
 #: 只是文件名和列名都不是我们猜的那套。
 #:
 #: 因此本字典里**没有** ``series`` 这个键（:data:`OFFICIAL_LABEL_FILES`）——
-#: 找表、打印自检时都不会再出现 ``3_serieslabel.xlsx``。
+#: 找表、打印自检时都不会再出现 ``工作区兼容表``。
 OFFICIAL_LABEL_FILES = {
     "abnormal": "1_abnormal.xlsx",
     "duplicate": "2_duplicate.xlsx",
@@ -349,7 +349,7 @@ OFFICIAL_LABEL_FILES = {
 SERIES_TYPE_TABLE = "SeriesType.xlsx"
 
 #: 查找/自检文案里出现的表名（**只有一个名字**：数据集自带的那张）。
-#: 以前这里还有 ``3_serieslabel.xlsx`` 做兜底 —— 已删除：它与本赛道数据集无关，
+#: 以前这里还有 ``工作区兼容表`` 做兜底 —— 已删除：它与本赛道数据集无关，
 #: 而且取值更粗（只写 ``T2``），会把数据集里的 ``T2WI`` / ``T2-Flair`` 静默压平。
 SERIES_TYPE_FILENAMES = (SERIES_TYPE_TABLE,)
 
@@ -357,61 +357,20 @@ SERIES_TYPE_FILENAMES = (SERIES_TYPE_TABLE,)
 LABELS_DIR_ENV = "GLIOMA_LABELS_DIR"
 
 
-#: 在 ``$WORKSPACE`` 下做有界搜索时要跳过的目录（缓存/日志里不可能有官方表，
-#: 但它们动辄上万个子目录，不剪掉会让这一步从"秒级"变成"分钟级"）
-_SKIP_WORKSPACE_DIRS = frozenset({
-    "cache", "cache_nifti", "cache_dicom", "logs", "checkpoints", "runs", "outputs",
-    "tmp", "node_modules", "__pycache__",
-})
-
-
-def workspace_labels_dirs(max_depth: int = 3) -> list[Path]:
-    """``$WORKSPACE`` 下所有名为 ``labels`` 的目录（按"官方表更全 + 更新"排序）。
-
-    为什么需要它：官方 5 张表**不随数据集下发**，通常躺在团队持久化工作区里
-    （如 ``<workspace>/dcs/goal1and2/Goal1and2/labels``）。有了这一步，容器里
-    **零配置**就能读到表，不必每个人都记得 ``export GLIOMA_LABELS_DIR``。
-
-    搜索是**有界**的（深度 ≤ ``max_depth``、目录名必须恰好是 ``labels``、
-    剪掉缓存/日志类目录），因此代价与工作区规模无关。
-    """
-    ws = Path(os.environ.get("WORKSPACE") or "/2026aicompetition/workspace").expanduser()
-    if not ws.is_dir():
-        return []
-    hits: list[Path] = []
-
-    def walk(d: Path, depth: int) -> None:
-        try:
-            entries = list(os.scandir(d))
-        except OSError:
-            return
-        for e in entries:
-            try:
-                if not e.is_dir():
-                    continue
-            except OSError:
-                continue
-            if e.name.startswith(".") or e.name in _SKIP_WORKSPACE_DIRS:
-                continue
-            child = Path(e.path)
-            if e.name == "labels":
-                hits.append(child)                      # 命中即止，不再往里钻
-                continue
-            if depth < max_depth:
-                walk(child, depth + 1)
-
-    walk(ws, 0)
-
-    def score(p: Path) -> tuple[int, float]:
-        files = [p / name for name in OFFICIAL_LABEL_FILES.values()]
-        n = sum(f.is_file() for f in files)
-        try:
-            mt = max(f.stat().st_mtime for f in files if f.is_file())
-        except (OSError, ValueError):
-            mt = 0.0
-        return (n, mt)                                  # 表更全优先，其次更新
-
-    return sorted(set(hits), key=score, reverse=True)
+#: **表的搜索范围 = 数据根（+其父/祖父 + 像标注容器的子目录）。**
+#:
+#: 这里曾经还会去 ``<工程>/labels`` 与 ``$WORKSPACE`` 下 3 层翻 ``labels/`` 目录
+#: （"零配置读到团队工作区那几张表"）。**已移除**，原因有两条：
+#:
+#: 1. **串表**：工作区里若残留**另一份数据**的表，它会先于当前数据自己的表被命中 ——
+#:    表现是"表读到了几千条、却一条都查不中"（拿训练集的键查验证集），日志里表路径
+#:    指向 ``labels/`` 而不是数据目录，一眼看不出串了；
+#: 2. **本赛道数据集自带全部所需**：模态在 ``SeriesType.xlsx``、掩膜靠 ``_mask`` 文件、
+#:    字段金标准是 ``脑胶质瘤标注结果-*.xlsx``、特殊/重复影像靠 ``{fake,compositing,
+#:    duplicate}/`` 目录 —— 那 5 张工作区表**不是本赛道数据集的内容**，翻它们只会带偏。
+#:
+#: 仍然保留**显式**入口（见 :data:`LABELS_DIR_ENV`）：只有你亲手指定时才用它，
+#: 不做任何隐式搜索。
 
 
 #: 候选目录里**值得下钻一层**的子目录名（大小写无关）：标注/结果类容器。
@@ -456,27 +415,24 @@ def label_search_dirs(root: str | os.PathLike | None = None,
     """标注表候选目录（**顺序即优先级**，命中即止）。
 
     1. 显式传入的 ``labels_dir``（对应官方 config 的 ``paths.labels_dir``）
-    2. 环境变量 ``GLIOMA_LABELS_DIR``
-    3. **本工程目录下的 ``labels/``**（官方默认 ``./labels``）
-    4. ``$WORKSPACE`` 下名为 ``labels`` 的目录（**团队工作区里那份**；平台不随数据集下发，
-       见 :func:`workspace_labels_dirs`。容器里靠这一步做到零配置）
-    5. 数据根自身、父目录、祖父目录 —— 平台把 ``SeriesType.xlsx`` 放在**病例目录那一层**
-       （``training/annotation/``），第 5 条就是为它准备的；传进来的若是**病例目录**，
-       父/祖父两级正好覆盖到 ``annotation/``
-    6. 上述每个目录下"像标注容器"的一级子目录（见 :data:`_LABEL_SUBDIR_NAMES`）——
+    2. 环境变量 ``GLIOMA_LABELS_DIR`` —— **显式**指定，只有你亲手设了才用它
+    3. 数据根自身、父目录、祖父目录 —— 官方把 ``SeriesType.xlsx`` / 字段金标准放在
+       **病例目录那一层**（``training/annotation/``），第 3 条就是为它准备的；
+       传进来的若是**病例目录**，父/祖父两级正好覆盖到 ``annotation/``
+    4. 上述每个目录下"像标注容器"的一级子目录（见 :data:`_LABEL_SUBDIR_NAMES`）——
        防止表藏在 ``annotation/`` 的下一层（下载解压后常见的 ``标注结果/``）
 
-    抽成独立函数是因为各类表**可能不在一起**：赛道四数据集自带 ``SeriesType.xlsx``
-    （与病例目录同层），而字段金标准 / 掩膜名表在**工作区**的 ``labels/`` 下；
-    两套搜索必须同一口径，否则又出现"表在磁盘上、代码却只看了一个目录"。
+    ⚠️ **不再搜 ``<工程>/labels`` 与 ``$WORKSPACE``**：隐式翻别处的表会**串表**
+    （工作区里残留另一份数据的表 → 先于当前数据被命中，"表读到几千条却一条都查不中"），
+    而本赛道数据集自带全部所需（模态 `SeriesType.xlsx`、掩膜 `_mask` 文件、
+    字段 `脑胶质瘤标注结果-*.xlsx`、特殊/重复影像的 `fake/compositing/duplicate` 目录）。
+    需要指向别处的表时，用 ``GLIOMA_LABELS_DIR`` **显式**说明。
     """
     cands: list[Path] = []
     if labels_dir:
         cands.append(Path(labels_dir).expanduser())
     if os.environ.get(LABELS_DIR_ENV):
         cands.append(Path(os.environ[LABELS_DIR_ENV]).expanduser())
-    cands.append(Path(__file__).resolve().parents[2] / "labels")      # <工程>/labels
-    cands.extend(workspace_labels_dirs())                             # $WORKSPACE/**/labels
     if root is not None:
         base = Path(str(root)).expanduser()
         try:
@@ -556,7 +512,7 @@ def find_official_labels(root: str | os.PathLike | None = None,
     这也是"数据根下找不到金标准"的原因之一。``root=None`` 时只搜 1~4
     （用于报错时做"表到底在不在"的自检）。
 
-    ⚠️ 里面**没有模态表**：``3_serieslabel.xlsx`` 已从 :data:`OFFICIAL_LABEL_FILES`
+    ⚠️ 里面**没有模态表**：``工作区兼容表`` 已从 :data:`OFFICIAL_LABEL_FILES`
     移除，模态只在数据集的 ``SeriesType.xlsx`` 里认（见 :func:`read_series_types`）。
     """
     cands = label_search_dirs(root, labels_dir)
@@ -592,9 +548,10 @@ def find_series_type_table_in_data(root: str | os.PathLike | None) -> str | None
     """**只在数据目录里**找序列类型表 → 路径或 ``None``。
 
     为什么需要它（防**跨数据集串表**）：:func:`find_named_table` 的候选顺序是
-    ``$GLIOMA_LABELS_DIR → <工程>/labels → $WORKSPACE/**/labels → 数据根/父/祖父``。
-    若工作区的 ``labels/`` 里残留了一份**另一个数据集**的 ``SeriesType.xlsx``
-    （比如把训练集的表拷过去过），它会**先于**当前数据自己的表被命中 ——
+    ``显式 labels_dir/$GLIOMA_LABELS_DIR → 数据根/父/祖父``。
+    早先这一轮还会去 ``<工程>/labels`` 与 ``$WORKSPACE/**/labels``，若那里残留了一份
+    **另一个数据集**的 ``SeriesType.xlsx``（比如把训练集的表拷过去过），它会**先于**
+    当前数据自己的表被命中 ——
     表现正是"表读到了几千条、却一条都查不到"：拿训练集的检查号/序列号去查
     验证集的数据（2026-09-24 排查过的故障形态），而且日志里表的路径指向
     ``labels/`` 而不是数据目录，一眼看不出串了。
@@ -1707,8 +1664,8 @@ def describe_modality_sources(root: str | os.PathLike | None = None) -> str:
     table_desc = "；".join(f"数据信息表 {name}={path}" for name, path in found if path)
     if not table_desc:
         table_desc = (f"数据信息表 {SERIES_TYPE_TABLE}=未找到（已搜 "
-                      "$GLIOMA_LABELS_DIR、<工程>/labels、$WORKSPACE 下 3 层、数据根/父/祖父"
-                      "+ 像标注容器的子目录；它就在数据里、与病例目录同层）")
+                      "数据根/父/祖父 + 像标注容器的子目录，以及显式指定的 "
+                      "$GLIOMA_LABELS_DIR；它就在数据里、与病例目录同层）")
     try:
         from .modality_model import DEFAULT_MODEL_PATH
         model_desc = (f"体素判别模型 {DEFAULT_MODEL_PATH}="
@@ -1867,7 +1824,7 @@ def read_series_types(root: str | os.PathLike,
     还会按**取值**嗅探三列（见 :func:`_sniff_series_type_columns`），
     所以列名改版、前两列是索引列都读得到。
 
-    **工作区那份 ``3_serieslabel.xlsx`` 一律不读**：它不是本赛道数据集的内容，
+    **工作区那份 ``工作区兼容表`` 一律不读**：它不是本赛道数据集的内容，
     且取值更粗（只有 ``T1CE``/``T2``/``FLAIR``），一旦参与合并就会把 ``T2WI`` /
     ``T2-Flair`` 静默压平、把 ``其他`` 变成假 ``FLAIR`` ——
     表现是"模态看着都认出来了、通道里却是错的对比度"，比直接报错难查得多。
@@ -1880,9 +1837,9 @@ def read_series_types(root: str | os.PathLike,
     out: dict[tuple[str, str], str] = {}
 
     # ★ 数据优先：这张表随数据下发、与检查号目录同层。先在数据目录里直接找，
-    #   找不到才退回通用搜索（$GLIOMA_LABELS_DIR / <工程>/labels / $WORKSPACE…）。
-    #   顺序反了会串表：工作区 labels/ 里若残留另一份数据的 SeriesType.xlsx，
-    #   它会先被命中 → 拿训练集的键查验证集，一条都对不上（见
+    #   找不到才退回**显式**指定的 $GLIOMA_LABELS_DIR（不再隐式搜 <工程>/labels
+    #   与 $WORKSPACE：那会串表 —— 工作区里若残留另一份数据的 SeriesType.xlsx，
+    #   它会先被命中 → 拿训练集的键查验证集，一条都对不上，见
     #   :func:`find_series_type_table_in_data`）。
     path = (find_series_type_table_in_data(root)
             or find_named_table(SERIES_TYPE_TABLE, root, labels_dir))
@@ -2032,6 +1989,20 @@ def is_official_mask_name(filename: str) -> bool:
     大小写/全角无关（``_MASK`` / 全角扩展名都认）。
     """
     return nifti_stem(filename).casefold().endswith(MASK_FILE_SUFFIX)
+
+
+#: 大赛检查号的形态：**32 位十六进制**（实测 ``0050d79429cf4d86907dc8c4a34cbf04``）。
+#:
+#: 这是"这一层就是大赛数据的病例目录"的**唯一判据**，也是"只读大赛数据"的执行点：
+#: 平台上 ``<数据根>/<检查号>/…``，检查号必然长这样。任何不满足的顶层目录
+#: （别的数据集、随手一个堆着 nii 的目录）都在**读取之前**被挡掉 ——
+#: 读了会污染训练与指标，报出来会把排查方向带偏，两者都不允许（2026-09-28）。
+OFFICIAL_ACCESSION_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def is_official_accession(name: str) -> bool:
+    """该目录名是大赛检查号吗（32 位十六进制；大小写不敏感）。"""
+    return bool(OFFICIAL_ACCESSION_RE.match(str(name or "").strip().casefold()))
 
 
 def series_uid_candidates(stem: str) -> tuple[str, ...]:
@@ -2243,7 +2214,7 @@ def read_series_desc_index(path: str | os.PathLike) -> dict[str, str]:
 
 
 #: 非"字段金标准表"的文件名关键词（见 :func:`find_structured_tables`）。
-#: 两个序列类型表的命名（数据集里的 ``SeriesType`` / 工作区那份 ``3_serieslabel``）
+#: 序列类型表的命名（只认数据集自带的 ``SeriesType``；工作区里别处的表一律不读）
 #: 都在其中：它们的列是 ``AccessionNumber/SeriesUid/SeriesType|SeriesLabel``，
 #: 一行字段都映射不出来，混进来只会让"解析出 N 行 / 有表但没解析出"这两句诊断互相矛盾。
 #: （后者虽已不读，但仍要在**找表**时排除 —— 否则诊断计数还是会被它带偏。）
@@ -2262,7 +2233,7 @@ def find_structured_tables(root: str, max_parents: int = 2) -> list[str]:
     分不清是"没表"还是"数据根定位偏了一层"。
 
     排除另有专用读取器的表（见 :data:`_NON_LABEL_TABLE_KW`）：序列类型表
-    （``SeriesType.xlsx`` / ``3_serieslabel.xlsx``）、掩膜名表（``4_masklabel.xlsx``）、
+    （``SeriesType.xlsx`` / ``工作区兼容表``）、掩膜名表（``4_masklabel.xlsx``）、
     重复影像金标准（``gold*.csv`` / ``2_duplicate.xlsx``）—— 它们都不是字段金标准，
     混进来会污染"解析出 N 行"这个计数，把诊断信息带偏。
 

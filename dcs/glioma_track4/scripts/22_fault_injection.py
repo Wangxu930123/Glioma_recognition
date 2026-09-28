@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -30,6 +31,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 SZ = 48                                     # 基准体积边长（小体积 → 单次滑窗，跑得快）
+
+
+def _acc(tag: str) -> str:
+    """由场景名派生一个**大赛形态**的检查号（32 位十六进制）。
+
+    检查号必须是 32 位十六进制（平台契约）：``scan_real`` 只认大赛布局，
+    ``FAULT001`` 这类名字在发现层就被挡掉，整批会一例都扫不到。
+    """
+    return hashlib.md5(tag.encode("utf-8")).hexdigest()
 
 
 def _affine(spacing=(1.0, 1.0, 1.0)) -> np.ndarray:
@@ -221,8 +231,8 @@ def s_mask_shape_mismatch(root: str, acc: str) -> None:
     _nii(f"{ad}/mask_core.nii.gz", np.ones((32, 32, 32), np.uint8))
 
 
-def s_brats_labels(root: str, acc: str) -> None:
-    """BraTS 风格多类标签（0/1/2/4）当作掩码，且 core/flair 写在同一目录下。"""
+def s_multiclass_labels(root: str, acc: str) -> None:
+    """多类标签（0/1/2/4）当作掩码，且 core/flair 掩码写在同一目录下。"""
     d, ad = _case_dir(root, acc)
     _nii(f"{d}/t1c.nii.gz", _tumor())
     _nii(f"{d}/flair.nii.gz", _tumor())
@@ -230,14 +240,7 @@ def s_brats_labels(root: str, acc: str) -> None:
     lab[10:20, 10:20, 10:20] = 1
     lab[20:30, 20:30, 20:30] = 2
     lab[30:36, 30:36, 30:36] = 4
-    _nii(f"{ad}/seg_brats.nii.gz", lab)
-
-
-def s_weird_accession(root: str, acc: str) -> None:
-    """AccessionNumber 含空格与特殊字符（目录名即 Acc）。"""
-    d, _ad = _case_dir(root, acc)
-    _nii(f"{d}/t1c.nii.gz", _tumor())
-    _nii(f"{d}/flair.nii.gz", _tumor())
+    _nii(f"{ad}/seg_multilabel.nii.gz", lab)
 
 
 def s_huge_intensity(root: str, acc: str) -> None:
@@ -249,30 +252,32 @@ def s_huge_intensity(root: str, acc: str) -> None:
     _nii(f"{ad}/mask_core.nii.gz", (v > 1e9).astype(np.uint8))
 
 
-SCENARIOS: list[tuple[str, object, str | None]] = [
-    ("正常对照", s_normal, None),
-    ("影像损坏(随机字节)", s_corrupt, None),
-    ("影像被截断", s_truncated, None),
-    ("0字节文件", s_empty_file, None),
-    ("影像全0", s_all_zero, None),
-    ("影像全NaN", s_all_nan, None),
-    ("影像含inf", s_with_inf, None),
-    ("缺T1C(仅FLAIR)", s_only_flair, None),
-    ("缺FLAIR(仅T1C)", s_only_t1c, None),
-    ("无影像仅有掩码", s_no_image, None),
-    ("空病例目录", s_empty_dir, None),
-    ("spacing=0.01mm", s_tiny_spacing, None),
-    ("spacing=20mm", s_huge_spacing, None),
-    ("单切片D=1", s_single_slice, None),
-    ("4D影像", s_4d_volume, None),
-    ("affine全0", s_singular_affine, None),
-    ("affine含NaN", s_nan_affine, None),
-    ("2x2x2极小体积", s_tiny_volume, None),
-    ("掩码维度不符", s_mask_shape_mismatch, None),
-    ("BraTS多类标签", s_brats_labels, None),
-    ("Acc含特殊字符", s_weird_accession, "P &特殊-001_CT"),
-    ("强度1e10", s_huge_intensity, None),
+SCENARIOS: list[tuple[str, object]] = [
+    ("正常对照", s_normal),
+    ("影像损坏(随机字节)", s_corrupt),
+    ("影像被截断", s_truncated),
+    ("0字节文件", s_empty_file),
+    ("影像全0", s_all_zero),
+    ("影像全NaN", s_all_nan),
+    ("影像含inf", s_with_inf),
+    ("缺T1C(仅FLAIR)", s_only_flair),
+    ("缺FLAIR(仅T1C)", s_only_t1c),
+    ("无影像仅有掩码", s_no_image),
+    ("空病例目录", s_empty_dir),
+    ("spacing=0.01mm", s_tiny_spacing),
+    ("spacing=20mm", s_huge_spacing),
+    ("单切片D=1", s_single_slice),
+    ("4D影像", s_4d_volume),
+    ("affine全0", s_singular_affine),
+    ("affine含NaN", s_nan_affine),
+    ("2x2x2极小体积", s_tiny_volume),
+    ("掩码维度不符", s_mask_shape_mismatch),
+    ("多类标签掩码(0/1/2/4)", s_multiclass_labels),
+    ("强度1e10", s_huge_intensity),
 ]
+# 注：**不再有"检查号含特殊字符"这一类**。检查号必须是 32 位十六进制
+# （平台契约，见 ``src/data/labels.py::is_official_accession``）：不满足的目录
+# 在发现层就被挡掉、连读都不读，构造这类输入已无意义。
 
 
 def main() -> int:
@@ -306,8 +311,8 @@ def main() -> int:
     print("=" * 78)
     print(f"故障注入压测：{len(SCENARIOS)} 个场景    权重={os.path.relpath(ckpt, ROOT)}")
     print("=" * 78)
-    for i, (name, fn, acc_override) in enumerate(SCENARIOS):
-        acc = acc_override or f"FAULT{i:03d}"
+    for name, fn in SCENARIOS:
+        acc = _acc(name)                       # 大赛形态检查号（32 位十六进制）
         accs[acc] = name
         try:
             fn(ds, acc)

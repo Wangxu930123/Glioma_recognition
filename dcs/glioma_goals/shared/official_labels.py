@@ -11,7 +11,7 @@
 | ``4_masklabel.xlsx`` | AccessionNumber, SeriesUid, **Maskname** | 掩膜文件名（任意名，关键词认不出） |
 | ``5_characteristics.xlsx`` | AccessionNumber + 14 个英文列 | 目标三/四的结构化字段金标准 |
 
-> ``3_serieslabel.xlsx``（团队工作区那份）**不在本模块读取范围内**：它不是赛道四
+> ``工作区兼容表``（团队工作区那份）**不在本模块读取范围内**：它不是赛道四
 > 数据集的内容，且取值更粗（只有 ``T1CE``/``T2``/``FLAIR``）—— 混用会把数据集的
 > ``T2WI``/``T2-Flair`` **静默压成 ``T2``**，表现是"模态看着都认出来了、通道里却是
 > 错的对比度"，比直接报错难查得多。它曾作为兜底出现在 ``read_series_labels`` 里，
@@ -31,7 +31,7 @@ from typing import Any
 
 #: 官方标注文件名 → 用途（键名与官方一致，便于对照）
 #:
-#: **不含** ``3_serieslabel.xlsx``：模态来自数据集自带的 ``SeriesType.xlsx``
+#: **不含** ``工作区兼容表``：模态来自数据集自带的 ``SeriesType.xlsx``
 #: （见模块 docstring）。留"series"这个键会让调用方以为还有第二个来源可选。
 OFFICIAL_LABEL_FILES = {
     "abnormal": "1_abnormal.xlsx",
@@ -55,8 +55,9 @@ def find_series_type_table_in_data(root: str | os.PathLike | None) -> str | None
     """**只在数据目录里**找序列类型表 → 路径或 ``None``。
 
     为什么需要它（防**跨数据集串表**）：:func:`find_named_table` 的候选顺序是
-    ``$GLIOMA_LABELS_DIR → <工程>/labels → $WORKSPACE/**/labels → 数据根/父/祖父``。
-    若工作区的 ``labels/`` 里残留了一份**另一个数据集**的 ``SeriesType.xlsx``
+    ``显式 labels_dir/$GLIOMA_LABELS_DIR → 数据根/父/祖父``
+    （早先还会搜 ``<工程>/labels`` 与 ``$WORKSPACE``，已移除）。
+    若别处残留了一份**另一个数据集**的 ``SeriesType.xlsx``
     （比如把训练集的表拷过去过），它会**先于**当前数据自己的表被命中 ——
     表现正是"表读到了几千条、却一条都查不到"：拿训练集的检查号/序列号去查
     验证集的数据，而且日志里表的路径指向 ``labels/`` 而不是数据目录。
@@ -106,60 +107,14 @@ OFFICIAL_BINARY_COLUMNS = {"Glioma", "Enhancement", "Necrosis", "CysticChange",
 # --------------------------------------------------------------------------- #
 # 表定位
 # --------------------------------------------------------------------------- #
-#: 扫工作区时剪掉的目录（缓存/依赖/产物类，钻进去只会白花时间）
-_SKIP_WORKSPACE_DIRS = frozenset({
-    "node_modules", "__pycache__", ".cache", ".git", "site-packages",
-    "logs", "log", "runs", "outputs", "checkpoints", "wandb", "tmp", "cache",
-})
-
-
-def workspace_labels_dirs(max_depth: int = 3) -> list[Path]:
-    """``$WORKSPACE`` 下所有名为 ``labels`` 的目录（"官方表更全 + 更新"者在前）。
-
-    为什么需要它：官方标注表**不随数据集下发**，通常躺在团队持久化工作区里
-    （如 ``<workspace>/dcs/goal1and2/Goal1and2/labels``）。有了这一步，容器里
-    **零配置**就能读到表，不必每个人都记得 ``export GLIOMA_LABELS_DIR``。
-
-    搜索是**有界**的（深度 ≤ ``max_depth``、目录名必须恰好是 ``labels``、
-    剪掉缓存/日志类目录），代价与工作区规模无关。
-    """
-    ws = Path(os.environ.get("WORKSPACE") or "/2026aicompetition/workspace").expanduser()
-    if not ws.is_dir():
-        return []
-    hits: list[Path] = []
-
-    def walk(d: Path, depth: int) -> None:
-        try:
-            entries = list(os.scandir(d))
-        except OSError:
-            return
-        for e in entries:
-            try:
-                if not e.is_dir():
-                    continue
-            except OSError:
-                continue
-            if e.name.startswith(".") or e.name in _SKIP_WORKSPACE_DIRS:
-                continue
-            child = Path(e.path)
-            if e.name == "labels":
-                hits.append(child)                      # 命中即止，不再往里钻
-                continue
-            if depth < max_depth:
-                walk(child, depth + 1)
-
-    walk(ws, 0)
-
-    def score(p: Path) -> tuple[int, float]:
-        files = [p / name for name in OFFICIAL_LABEL_FILES.values()]
-        n = sum(f.is_file() for f in files)
-        try:
-            mt = max(f.stat().st_mtime for f in files if f.is_file())
-        except (OSError, ValueError):
-            mt = 0.0
-        return (n, mt)                                  # 表更全优先，其次更新
-
-    return sorted(set(hits), key=score, reverse=True)
+#: **表的搜索范围 = 数据根（+其父/祖父 + 像标注容器的子目录）。**
+#:
+#: 这里曾会去 ``<工程>/labels`` 与 ``$WORKSPACE`` 下 3 层翻 ``labels/``。
+#: **已移除**：①隐式翻别处会**串表**（工作区残留另一份数据的表 → 先于当前数据被命中，
+#: "表读到几千条却一条都查不中"）；②本赛道数据集自带全部所需（模态 `SeriesType.xlsx`、
+#: 掩膜 `_mask` 文件、字段 `脑胶质瘤标注结果-*.xlsx`、特殊/重复影像目录），
+#: 那 5 张工作区表**不是本赛道数据集的内容**。
+#: 仍需指向别处时用 :data:`LABELS_DIR_ENV` **显式**指定（不做任何隐式搜索）。
 
 
 def find_official_labels(root: str | os.PathLike | None = None,
@@ -218,22 +173,21 @@ def label_search_dirs(root: str | os.PathLike | None = None,
     """标注表候选目录（**顺序即优先级**，命中即止）。
 
     1. 显式传入的 ``labels_dir``（对应官方 config 的 ``paths.labels_dir``）
-    2. 环境变量 ``GLIOMA_LABELS_DIR``
-    3. **本工程目录下的 ``labels/``**（官方默认 ``./labels``）
-    4. ``$WORKSPACE`` 下名为 ``labels`` 的目录（**团队工作区里那份**；平台不随数据集
-       下发，见 :func:`workspace_labels_dirs`。容器里靠这一步做到零配置）
-    5. 数据根自身、父目录、祖父目录 —— 平台把 ``SeriesType.xlsx`` 放在**病例目录那一层**
+    2. 环境变量 ``GLIOMA_LABELS_DIR`` —— **显式**指定，只有你亲手设了才用它
+    3. 数据根自身、父目录、祖父目录 —— 官方把 ``SeriesType.xlsx`` 放在**病例目录那一层**
        （``training/annotation/``）；传进来的若是**病例目录**，父/祖父正好覆盖到它
-    6. 上述目录下"像标注容器"的一级子目录（见 :data:`_LABEL_SUBDIR_NAMES`）——
+    4. 上述目录下"像标注容器"的一级子目录（见 :data:`_LABEL_SUBDIR_NAMES`）——
        防住"表藏在数据根下一层（如 ``标注结果/``）"这种情况
+
+    ⚠️ **不再搜 ``<工程>/labels`` 与 ``$WORKSPACE``**（会**串表**：工作区残留另一份
+    数据的表 → 先于当前数据被命中，"表读到几千条却一条都查不中"）；本赛道数据集自带
+    全部所需。要指向别处请用 ``GLIOMA_LABELS_DIR`` 显式说明。
     """
     cands: list[Path] = []
     if labels_dir:
         cands.append(Path(labels_dir).expanduser())
     if os.environ.get(LABELS_DIR_ENV):
         cands.append(Path(os.environ[LABELS_DIR_ENV]).expanduser())
-    cands.append(Path(__file__).resolve().parents[2] / "labels")      # <工程>/labels
-    cands.extend(workspace_labels_dirs())                             # $WORKSPACE/**/labels
     if root is not None:
         base = Path(str(root)).expanduser()
         try:
@@ -323,7 +277,7 @@ def describe_modality_sources(root: str | os.PathLike | None = None) -> str:
     ``root`` 传**病例目录**也行：候选目录含数据根/父/祖父，正好覆盖到
     ``training/annotation/``。
 
-    只报这一张表：模态**只有一个来源**（工作区那份 ``3_serieslabel.xlsx`` 已不再被读，
+    只报这一张表：模态**只有一个来源**（工作区那份 ``工作区兼容表`` 已不再被读，
     列出来只会误导排查方向）。
 
     查找顺序与 :func:`read_series_types` 完全一致（**数据优先**，见
@@ -334,9 +288,9 @@ def describe_modality_sources(root: str | os.PathLike | None = None) -> str:
             or find_named_table("SeriesType.xlsx", root))
     if path:
         return f"数据信息表 SeriesType.xlsx={path}"
-    return ("数据信息表 SeriesType.xlsx=未找到（已按数据优先搜过 "
+    return ("数据信息表 SeriesType.xlsx=未找到（已搜 "
             "<数据根>/SeriesType.xlsx、annotation/、original/、父目录，"
-            "再退 $GLIOMA_LABELS_DIR、<工程>/labels、$WORKSPACE 下 3 层；"
+            "以及显式指定的 $GLIOMA_LABELS_DIR；"
             "平台数据里这张表与病例目录同层）")
 
 

@@ -55,16 +55,34 @@ def _default_goals() -> Path:
 _MODALITY_STEM = {"flair", "t1", "t1c", "t1ce", "t1w", "t2", "t2w", "dwi",
                   "adc", "swi", "bold", "perf", "image", "img", "volume"}
 
+#: 大赛检查号的形态：**32 位十六进制**（实测 ``0050d79429cf4d86907dc8c4a34cbf04``）。
+_ACC_RE = re.compile(r"^[0-9a-f]{32}$")
+
+#: 平台挂载点下**一定属于本赛道**的顶层目录名（§① 只列这些 + 大赛数据树）。
+_PLATFORM_TOP = {"datasets", "workspace"}
+
+
+def _has_official_case(root: Path) -> bool:
+    """该目录是不是大赛数据布局：一级子目录里**有 32 位十六进制检查号**。
+
+    平台契约是 ``<数据根>/<检查号>/…``，检查号必然是 32 位十六进制 —— 这是
+    "只读大赛数据"的**唯一判据**。不满足的目录（别的数据集、随手堆着 nii 的目录）
+    **连探测都不做、名字都不打印**：读了会污染数据，报出来会把排查方向带偏。
+    """
+    try:
+        return any(k.is_dir() and _ACC_RE.match(k.name) for k in root.iterdir())
+    except OSError:                                             # noqa: BLE001
+        return False
+
 
 def _looks_like_root(p: Path) -> bool:
     """区分**数据根**与**检查目录**（两者都能被 ``discover_cases`` 扫出非零数）。
 
     这是本脚本最容易误导人的地方：``discover_cases`` 只认"一级子目录 = 检查号"，
-    所以把``<数据根>/<检查号>``当成根传进去，它会把**序列目录**（``flair_0000``）
+    所以把 ``<数据根>/<检查号>`` 当成根传进去，它会把**序列目录**（``flair_0000``）
     当成检查号，照样返回一个非零数字——看起来"可用"，实则少了一层。
 
-    两者结构相同，只能靠命名区分：检查号的子目录是模态名，数据根的子目录是
-    病例号。这里据此判断，避免把 `<数据根>/BraTS_00002` 这种路径推荐给你。
+    两者结构相同，只能靠命名区分：检查号的子目录是模态名，数据根的子目录是病例号。
     """
     kids = [k for k in p.iterdir() if k.is_dir() and k.name.lower() not in _PRUNE]
     if not kids:
@@ -75,17 +93,20 @@ def _looks_like_root(p: Path) -> bool:
         if stem in _MODALITY_STEM:
             modality_like += 1
     return modality_like < len(kids)
+
+
+def _simple_count(root: Path) -> int:
     """内置的病例计数（``discover_cases`` 不可用时的兜底）。
 
-    规则与工程一致：一级子目录 = 检查号，其下递归找 NIfTI，跳过标注类目录
-    与掩膜文件。只做粗略判定，够用来比较"哪个候选有数据"。
+    规则与工程一致：一级子目录 = 检查号（**只认 32 位十六进制**），其下递归找
+    NIfTI，跳过标注类目录与掩膜文件。只做粗略判定，够用来比较"哪个候选有数据"。
     """
     skip_dirs = {"annotation", "cache", "runs", "folds", "labels"}
     mask_hints = ("mask", "seg", "label", "roi", "掩码", "标注",
                   "瘤体", "水肿", "异常", "核心", "病灶", "肿瘤区")
     n = 0
     for acc in sorted(p for p in root.iterdir() if p.is_dir()):
-        if acc.name.lower() in skip_dirs:
+        if acc.name.lower() in skip_dirs or not _ACC_RE.match(acc.name):
             continue
         for f in acc.rglob("*"):
             if not f.is_file() or not f.name.lower().endswith((".nii", ".nii.gz")):
@@ -97,6 +118,27 @@ def _looks_like_root(p: Path) -> bool:
     return n
 
 
+def _in_competition_tree(base: Path, d: Path) -> bool:
+    """该目录属于**大赛数据树**吗（决定 §①/§② 要不要把它列出来）。
+
+    判据（任一成立即可）：
+      · 路径里出现 32 位十六进制检查号目录（平台的病例目录名）；
+      · 该目录、父目录或祖父目录里直接放着 ``SeriesType.xlsx``（大赛的数据信息表）。
+
+    不满足的目录**一律不列**：§①/§② 是回答"影像挂上了没有 / 数据根在哪一层"，
+    不是列全机 NIfTI —— 把无关目录列出来只会把排查方向带偏（硬口径，见
+    ``26_audit_plugin_completeness.py`` 的守门断言）。
+    """
+    for anc in (d, d.parent, d.parent.parent):
+        if (anc / "SeriesType.xlsx").is_file():
+            return True
+    try:
+        parts = d.relative_to(base).parts
+    except ValueError:
+        parts = d.parts
+    return any(_ACC_RE.match(x) for x in parts)
+
+
 def _scan_nifti(base: Path, max_depth: int) -> dict[str, int]:
     hits: dict[str, int] = {}
     for root, dirs, files in os.walk(base):
@@ -104,7 +146,7 @@ def _scan_nifti(base: Path, max_depth: int) -> dict[str, int]:
             dirs[:] = []
         dirs[:] = [d for d in dirs if d not in _PRUNE]
         n = sum(1 for f in files if f.endswith((".nii", ".nii.gz")))
-        if n:
+        if n and _in_competition_tree(base, Path(root)):
             hits[root] = n
     return hits
 
@@ -126,6 +168,10 @@ def main() -> int:
         print("  用 --base 指向实际挂载点后重跑。")
         return 2
     for p in sorted(base.iterdir()):
+        # 只列平台目录（datasets/workspace）与**大赛数据树**里的条目；其余**不列**
+        # （硬口径：与大赛无关的数据、无关的输出一个都不要有）。
+        if p.name not in _PLATFORM_TOP and not _in_competition_tree(base, p):
+            continue
         try:
             n = sum(1 for _ in p.iterdir()) if p.is_dir() else 0
             print(f"  {'dir ' if p.is_dir() else 'file'} {p}   子项={n}")
@@ -134,13 +180,13 @@ def main() -> int:
 
     print()
     print("=" * 72)
-    print(f"② 哪里有 NIfTI（深度≤{a.max_depth}，按数量排序）")
+    print(f"② 哪里有 NIfTI（深度≤{a.max_depth}，按数量排序；只列大赛数据树）")
     print("=" * 72)
     hits = _scan_nifti(base, a.max_depth)
     for d, n in sorted(hits.items(), key=lambda kv: -kv[1])[:15]:
         print(f"  {n:>7} 个 NIfTI  {d}")
     if not hits:
-        print("  ⚠️ 未找到任何 .nii/.nii.gz —— 影像那份存储很可能没有挂到实例上。")
+        print("  ⚠️ 未在**大赛数据树**里找到 .nii/.nii.gz —— 影像那份存储很可能没挂上。")
         print("     这不是代码问题：回容器实例的「存储与数据服务」勾选训练/评测影像数据集，")
         print("     或重建实例后再跑一次本脚本。")
 
@@ -183,15 +229,28 @@ def main() -> int:
     cands += [base / f"public_dataset_{t}" for t in ("", "四", "4")]
 
     seen: set[str] = set()
-    usable: list[tuple[str, int]] = []          # 真正的候选数据根
+    usable: list[tuple[str, int]] = []          # 大赛数据根（0 例的也留，便于看"挂没挂上"）
     other: list[tuple[int, str]] = []           # (排序键, 已格式化文本)
     for c in cands:
         key = str(c)
         if key in seen or not c.is_dir():
             continue
         seen.add(key)
+        # ★ 只探测**大赛数据布局**的目录（一级子目录里有 32 位十六进制检查号）。
+        #   其余目录**连探测都不做、连名字都不打印** —— 这是"不读非大赛数据、
+        #   不输出非大赛信息"的执行点（此前会把机器上别的数据集一并扫出来报）。
+        if not _has_official_case(c):
+            continue
         try:
-            n = int(len(discover(c)) if discover else _simple_count(c))
+            # 探测模式：对**多个候选根**轮流试，紧凑输出（由本段汇总）。
+            if discover:
+                try:
+                    _cs = discover(c, diagnose=False)
+                except TypeError:                  # 旧版签名（无 diagnose 参数）
+                    _cs = discover(c)
+                n = len(_cs)
+            else:
+                n = int(_simple_count(c))
         except Exception as exc:                            # noqa: BLE001
             other.append((2, f"  {key:<56} 拦截: {type(exc).__name__}"
                              f"（父目录/无效根，预期行为）"))
@@ -219,8 +278,9 @@ def main() -> int:
             print("      注意：这不是 training/ 那层 —— 若含 evaluation_* 阶段名，")
             print("            说明你扫到的是评测集；训练要用含训练影像的那个根。")
     else:
-        print("结论：所有候选都是 0 例。影像未挂载，或结构与预期完全不同；")
-        print("      请把 ①② 的输出贴出来一起看。")
+        print("结论：候选里**没有大赛数据布局的根**（一级子目录须含 32 位十六进制")
+        print("      检查号，如 0050d79429cf4d86907dc8c4a34cbf04）。影像可能未挂载。")
+        print("      请直接指定根并核对挂载：export DATASET_ROOT=…/datasets/training")
     return 0
 
 

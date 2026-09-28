@@ -25,7 +25,7 @@ from .labels import (SERIES_TYPE_TABLE, build_uid_index, desc_index_from_records
                      find_official_labels, find_structured_tables,
                      guess_modality, has_input_modality, has_series_type_table,
                      has_strict_mask_hint, id_key, is_explicit_other, is_hard_skip,
-                     is_official_mask_name,
+                     is_official_accession, is_official_mask_name,
                      lookup_series_type, mask_role_for, norm_key,
                      read_abnormal_table,
                      read_duplicate_pairs, read_mask_table, read_series_desc_index,
@@ -477,8 +477,28 @@ def scan_real(root: str, limit_cases: int | None = None,
     uid_index = build_uid_index(series_types)
     entries = sorted(e for e in os.listdir(root)
                      if os.path.isdir(os.path.join(root, e))
-                     and e.lower() != "annotation"
+                     and is_official_accession(e)                # 只认大赛检查号（见下）
                      and e.lower() not in SPECIAL_SOURCE_DIRS)   # fake/compositing/duplicate 是"来源"不是检查号
+    # ---- 大赛数据闸门 ----
+    # 平台上 ``<数据根>/<检查号>/…`` 的检查号必然是 32 位十六进制。非大赛目录
+    # （别的数据集、随手堆着 nii 的目录）在这里就被挡在**读取之前**：读了会污染
+    # 训练与指标；报出来会把排查方向带偏。所以这里只拦、不列出它们的名字。
+    if not entries:
+        _dirs = sorted(e for e in os.listdir(root)
+                       if os.path.isdir(os.path.join(root, e)))
+        if not _dirs:
+            print(f"[probe] ⚠️ 数据根 {root} 下没有子目录 → 0 例"
+                  f"（影像存储可能没挂上，见 docs/DATASET_ROOT_TROUBLESHOOT.md）",
+                  flush=True)
+            return cases
+        raise ValueError(
+            f"数据根 {root} 不是大赛数据布局：一级子目录里没有 32 位十六进制的检查号"
+            f"（如 0050d79429cf4d86907dc8c4a34cbf04）。当前 {len(_dirs)} 个子目录、"
+            f"其中 {sum(1 for e in _dirs if e.lower() in _NON_CASE_DIRS)} 个是本工程"
+            f"自己的目录（annotation/original/fake/compositing/duplicate 等）。"
+            f"官方布局：训练集根=…/datasets/training（其下 annotation/）、"
+            f"验证集根=…/datasets/verification（其下 original/），"
+            f"病例目录名就是检查号本身。")
     skipped_sources = [e for e in sorted(os.listdir(root))
                        if os.path.isdir(os.path.join(root, e))
                        and e.lower() in SPECIAL_SOURCE_DIRS]
@@ -602,8 +622,8 @@ def merge_special_cases(cases: list[dict], special: dict, log: list | None = Non
     for cls, key in (("fake", "fake_cases"), ("Composition", "composition_cases")):
         base = os.path.join(ann, cls)
         for ident in (special.get(key) or []):
-            if ident in by:
-                continue
+            if ident in by or not is_official_accession(str(ident)):
+                continue                       # 同上：非大赛检查号不读
             d = os.path.join(base, str(ident))
             if not os.path.isdir(d):
                 continue
@@ -637,12 +657,13 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8,
     # 目录名统一归一化后再传：表内取值会经 id_key 归一化，两侧不同口径会
     # 一条都对不上（哈希型检查号 C0E1F8F2-53BA-45BE 就是这么栽的）。
     known_ids = ({id_key(e) for e in os.listdir(root)
-                  if os.path.isdir(os.path.join(root, e)) and e.lower() != "annotation"}
+                  if os.path.isdir(os.path.join(root, e))
+                  and is_official_accession(e)}            # 只认大赛检查号（见 labels）
                  if os.path.isdir(root) else set())
     # 天坛参考实现那几张表（`1_abnormal` / `2_duplicate` / `4_masklabel` /
     # `5_characteristics`）**不是赛道四数据集的内容**，只在附近有（如团队工作区
     # labels/）时顺手用上：字段金标准、掩膜名表都在这里，靠目录名或关键词猜不出来。
-    # 它们的 `3_serieslabel.xlsx` **不再参与**（模态只认数据集自带的 `SeriesType.xlsx`，
+    # 它们的 `工作区兼容表` **不再参与**（模态只认数据集自带的 `SeriesType.xlsx`，
     # 上面 read_series_types 已读；工作区那份取值更粗，读了会把 T2WI/T2-Flair 压平）；
     # 数据集里的字段金标准在 `annotation/脑胶质瘤标注结果-训练集.xlsx`
     # （下面 find_structured_tables 会找到）。
@@ -780,10 +801,11 @@ def probe(root: str, limit_cases: int | None = None, sample_geometry: int = 8,
                        "若平台后续单独发布验证集标注表：放进验证集目录或 "
                        "export GLIOMA_LABELS_DIR=<含表目录>，重跑本探针即自动接上")
     elif not tables:
-        labels_hint = ("数据根/父/祖父、<工程>/labels、$GLIOMA_LABELS_DIR、"
-                       "$WORKSPACE 下 3 层都没找到 csv/xlsx 金标准表；"
-                       "若表在别处：export GLIOMA_LABELS_DIR=<含表的目录>（或 ln -s 到 "
-                       "<工程>/labels），或把数据根定到与它同级的那一层")
+        labels_hint = ("没找到 csv/xlsx 金标准表（已搜数据根/父/祖父，含 annotation / "
+                       "original / 标注结果 这类子目录）；若表确在别处："
+                       "export GLIOMA_LABELS_DIR=<含表的目录>（**显式**指定 —— "
+                       "不做任何隐式搜索，隐式翻别处会串表），"
+                       "或把数据根定到与表同级的那一层")
     elif not struct:
         # 0 行**不一定**是表坏了：扫描范围里的"杂物表"（本地伪造的对照表、临时导出
         # 的样本、别的赛道的表）同样会被当成候选金标准表 —— 它们连行键列都没有，
@@ -964,10 +986,10 @@ def main() -> None:
               f"{res['report']['labels_hint']}")
     if res["report"]["modality_counts"].get("other") and not res["report"]["series_type_rows"]:
         # 序列类型表只在**数据集里**（与病例目录同层），走到这里就是没找到 ——
-        # 而不是我们没看那几个目录（工作区那份 3_serieslabel.xlsx 已不参与）。
+        # 而不是我们没看那几个目录（工作区那份 工作区兼容表 已不参与）。
         print(f"[probe] ⚠️ 有序列落到 other 且没读到数据信息表（{SERIES_TYPE_TABLE}）："
-              "先确认数据根指向的是含 annotation/ 的那一层（表与病例目录同层），"
-              "或 export GLIOMA_LABELS_DIR=<含该表的目录>（/ ln -s 到 <工程>/labels）"
+              "先确认数据根指向的是含 annotation/ 的那一层（表与病例目录同层）；"
+              "表确在别处就 export GLIOMA_LABELS_DIR=<含该表的目录>（**显式**指定）"
               "再重跑本探针；表也没有时走体素判别兜底（见下一条）。"
               "排查步骤：README.md §7.2")
     elif (res["report"]["modality_counts"].get("other")

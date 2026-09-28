@@ -41,6 +41,41 @@ _GOALS = pathlib.Path(os.environ.get("GLIOMA_GOALS_ROOT")
 GOALS = ["goal1_authenticity", "goal2_stitched", "goal2_duplicate",
          "goal3_tumor", "goal4_diagnosis", "goal5_segmentation"]
 
+#: **禁止出现**的"与大赛无关"引用（源码 / 文档 / 配置里一个都不许有）。
+#:
+#: 机器上常常还躺着别的数据集与历史本机路径；一旦它们出现在工程里，既会把排查
+#: 方向带偏（"表读到了却报未找到"那类假象），也意味着有人把非大赛数据接进来过。
+#: 逐条写在这里 = 口径可执行、可回归（不是靠人工 review）。
+_FORBIDDEN_TOKENS = ("data_sdb", "track4_sim", "BraTS", "ImagesTr", "3_serieslabel")
+
+
+def _no_foreign_data_refs() -> None:
+    """源码 / 文档 / 配置里**不得**出现与大赛无关的数据引用。
+
+    扫描范围是本工程（`src/`、`scripts/`、`configs/`、`docs/`、`README.md`）与
+    训练工程（`shared/`、`README.md`）。判据的定义文件（本文件）自身豁免。
+    """
+    roots = [_TRACK4 / "src", _TRACK4 / "scripts", _TRACK4 / "configs",
+             _TRACK4 / "docs", _TRACK4 / "README.md",
+             _GOALS / "shared", _GOALS / "README.md"]
+    exts = (".py", ".md", ".sh", ".yaml", ".yml")
+    me = pathlib.Path(__file__).resolve()
+    hits: list[str] = []
+    for r in roots:
+        files = ([r] if r.is_file()
+                 else [p for p in r.rglob("*") if p.suffix.lower() in exts])
+        for p in files:
+            if p.resolve() == me or "__pycache__" in p.parts:
+                continue                       # 判据定义处 + 陈旧字节码不算
+            try:
+                txt = p.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            hits += [f"{p.relative_to(_TRACK4.parent)}:{t}"
+                     for t in _FORBIDDEN_TOKENS if t in txt]
+    if hits:
+        raise AssertionError("发现与大赛无关的引用：" + "; ".join(sorted(set(hits))[:6]))
+
 #: 包初始化文件允许为空
 EMPTY_OK = {"__init__.py"}
 
@@ -169,11 +204,14 @@ def scan(root: pathlib.Path, label: str) -> list[str]:
 
 
 def _normalized_src(path: pathlib.Path) -> str:
-    """去掉 import 与类型注解后的源码转写。
+    """去掉 import、类型注解与 docstring 后的源码转写。
 
     两个工程的模块路径本就不同（``shared.selector`` vs ``data.series_selector``），
     还会各自加类型注解，因此不能逐字节比较；但**函数体**必须一致——
     这才是"训练出的权重能被推理正确加载"的真正前提。
+
+    docstring 也一并摘掉：说明文字（含措辞、术语）不属于"实现"，两侧各自行文
+    不该被判成漂移；**代码**有任何改动仍会在此处逐字显出。
     """
     tree = ast.parse(path.read_text(encoding="utf-8"))
     for node in ast.walk(tree):
@@ -181,6 +219,15 @@ def _normalized_src(path: pathlib.Path) -> str:
             node.annotation = None                            # 参数注解：可空
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             node.returns = None                               # 返回注解：可空
+        elif isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                               ast.AsyncFunctionDef)):
+            # 摘掉 docstring（模块/类/函数的第一条字符串表达式）
+            if node.body:
+                _first = node.body[0]
+                if (isinstance(_first, ast.Expr)
+                        and isinstance(_first.value, ast.Constant)
+                        and isinstance(_first.value.value, str)):
+                    node.body = node.body[1:] or [ast.Pass()]
         # 注意：不要去改 ``ast.AnnAssign.annotation`` —— 它是**必填字段**，
         # 置 None 会让 ``ast.unparse`` 直接崩（AttributeError: None has no _fields）。
     body = [n for n in tree.body if not isinstance(n, (ast.Import, ast.ImportFrom))]
@@ -201,7 +248,6 @@ def check_shared_sources() -> list[str]:
 
     #: 必须**逐字节**一致
     strict = [
-        ("shared/backbone_mednext.py", "tasks/_common/mednext.py"),
         ("shared/backbone_unet3d.py", "tasks/_common/unet3d.py"),
         ("shared/spatial.py", "tasks/_common/spatial.py"),
         ("shared/sliding.py", "tasks/_common/sliding.py"),
@@ -218,8 +264,15 @@ def check_shared_sources() -> list[str]:
         if not same:
             failures.append(f"{a} ≠ {b}")
 
-    #: 允许 import / 类型注解差异，但**实现**必须一致
-    for a, b in [("shared/volume.py", "tasks/_common/volume.py")]:
+    #: 允许 import / 类型注解 / **docstring 措辞**差异，但**实现**必须一致。
+    #:
+    #: ``backbone_mednext`` 从"逐字节"下移到这一组的原因：外部提交工程
+    #: （``Glioma_recognition-main``）**一字不动**，其 docstring 的行文与本工程不同
+    #: —— 那是说明文字，不是实现。用逐字节比较会因一句用词就报"漂移"，反而把真正的
+    #: 漂移淹掉；改为只比代码（AST，摘掉 docstring / import / 注解）后，一旦真有人
+    #: 改了层结构、卷积核或初始化，照样当场报出来。
+    for a, b in [("shared/volume.py", "tasks/_common/volume.py"),
+                 ("shared/backbone_mednext.py", "tasks/_common/mednext.py")]:
         pa, pb = _GOALS / a, _MAIN / b
         same = _normalized_src(pa) == _normalized_src(pb)
         print(f"  {'✓' if same else '✗'} {pathlib.Path(a).name} "
@@ -231,6 +284,9 @@ def check_shared_sources() -> list[str]:
 
 
 def main() -> int:
+    # 口径守门：**与大赛无关的数据、无关的输出一个都不要有**（用户 2026-09-28 明确要求）。
+    check("源码/文档/配置不含与大赛无关的数据引用", _no_foreign_data_refs)
+
     shells = scan(_MAIN / "tasks", "提交工程 tasks/")
     shells += scan(_GOALS, "训练工程 glioma_goals/")
 

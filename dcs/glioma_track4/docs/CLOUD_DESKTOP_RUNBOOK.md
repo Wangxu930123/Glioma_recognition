@@ -263,7 +263,7 @@ python scripts/29_locate_dataset_root.py
 
 训练集、验证集（`verification/`）都有这张表；**评测集的 `SeriesType.xlsx` 在正式测试时
 随测试数据一起下发**（路径由 `input.dataset_path` 给出）。
-模态**只有这一个来源**：团队工作区那份 `labels/3_serieslabel.xlsx` 与数据集无关（属另一个
+模态**只有这一个来源**：团队工作区那份 `labels/工作区兼容表` 与数据集无关（属另一个
 目标），代码**已不再读它**（它取值更粗，会把 `T2WI`/`T2-Flair` 静默压成 `T2`）。
 
 ### 3.3 三个坑
@@ -287,7 +287,7 @@ bash scripts/01_probe.sh
 
 | 报告字段 | 期望 | 含义 |
 |---|---|---|
-| `series_type_rows` | **> 0** | 读到数据信息表的映射条数（`<阶段>/annotation/SeriesType.xlsx`）；**0 = 表没接上**（先在数据根/父/祖父与像标注容器的子目录里搜，再退 `$GLIOMA_LABELS_DIR` → `<工程>/labels` → `$WORKSPACE` 下 3 层）。表在哪、读到几条：`python scripts/30_inspect_table.py --root $DATASET_ROOT --rows 3` |
+| `series_type_rows` | **> 0** | 读到数据信息表的映射条数（`<阶段>/annotation/SeriesType.xlsx`）；**0 = 表没接上**（代码**只在数据根**找：数据根/父/祖父 + 像标注容器的子目录；不再隐式翻工作区）。表在哪、读到几条：`python scripts/30_inspect_table.py --root $DATASET_ROOT --rows 3` |
 | `cases_with_declared_other_series` | 任意（**非 0 正常**） | 被 `SeriesType` 标为 `其他` 的病例数：这些序列已排除、不交给体素模型猜，**不是**缺表信号 |
 | `modality_counts` | 出现 `t1c` / `flair` / `t2` / `t1` | 模态识别正常；只有 `other` = 全是 UID 命名、没读到数据信息表 |
 | `mask_role_counts` | 出现 `core` / `peri` | 掩膜识别正常 |
@@ -300,12 +300,12 @@ ls -l /2026aicompetition/datasets/training/annotation/SeriesType.xlsx
 find /2026aicompetition/datasets -maxdepth 3 -name "SeriesType.xlsx" 2>/dev/null
 ```
 
-命中即用、零配置。模态表**数据优先**（防**跨数据集串表**）：先查 `数据根` 本身、
-`数据根/annotation`、`数据根/original`、`数据根` 的父目录，都找不到才退回通用搜索
-（`$GLIOMA_LABELS_DIR → <工程>/labels → $WORKSPACE 下 3 层`）。顺序反了会串表：工作区
-`labels/` 里残留的另一份数据的 `SeriesType.xlsx`（比如把训练集的表拷过去过）会先被命中 →
-**拿训练集的键查验证集**，表读到几千条却一条都对不上。表里"检查号"列与磁盘病例目录名
-对不上**也不影响**：`SeriesUid` 与影像同源，会自动单键回退。
+命中即用、零配置。模态表**只从数据根找**（防**跨数据集串表**）：`数据根` 本身、
+`数据根/annotation`、`数据根/original`、`数据根` 的父/祖父 + 像标注容器的子目录。
+**不再隐式搜 `<工程>/labels` 与 `$WORKSPACE`** —— 那样工作区 `labels/` 里残留的另一份数据的
+`SeriesType.xlsx`（比如把训练集的表拷过去过）会先被命中 → **拿训练集的键查验证集**，
+表读到几千条却一条都对不上。表确在别处时用 `export GLIOMA_LABELS_DIR=<目录>` **显式**指定。
+表里"检查号"列与磁盘病例目录名对不上**也不影响**：`SeriesUid` 与影像同源，会自动单键回退。
 
 **背景**：训练侧原先只能从**目录名**猜模态。本地模拟集目录名是 `flair_0000` 所以一直正常；
 官方数据的目录名是 DICOM UID（`2.25.25750572698...`），任何关键词都命中不了，于是
@@ -414,15 +414,21 @@ python scripts/24_verify_eval_split.py   # 期望 0 项 WARN
 实际为单行，此处折行显示）：
 
 ```text
-病例 3d58e8712e064ec289da602fc594fd9 无任何可用序列（清单里的序列键=['other']；未知序列 2 路）。
-模态来源自检：数据信息表 SeriesType.xlsx=未找到（已搜 $GLIOMA_LABELS_DIR、<工程>/labels、
-$WORKSPACE 下 3 层、数据根/父/祖父 + 像标注容器的子目录；它就在数据里、与病例目录同层）；
-体素判别模型 /…/data/modality_model.json=缺失。
-按顺序试：① export GLIOMA_LABELS_DIR=<含数据信息表 SeriesType.xlsx 的目录>（或 ln -s 到
-<工程>/labels），数据的表就在 annotation/ 下、与病例目录同层；然后重跑 bash scripts/01_probe.sh
-与 bash scripts/02_build_dataset.sh；② 没有类型表时训练体素判别模型：
+病例 3d58e8712e064ec289da602fc594fd9 没有任何可用的影像文件（清单里的序列键=['other']；未知序列 2 路）。
+模态来源自检：数据信息表 SeriesType.xlsx=未找到（已搜 数据根/父/祖父 + 像标注容器的子目录，
+以及显式指定的 $GLIOMA_LABELS_DIR；它就在数据里、与病例目录同层）。
+注意：**只有 `其他` 序列/只有 DWI 的病例不算这一类** —— 那种情况会全零通道照训（全放开口径）。
+这里失败说明连几何都借不到。按顺序试：① 数据的表就在 annotation/ 下、与病例目录同层 ——
+先确认数据根指向的是那一层；表确在别处就 export GLIOMA_LABELS_DIR=<含数据信息表
+SeriesType.xlsx 的目录>（**显式**指定，不做隐式搜索）；然后重跑 bash scripts/01_probe.sh 与
+bash scripts/02_build_dataset.sh；② 没有类型表时训练体素判别模型：
 python3 scripts/31_train_modality_model.py --root <数据根>（产出 data/modality_model.json）；③ 详见 …
 ```
+
+> ✅ **注意这条报错的含义变了**：只有"**连一个影像文件都没有**"才会抛它。"模态认不出"
+> （整例序列都是 `其他`）**不再报错** —— 按**全放开**口径会 4 通道全零照训（掩膜仍是真值），
+> 代价是这一例输入是常数、只回传近噪声梯度。这类例数看探针报告的
+> `cases_without_input_channel`；它不为 0 时先解决模态表，别指望后面会崩给你看。
 
 （提交/推理工程 `Glioma_recognition-main` 抛的是 `study '...' 无任何可用序列（共 N 条…）`，
 同一根因、同样处理。）
@@ -448,8 +454,7 @@ from src.data.labels import (build_uid_index, find_named_table, norm_key,
 
 root = Path(os.environ["DATASET_ROOT"])
 print("数据信息表位置:", find_named_table("SeriesType.xlsx", root)
-      or "未找到（已搜 数据根/父/祖父、像标注容器的子目录、$GLIOMA_LABELS_DIR、"
-         "<工程>/labels、$WORKSPACE 下 3 层）")
+      or "未找到（只在数据根/父/祖父 + 像标注容器的子目录，以及显式 $GLIOMA_LABELS_DIR 里找过）")
 types = read_series_types(root)
 uid_index = build_uid_index(types)          # 检查号列对不上时的回退索引
 print("SeriesType.xlsx 映射条数:", len(types), "| UID 单键索引:", len(uid_index))
@@ -737,11 +742,12 @@ cat > /2026aicompetition/workspace/common/env.sh <<'EOF'
 export DATASET_ROOT=/2026aicompetition/datasets/training/annotation   # ← 换成 3.2 的结论
 export GLIOMA_DATASET_ROOT="$DATASET_ROOT"        # glioma_goals 用的名字
 
-# 工作区标注表（1_abnormal / 2_duplicate / 4_masklabel / 5_characteristics）：不在数据集里；
-# 探针/加载器会自动搜 $WORKSPACE 下 3 层 —— 这行只是显式兜底，路径不对也不会出错。
-# ⚠️ 模态表 SeriesType.xlsx **不从这里读**（随数据下发、数据优先查找）；
-#    这里放一份别的数据的 SeriesType.xlsx 反而会串表（表读到几千条却 0 命中）。
-export GLIOMA_LABELS_DIR=/2026aicompetition/workspace/dcs/goal1and2/Goal1and2/labels
+# 标注表的**显式**入口（可选）：代码不会自动去工作区翻表（会串表）。
+# 本赛道所需（SeriesType.xlsx / 脑胶质瘤标注结果-*.xlsx / 掩膜 / fake-compositing-duplicate）
+# 都在数据根里，所以**默认不用设**；只有表确实放在工作区（如下面这个路径）才需要这行。
+# ⚠️ 模态表 SeriesType.xlsx **不要**从工作区读：那里放一份别的数据的表会串表
+#    （表读到几千条却 0 命中）。
+# export GLIOMA_LABELS_DIR=/2026aicompetition/workspace/dcs/goal1and2/Goal1and2/labels
 
 export GLIOMA_FOLDS=/2026aicompetition/workspace/dcs/glioma_track4/data/folds.json
 export WORKSPACE=/2026aicompetition/workspace

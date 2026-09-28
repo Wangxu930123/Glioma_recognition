@@ -42,7 +42,7 @@ for c in "${PYTHON:-}" python3 python; do
 done
 [ -n "$PY" ] || { echo "[33] 找不到 python 解释器" >&2; exit 2; }
 
-OFFICIAL_5="1_abnormal 2_duplicate 3_serieslabel 4_masklabel 5_characteristics"
+OFFICIAL_5="1_abnormal 2_duplicate 4_masklabel 5_characteristics"
 WORKSPACE="${WORKSPACE:-/2026aicompetition/workspace}"
 
 # --------------------------------------------------------------------------- #
@@ -124,7 +124,7 @@ echo "     原表 base  = $LABELS_DIR/1_abnormal.xlsx"
 echo "     补丁 patch = $PATCH_FILE"
 echo "     病例层根   = $ANNOT_ROOT"
 off=0; for f in $OFFICIAL_5; do [ -f "$LABELS_DIR/$f.xlsx" ] && off=$((off + 1)); done
-echo "     labels 目录里官方 5 张表：$off/5"
+echo "     labels 目录里官方 4 张表：$off/4"
 case "$LABELS_DIR" in
     */data_validation/*) echo "     ⚠ 用的是 data_validation/ 下的暂存副本，建议改用团队工作区那份" ;;
 esac

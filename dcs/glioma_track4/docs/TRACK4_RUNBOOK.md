@@ -28,9 +28,11 @@ DCS=/2026aicompetition/workspace/dcs
 T4=$DCS/glioma_track4
 WS=/2026aicompetition/workspace
 
-# 训练集数据根（有 3_serieslabel.csv / 4_masklabel.csv 的那一层）
+# 训练集数据根：**含 <32位检查号>/ 与 SeriesType.xlsx 的那一层**
+#   （填上一层如 .../training 会自动下钻并告警；模态只认数据集自带的 SeriesType.xlsx，
+#    别去别处找表 —— 非本赛道数据在发现层就会被拒收）
 DSROOT=/2026aicompetition/datasets/training/annotation
-# 官方验证集根（可选但强烈建议；实测只有 SeriesType.xlsx，见 §8）
+# 官方验证集根（可选但强烈建议；实测没有字段金标准表，见 §8）
 VALROOT=/2026aicompetition/datasets/verification
 
 export PY=python3
@@ -76,6 +78,10 @@ bash scripts/23_pre_submit_check.sh
 ```
 
 > 时间预算（参考）：环境 10 分钟 → 探针 1~5 分钟 → 折划分 1 分钟 → 缓存 10~30 分钟 → 训练每折 3~8 小时（4 卡并行）→ 收尾 30~60 分钟。
+>
+> **不想做折内 CV、直接"全量训练 + 验证集验证"？** 把 ⑤⑦ 换成
+> `bash scripts/03_train.sh full`，⑧ 换成 `FOLDS=full bash scripts/16_finalize.sh`。
+> 完整流程（数据准备 → 训练 → 验证 → 交付 + 验收清单）见 **[`FULL_TRAIN_GUIDE.md`](FULL_TRAIN_GUIDE.md)**。
 
 ---
 
@@ -166,15 +172,16 @@ $PY scripts/29_locate_dataset_root.py
 期望（末行给出可直接复制的变量）：
 
 ```
-[29] 候选数据根（含 3_serieslabel.csv / 4_masklabel.csv 或 <检查号>/<SeriesUid>/ 结构）：
-[29]   /2026aicompetition/datasets/training/annotation   病例 1234
-[29] DATASET_ROOT=/2026aicompetition/datasets/training/annotation
+③ 候选数据根的病例数（用工程自己的发现逻辑）
+  /2026aicompetition/datasets/training/annotation -> 1234 例  ← 可用
+结论：数据根 = /2026aicompetition/datasets/training/annotation（1234 例）
+      export DATASET_ROOT=/2026aicompetition/datasets/training/annotation
 ```
 
 | 检查 | 期望 |
 |---|---|
 | `ls "$DATASET_ROOT"` | 看到 32 位十六进制检查号目录（若有 `original/` 之类中间层，探针会自动下钻） |
-| 表格 | 该目录（或父/祖父层）能找到 `3_serieslabel.csv` / `4_masklabel.csv` |
+| 数据信息表 | 该目录（或父/祖父层）能找到 `SeriesType.xlsx`，且它**与检查号目录同层** |
 
 **坑**：别把数据根定太深（例如定到 `…/original` 里的病例目录），探针只在"数据根 + 上两级"找表。定位脚本给哪一层就用哪一层。
 
@@ -218,7 +225,7 @@ PY
 | `n_cases` | 与官方病例数一致 | 差很多 → 数据根不对（回 §3） |
 | `modality_counts` | 4 个模态都接近满员 | 缺 T1c/FLAIR 的病例看 `missing_t1c/missing_flair`，真缺就接受 |
 | `mask_role_counts` | `core`/`peri` 都≈全量 | 只有 core 没有 peri → 查 `4_masklabel.csv` 是否被读到 |
-| `label_field_counts` | 训练集应**非空** | 全空 → 表没找到：`export GLIOMA_LABELS_DIR=<含表目录>` 或 `ln -s` 到 `<工程>/labels`，重跑 |
+| `label_field_counts` | 训练集应**非空** | 全空 → 表没找到：先确认它就在数据根那一层（`<阶段>/annotation/脑胶质瘤标注结果-训练集.xlsx`）；确在别处则 `export GLIOMA_LABELS_DIR=<含表目录>`（**显式**指定，代码不再自动翻工作区），重跑 |
 | `no_labels` | 训练集应**很短** | 长列表说明大量病例没字段标签，分类头学不到东西，先解决表 |
 
 **验证集（`--val`）的期望与之不同，这是正常的**：
@@ -339,6 +346,9 @@ TAG_PREFIX=smoke CACHE_DIR=$WS/cache_smoke bash scripts/03_train.sh 0
 ## 8. 验证集没有金标准，能不能用它做全量训练的验证？有影响吗？
 
 **结论：能，前提是验证集病例带掩膜（分割金标准）。字段金标准缺失没有任何影响。**
+
+> 📄 全量训练的**完整分步流程**（数据准备 → 训练 → 验证 → 交付，含判据与验收清单）见
+> **[`FULL_TRAIN_GUIDE.md`](FULL_TRAIN_GUIDE.md)**。本节只回答"验证集没有金标准行不行"。
 
 ### 8.1 为什么可以
 
@@ -604,13 +614,13 @@ PASS 汇总
 
 ## 14. 切换到正式数据 / 重训（10 / 17 / 18 / 19 / 31 / 32 / 33）
 
-### 14.1 本地实验数据（BraTS）只用于验证链路
+### 14.1 本地实验数据（同类数据集）只用于验证链路
 
 ```bash
-$PY scripts/10_brats_to_track4.py ...    # 把 BraTS 整理成赛道四布局
+$PY scripts/10_brats_to_track4.py ...    # 把 同类数据集 整理成赛道四布局
 ```
 
-**合规红线**：正式提交的权重必须只用大赛提供的数据训练；BraTS 产物只能用来验证工程链路（探针/掩码归位/1mm 网格/答案格式）与算法上限，**不可**用来产出提交权重。
+**合规红线**：正式提交的权重必须只用大赛提供的数据训练；同类数据集 产物只能用来验证工程链路（探针/掩码归位/1mm 网格/答案格式）与算法上限，**不可**用来产出提交权重。
 
 ### 14.2 切官方数据前的清场（必做）
 
@@ -681,7 +691,7 @@ $PY scripts/32_apply_abnormal_patch.py ...                       # 核验并合�
 | `[trainer] 全量训练（--fold full）需要官方验证集` | 没有 `manifest_val.json`，或**一例带掩膜的都没有** | §8：跑 `01_probe.sh --val`，或改折内 val |
 | `清单数据源与本机数据源不同类` | 清单与当前数据根不匹配 | 重跑 `01_probe.sh`（铁律 1）；换官方数据先 `17_reset_for_official.sh` |
 | 训练照跑但指标离谱 / `train` 与 `val` 重叠 | 旧 `folds.json` 配了新清单 | `rm -f data/folds.json && bash scripts/02_build_dataset.sh` |
-| 训练集探针 `label_field_counts` 全空 | 没找到字段金标准表 | `export GLIOMA_LABELS_DIR=<含表目录>` 或 `ln -s` 到 `<工程>/labels`，重跑探针 |
+| 训练集探针 `label_field_counts` 全空 | 没找到字段金标准表 | 确认表与病例目录同层（`annotation/` 下）；确在别处则 `export GLIOMA_LABELS_DIR=<含表目录>`，重跑探针 |
 | 验证集探针 `no_labels` 列出全部病例、`ℹ️` 提示 | **正常**：官方验证集没有字段金标准表 | 不用处理，见 §8 |
 | 报告里没有 `duplicate_w*` 键 / `15` 说"无正样本，跳过 AUC" | 没有重复影像金标准 | 正常；用 OOF 或本地数据看趋势 |
 | `24` 报"重复影像跨折" | 同一病人的重复序列落在不同折 | 修折划分（`02` 支持按病人分组），重训（§14.3） |
@@ -720,10 +730,13 @@ $PY scripts/32_apply_abnormal_patch.py ...                       # 核验并合�
 
 | 想知道什么 | 看哪里 |
 |---|---|
-| 命令怎么敲、期望什么输出、报错怎么办 | **本文（TRACK4_RUNBOOK.md）** |
-| 配置项含义、算法细节、目录结构、指标定义 | `README.md` |
-| 广场桌面/云桌面环境、镜像、离线依赖、三端联动 | `docs/CLOUD_DESKTOP_RUNBOOK.md` |
-| 整体架构与三工程协作 | `docs/MASTER_GUIDE.md` |
+| **全流程命令怎么敲、期望什么输出、报错怎么办** | **本文（TRACK4_RUNBOOK.md）** ← 默认看这份 |
+| **只走"全量训练 + 验证集"这条路** | [`FULL_TRAIN_GUIDE.md`](FULL_TRAIN_GUIDE.md) |
+| 配置项含义、算法细节、目录结构、指标定义、常见问题 | `README.md`（§3 命令速查、§7 报错） |
+| 数据根填什么、路径类报错 | [`DATASET_ROOT_TROUBLESHOOT.md`](DATASET_ROOT_TROUBLESHOOT.md) |
+| 广场桌面/云桌面环境、镜像、离线依赖、三端联动 | [`CLOUD_DESKTOP_RUNBOOK.md`](CLOUD_DESKTOP_RUNBOOK.md) |
+| 赛事平台/云电脑账号、建容器、SSH、跑训练 | [`PLATFORM_GUIDE.md`](PLATFORM_GUIDE.md) |
+| 整体架构与三工程协作 | [`MASTER_GUIDE.md`](MASTER_GUIDE.md) |
 | 赛事规范原文 | 平台《赛事开发规范》 |
 
 

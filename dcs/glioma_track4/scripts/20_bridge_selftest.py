@@ -97,8 +97,8 @@ def build_eval_dataset(src_root: Path, dst_root: Path, n: int) -> list[str]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--team", default=str(ROOT.parent / "Glioma_recognition-main"))
-    ap.add_argument("--src", default=os.environ.get("DATASET_ROOT")
-                    or "/mnt/data_sdb/wangx/data/Brain_MRI/track4_sim")
+    ap.add_argument("--src", default=os.environ.get("DATASET_ROOT"),
+                    help="影像数据根（显式指定或 export DATASET_ROOT；只接受大赛数据布局）")
     ap.add_argument("--n", type=int, default=3)
     ap.add_argument("--ckpt", default=None, help="默认取 checkpoints/g4_fold*/best.pth 首折")
     ap.add_argument("--work", default=None)

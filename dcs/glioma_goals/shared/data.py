@@ -46,6 +46,19 @@ _PLATFORM_PHASES = frozenset({
     "evaluation_finals", "verification",
 })
 
+#: 大赛检查号的形态：**32 位小写十六进制**（实测 ``0050d79429cf4d86907dc8c4a34cbf04``）。
+#:
+#: 这是"这一层就是大赛数据的病例目录"的**唯一判据**，也是"只读大赛数据"的执行点：
+#: 平台上 ``<数据根>/<检查号>/<序列UID>/…``，检查号必然是它。任何不满足的目录
+#: （别的数据集、随手一个堆着 nii 的目录）都在**读取之前**被挡掉 ——
+#: 读了会污染训练与指标，报出来会把排查方向带偏，两者都不允许。
+ACCESSION_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def is_official_accession(name: object) -> bool:
+    """该名字是大赛检查号吗（32 位十六进制；大小写不敏感）。"""
+    return bool(ACCESSION_RE.match(str(name or "").strip().lower()))
+
 
 def assert_case_root(root: Path) -> None:
     """拦截"数据根误指向 ``datasets/`` 父目录"。
@@ -201,9 +214,10 @@ def read_series_types(root: Path) -> dict[tuple[str, str], str]:
     （第 1~3 行都可能是索引信息，写死 ``rows[0]`` 会在换一版排版时整表读成 0 条）；
     列名一条都不命中时还会按**取值**嗅探三列（见 :func:`_sniff_series_type_columns`）。
 
-    定位见 :func:`shared.official_labels.label_search_dirs`：显式/环境变量 →
-    ``<工程>/labels`` → **``$WORKSPACE`` 下 3 层** → 数据根/父/祖父 →
-    这些目录下像标注容器的一级子目录（``annotation`` / ``标注结果`` …）。
+    定位见 :func:`shared.official_labels.label_search_dirs`：显式 ``labels_dir`` /
+    ``GLIOMA_LABELS_DIR`` → 数据根/父/祖父 → 这些目录下像标注容器的一级子目录
+    （``annotation`` / ``original`` / ``标注结果`` …）。
+    **不再隐式搜 ``<工程>/labels`` 与 ``$WORKSPACE``**（会串表）。
     只认数据根那一层会翻车（数据根常指到 ``training/`` 或某个病例目录）。
     表里检查号列与磁盘目录名对不上**不再是问题**：查表走两级口径
     （精确键 → SeriesUid 单键回退，见 :func:`shared.official_labels.lookup_series_type`）。
@@ -211,7 +225,7 @@ def read_series_types(root: Path) -> dict[tuple[str, str], str]:
     与提交工程 ``data/metadata.py: read_series_types`` 保持同一语义：
     表头别名容错、缺文件返回空表（不是错误）、同一键冲突取值**直接失败**。
 
-    ⚠️ **工作区那份 ``3_serieslabel.xlsx`` 不再参与**（这里曾把它当"只补缺、
+    ⚠️ **工作区那份 ``工作区兼容表`` 不再参与**（这里曾把它当"只补缺、
     不覆盖"的兜底）。两个原因：①它取值粗（``SeriesLabel`` 只有 ``T1CE``/``T2``/
     ``FLAIR``），混进来会把数据集的 ``T2WI``/``T2-Flair`` **静默压成 ``T2``** ——
     表现是"模态看着都认出来了、通道里却是错的对比度"，比报错难查得多；
@@ -233,9 +247,9 @@ def read_series_types(root: Path) -> dict[tuple[str, str], str]:
     # 位置与影像同层：`<阶段>/annotation/SeriesType.xlsx`（训练/验证集已下发，
     # 评测集在正式测试时随测试数据一起下发）。
     # ★ **数据优先**：先在数据目录里直接找（root 本身 / annotation/ / original/
-    #   父目录），找不到才退回通用搜索（$GLIOMA_LABELS_DIR / <工程>/labels /
-    #   $WORKSPACE/**/labels）。顺序反了会**串表**：工作区 labels/ 里若残留
-    #   另一份数据的 SeriesType.xlsx（如训练集的拷贝），它会先被命中 ——
+    #   父目录），找不到才退回**显式**指定的 $GLIOMA_LABELS_DIR。
+    #   **不再隐式搜 <工程>/labels 与 $WORKSPACE**：那会**串表** —— 工作区 labels/ 里
+    #   若残留另一份数据的 SeriesType.xlsx（如训练集的拷贝），它会先被命中 ——
     #   拿训练集的检查号/序列号去查验证集，一条都对不上
     #   （见 shared.official_labels.find_series_type_table_in_data）。
     hit = (find_series_type_table_in_data(root)
@@ -346,9 +360,77 @@ def _sidecar_desc(path: Path) -> str | None:
     return None
 
 
+#: 官方**标注结果表**的文件名（含 `ROI级别` sheet 的「序列描述」列）。
+#: 它是模态的**第二条来源**：类型表没到手 / 表里没有这一批 UID 时兜底。
+_ANNOTATION_RESULT_TABLES = ("脑胶质瘤标注结果-训练集.xlsx", "脑胶质瘤标注结果-验证集.xlsx")
+
+#: 「序列描述」列的候选列名。与 :data:`_SERIES_TYPE_ALIASES` 的 ``typ`` 同源 ——
+#: 那一列**本身就是模态取值**（``T1`` / ``T2-Flair`` / ``T1CE（增强）`` / ``其他``）。
+#: 官方口径叫 ``DetailDescription``，数据集实测拼写 ``SeriesDescription``
+#: （ROI 级别 sheet），分层写法末段 ``序列描述``。
+_SERIES_DESC_KWS: tuple[str, ...] = ("seriesdescription", "serisdescription",
+                                     "detaildescription", "seriestype",
+                                     "序列描述", "序列类型")
+
+#: DICOM UID 只含数字与点。用它把"UID 列"与"描述列"区分开：
+#: :func:`shared.official_labels._find_col` 的"包含"轮里，``series`` 会命中
+#: ``SeriesDescription`` **自己**，于是两列落成同一列、取值互相顶替。
+_UID_LIKE_RE = re.compile(r"^\d[\d.]*$")
+
+
+def read_series_desc_index(root) -> dict[str, str]:
+    """标注结果表 → ``{序列UID(归一化): 序列描述}``（**模态旁证**）。
+
+    为什么需要它（与算法工程 ``glioma_track4/src/data/labels.desc_index_from_records``
+    **同一口径**）：模态的权威来源是数据自带的 ``SeriesType.xlsx``，但它**可能没到手，
+    或表里恰好没有这一批 UID**。此时唯一还能**批量**判模态的正规线索，就是标注结果表
+    ``ROI级别`` sheet 的「序列描述」列 —— 行键是 ``序列Uid``，与磁盘上的序列目录名 /
+    文件名主干**同源**，能直接对上。
+
+    两条路线（本工程与 ``glioma_track4``）必须对同一份数据给出**同样的模态**：
+    只有一边认得出、另一边认不出，就是"训练与推理喂的模态不一致"这类静默错位。
+
+    读法与类型表一致：不假设表头在第几行（多张表拼在一起，每张各自一段表头），
+    列名认不出就跳过；取值必须**像模态**才收（否则散文列会被当成描述列）。
+    找不到表 / 认不出列都返回空表（由上层报数），不抛异常。
+    """
+    from shared.official_labels import _find_col, _rows, find_named_table
+
+    out: dict[str, str] = {}
+    path = None
+    for name in _ANNOTATION_RESULT_TABLES:
+        path = find_named_table(name, root)
+        if path:
+            break
+    if not path:
+        return out
+    uid_col: int | None = None
+    desc_col: int | None = None
+    for row in _rows(path):
+        cells = [str(c).strip() for c in row]
+        if not any(cells):
+            continue
+        # 每一段表头都重新定位两列（`_rows` 把多张工作表拼成了一个列表）
+        _u = _find_col(cells, _SERIES_TYPE_ALIASES["uid"])
+        _d = _find_col(cells, _SERIES_DESC_KWS)
+        if _u is not None and _d is not None and _u != _d:
+            uid_col, desc_col = _u, _d
+            continue
+        if uid_col is None or desc_col is None:
+            continue
+        if max(uid_col, desc_col) >= len(cells):
+            continue
+        uid, desc = cells[uid_col], cells[desc_col]
+        # 两列都要过形态校验：UID 是数字+点；描述要像模态（含"其他"这类权威排除值）
+        if _UID_LIKE_RE.match(uid) and _looks_like_modality_value(desc):
+            out.setdefault(_norm_key(uid), desc)
+    return out
+
+
 def _series_desc(path: Path, accession: str, uid: str, series_types: dict,
-                 uid_index: dict | None = None) -> str:
-    """序列类型的**取用优先级**：类型表 → sidecar → 目录名。
+                 uid_index: dict | None = None,
+                 desc_index: dict | None = None) -> str:
+    """序列类型的**取用优先级**：类型表 → **标注表「序列描述」旁证** → sidecar → 目录名。
 
     返回的文本会作为 ``Series`` 的 ``modality`` 交给模态关键词匹配，
     因此它可以是 ``T1CE`` / ``FLAIR`` / ``T1增强`` 这类**任意自然描述**。
@@ -361,6 +443,9 @@ def _series_desc(path: Path, accession: str, uid: str, series_types: dict,
     查表走两级（:func:`shared.official_labels.lookup_series_type`）：先
     ``(检查号, 序列号)`` 精确键，查不到再按 **SeriesUid 单键回退** ——
     表里的检查号列与磁盘目录名口径不一致时（匿名化/哈希），精确键会整批落空。
+
+    ``desc_index`` 是 :func:`read_series_desc_index` 的产出（第二条来源，可选）：
+    类型表**整份缺失**时它仍按 UID 直接命中，是"类型表没到手"唯一的批量退路。
     """
     from shared.official_labels import lookup_series_type
 
@@ -368,6 +453,11 @@ def _series_desc(path: Path, accession: str, uid: str, series_types: dict,
     value = lookup_series_type(series_types, accession, (uid, stem), uid_index)
     if value:
         return str(value)
+    if desc_index:
+        for cand in (uid, stem):
+            hit = desc_index.get(_norm_key(cand))
+            if hit:
+                return str(hit)
     value = _sidecar_desc(path)
     if value:
         return value
@@ -505,7 +595,8 @@ def _official_context(root: Path) -> dict:
             "labels": labels, "pairs": pairs}
 
 
-def discover_cases(dataset_root: Path, limit: int | None = None) -> list[dict]:
+def discover_cases(dataset_root: Path, limit: int | None = None,
+                   diagnose: bool = True) -> list[dict]:
     """扫描 ``<root>/<AccessionNumber>/<SeriesUid>/*.nii[.gz]``。
 
     返回的每个 case 除 ``accession``/``dir``/``series`` 外，还可能带：
@@ -517,14 +608,57 @@ def discover_cases(dataset_root: Path, limit: int | None = None) -> list[dict]:
     - ``source``：``true`` / ``fake`` / ``compositing`` / ``duplicate``（影像所在子目录）
 
     只做轻量发现（不读体素），真正的读取延迟到 ``load_case``。
+
+    ``diagnose=False``：**探测模式** —— 调用方在对**多个候选根**轮流试（如
+    ``glioma_track4/scripts/29_locate_dataset_root.py``），此时"模态认不出"的诊断
+    折叠成一行，由调用方汇总；避免把无关根的多行告警混进结果里，看着像在说官方数据集坏了。
+    无论开关如何，**每次调用都会打印"本批是哪个根 + 表读到几条"**，多根循环时不再串场。
     """
     root = resolve_case_root(Path(dataset_root))   # 填高一层（如 .../training）时自动下钻
     assert_case_root(root)
-    from shared.official_labels import build_uid_index
+    # ---- 大赛数据闸门：只认 32 位十六进制检查号（其余目录**不读、不打印**）----
+    # 平台契约：``<数据根>/<32 位十六进制检查号>/<序列UID>/…``。非大赛目录在这里
+    # 就被挡掉 —— 既不会进训练，也不会在日志里出现（出现只会把排查方向带偏）。
+    _dirs = [p for p in root.iterdir() if p.is_dir()]
+    if not _dirs:
+        print(f"[data] ⚠️ 数据根 {root} 下没有任何子目录 → 0 例"
+              f"（影像存储可能没挂上，见 docs/DATASET_ROOT_TROUBLESHOOT.md）", flush=True)
+        return []
+    _case_dirs = [p for p in _dirs if is_official_accession(p.name)]
+    _own_dirs = [p for p in _dirs if p.name.casefold() in
+                 (frozenset(_DESCEND_DIRS) | frozenset(SPECIAL_SOURCE_DIRS)
+                  | frozenset(_NON_CASE_DIRS))]
+    if not _case_dirs:
+        raise ValueError(
+            f"数据根 {root} 不是大赛数据布局：一级子目录里没有 32 位十六进制的检查号"
+            f"（如 0050d79429cf4d86907dc8c4a34cbf04）。当前 {len(_dirs)} 个子目录、"
+            f"其中 {len(_own_dirs)} 个是本工程自己的目录（annotation/original/"
+            f"fake/compositing/duplicate 等）。官方布局：训练集根="
+            f"…/datasets/training（其下 annotation/）、验证集根="
+            f"…/datasets/verification（其下 original/），病例目录名就是检查号本身。")
+    from shared.official_labels import (SERIES_TYPE_TABLE, build_uid_index,
+                                        find_named_table,
+                                        find_series_type_table_in_data)
 
     series_types = read_series_types(root)
+    # 本批**真正用到**的那张表（与 `read_series_types` 的查找口径完全一致）。
+    # 报告它、而不是"重新搜一遍文件系统"，否则会出现"表读到了 N 条 / 自检说未找到"
+    # 的自相矛盾（实测踩过：多根循环时把另一个根搜空，被当成本批的结论）。
+    _type_path = (find_series_type_table_in_data(str(root))
+                  or find_named_table(SERIES_TYPE_TABLE, str(root)))
     # 表里的检查号列与磁盘目录名对不上时，靠它按 SeriesUid 单键回退（见 _series_desc）
     uid_index = build_uid_index(series_types)
+    # 模态的**第二条来源**（与 `glioma_track4` 同口径）：标注结果表 `ROI级别` 的
+    # 「序列描述」。类型表整份缺失时，它是唯一还能**批量**判模态的正规线索 ——
+    # 缺了它就只能靠目录名（UID 命名下必落空）→ 全零通道照训（白跑且不报错）。
+    desc_index = read_series_desc_index(root)
+    # ★ 每次调用都**报出是哪个根**：`discover_cases` 会被探测类脚本对多个候选根轮流调用，
+    #   不打根就无法判断后面每段诊断属于谁（这正是"6340 条 / 未找到"并存的成因）。
+    print(f"[data] ── 数据根 {root}｜数据信息表 {_type_path or '未找到'}"
+          f"（{len(series_types)} 条）｜序列描述旁证 {len(desc_index)} 条", flush=True)
+    if desc_index:
+        print(f"[data] 已从标注表读到「序列描述」（模态旁证）：{len(desc_index)} 条序列 UID",
+              flush=True)
     ctx = _official_context(root)
     cases: list[dict] = []
 
@@ -538,7 +672,7 @@ def discover_cases(dataset_root: Path, limit: int | None = None) -> list[dict]:
             if not f.is_file() or not f.name.lower().endswith(NIFTI_SUFFIXES):
                 continue
             uid = f.parent.name
-            desc = _series_desc(f, acc_dir.name, uid, series_types, uid_index)
+            desc = _series_desc(f, acc_dir.name, uid, series_types, uid_index, desc_index)
             # 官方掩膜表：文件名任意（core.nii.gz…），关键词认不出，必须查表
             if f.name in (table_masks.get(_norm_key(uid)) or []):
                 role = _mask_role(f.name, desc) or "core"
@@ -581,10 +715,9 @@ def discover_cases(dataset_root: Path, limit: int | None = None) -> list[dict]:
         return flags
 
     # ---- 正常影像（主目录一级子目录 = 检查号）----
-    for acc_dir in sorted(p for p in root.iterdir() if p.is_dir()):
-        low = acc_dir.name.lower()
-        if low in ("annotation", "cache", "runs") or low in SPECIAL_SOURCE_DIRS:
-            continue
+    # 迭代 `_case_dirs`（已在闸门里筛成 32 位十六进制）：容器目录（annotation/
+    # original）与特殊影像目录（fake/…）天然不在其中，不必再按名字排除。
+    for acc_dir in _case_dirs:
         case = _collect(acc_dir, "true")
         if case:
             case["special"] = _special_of(case)
@@ -600,7 +733,8 @@ def discover_cases(dataset_root: Path, limit: int | None = None) -> list[dict]:
         if not src_dir.is_dir():
             continue
         added = 0
-        for acc_dir in sorted(p for p in src_dir.iterdir() if p.is_dir()):
+        for acc_dir in sorted(p for p in src_dir.iterdir()
+                              if p.is_dir() and is_official_accession(p.name)):
             case = _collect(acc_dir, src)
             if case:
                 case["special"] = _special_of(case)
@@ -612,23 +746,20 @@ def discover_cases(dataset_root: Path, limit: int | None = None) -> list[dict]:
             print(f"[data] 已并入 {src}/ 下 {added} 例异常影像"
                   f"（目标一/二-A 的正样本来源）", flush=True)
 
-    # 前置预警：一条序列都认不出模态时，训练会在 DataLoader worker 里抛
-    # 「无任何可用序列」——堆栈落在 torch 的取数内部，看不出根因。
+    # 前置预警：一条序列都认不出模态时的诊断。
+    #
+    # ★★ 两条**必须**遵守的写法（都踩过坑）：
+    #   1. **必须写明数据根**：`discover_cases` 常被"探测类"脚本对**多个候选根**轮流调用
+    #      （`scripts/29_locate_dataset_root.py` 一次试多个根），不写根就会出现
+    #      "上一行说读到 N 条、这一行说未找到"的自相矛盾 —— 那其实是**两个不同的根**。
+    #   2. **只能用手里的事实**：早先这里会**重新搜一遍文件系统**（调 official_labels 里
+    #      的"模态来源自检"），它只回答"表在不在"，既可能与 `series_types`（本批真正
+    #      用到的表）不一致，也看不出"表在、键对不上"这种更常见的情形。现在直接报告
+    #      **本批读到的表**（路径 + 条数）与**键命中数**，两种成因分开说。
     if cases and not any(
         guess_modality(s.get("desc") or s.get("uid") or "")
         for c in cases[:50] for s in c.get("series") or []
     ):
-        from shared.official_labels import describe_modality_sources
-
-        # ★ 查表失败只有三种成因：检查号对不上 / 序列号对不上 / 列认错了。
-        #   把"表里的键"和"磁盘上的名字"**各抽几个摆在一起**，一眼就能看出是哪种；
-        #   不摆出来就只能反复猜（2026-09-24 验证集就栽在这里：表读到了 1735 条，
-        #   但自检只说"未找到"，看不出键对没对上）。
-        _tbl_keys = [k for k in series_types if isinstance(k, tuple)][:3]
-        _tbl_accs = sorted({k[0] for k in series_types
-                            if isinstance(k, tuple) and k[0]})[:2]
-        _tbl_uids = sorted({k[1] for k in series_types
-                            if isinstance(k, tuple) and len(k) > 1})[:2]
         _disk_accs = [c["accession"] for c in cases[:2]]
         _disk_uids = [s.get("uid") for c in cases[:2]
                       for s in (c.get("series") or [])][:3]
@@ -638,23 +769,39 @@ def discover_cases(dataset_root: Path, limit: int | None = None) -> list[dict]:
         _uid_hit = sum(1 for c in cases[:50] for s in (c.get("series") or [])
                        if _norm_key(s.get("uid") or "") in
                        {k[1] for k in series_types if isinstance(k, tuple)})
-        print("[data] ⚠️ 没有任何序列能识别出模态（前 50 例逐条试过：目录名/文件名不含关键词，"
-              "数据信息表也没给出 T1CE/T2-Flair 这类取值）。\n"
-              f"       自检：{describe_modality_sources(root)}\n"
-              f"       表已读 {len(series_types)} 条：检查号样例 {_tbl_accs}、"
-              f"序列号样例 {_tbl_uids}（首键 {_tbl_keys[:1]}）\n"
-              f"       磁盘样例：检查号 {_disk_accs}、序列目录 {_disk_uids}\n"
-              f"       键命中（前 50 例）：检查号 {_acc_hit} 例 / 序列号 {_uid_hit} 路\n"
-              "       → 命中为 0 的两种成因：\n"
-              "         ① **串表**（拿另一份数据的表查本批数据，如训练集表查验证集 ——"
-              " 看上面表路径是不是指向 labels/ 而不是本数据目录）；\n"
-              "         ② 键口径不一致（表里检查号/序列号列与磁盘目录名对不上，"
-              "把上面两行样例贴出来即可定位）。\n"
-              "         命中不少却仍认不出 = 表的取值不是 T1/T1CE/T2-Flair/T2WI（贴几行取值）。\n"
-              "       继续训练会在取数时报「无任何可用序列」。"
-              "处理：表就在数据里、与病例目录同层（training→annotation、verification→original）；"
-              "确实在非常规位置就 export GLIOMA_LABELS_DIR=<它所在目录>",
-              flush=True)
+        if not diagnose:
+            # 探测模式（一次试很多候选根）：折叠成一行，别刷屏、别看起来像结论。
+            print(f"[data] · 数据根 {root}：前 50 例没有序列能识别出模态"
+                  f"（表 {'有' if series_types else '无'} / {len(series_types)} 条，"
+                  f"检查号命中 {_acc_hit} 例）—— 探测模式下仅记录，见调用方的汇总",
+                  flush=True)
+        else:
+            if series_types:
+                _why = (f"       本批数据信息表：{_type_path}（{len(series_types)} 条）"
+                        f"—— **表读到了，但键一条都命中不上**："
+                        f"前 50 例里检查号命中 {_acc_hit} 例 / 序列号命中 {_uid_hit} 路。\n"
+                        "       两种成因：① **串表**（这份表属于另一批数据，"
+                        "如拿训练集的表查验证集）；② **键口径不一致**"
+                        "（表里的检查号/序列号列与磁盘目录名对不上）。\n")
+            else:
+                _why = ("       本批**没有**读到数据信息表（数据根/父/祖父 + 标注容器子目录里都没有）。\n"
+                        "       表若确实在别处：export GLIOMA_LABELS_DIR=<含表目录>。\n")
+            print(f"[data] ⚠️ 数据根 {root}：前 50 例没有任何序列能识别出模态"
+                  f"（序列目录名/文件名不含模态关键词）。\n"
+                  + _why +
+                  f"       磁盘样例：检查号 {_disk_accs}、序列目录 {_disk_uids}\n"
+                  f"       ② 级（标注表「序列描述」旁证）读到 {len(desc_index)} 条 UID："
+                  "0 条 = 标注结果表没找到 / 没有「序列描述」列。\n"
+                  "       ⚠️ 全放开口径下，继续训练**不会再报错** —— 它会把 4 个通道全置零照训"
+                  "（借该例影像几何）。所以这不再是「会不会崩」，而是**训练会白跑**："
+                  "输入是常数，模型学不到东西，指标只会悄悄变差（比报错难查得多）。\n"
+                  "       处理（按序）：① 确认数据根没填偏 —— 表与病例目录**同层**"
+                  "（training→annotation、verification→original）；"
+                  "② 表在非常规位置 → export GLIOMA_LABELS_DIR=<它所在目录>；"
+                  "③ 类型表没有可取的值 → 用标注结果表的「序列描述」（本工程已自动接）；"
+                  "④ 以上都没有 → 先训体素判别模型："
+                  "python glioma_track4/scripts/31_train_modality_model.py --root <数据根>",
+                  flush=True)
     return cases
 
 

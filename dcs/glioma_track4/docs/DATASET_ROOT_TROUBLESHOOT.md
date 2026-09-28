@@ -156,23 +156,25 @@ ValueError: Caught ValueError in DataLoader worker process
 取值优先级：
 
 ```text
-SeriesType.xlsx（数据集自带，权威）→ 3_serieslabel.xlsx（工作区那份，兼容兜底）→ 同名 .json sidecar → 目录名（本地模拟集仍照旧）
+SeriesType.xlsx（数据集自带，权威）→ 工作区兼容表（工作区那份，兼容兜底）→ 同名 .json sidecar → 目录名（本地模拟集仍照旧）
 ```
 
 | 名字 | 在哪 | 列 / 取值 |
 |---|---|---|
 | `SeriesType.xlsx` | **赛道四数据集里**：`<阶段>/annotation/SeriesType.xlsx`（与病例目录**同层**） | `AccessionNumber`, `SeriesUid`, `SeriesType` ∈ {`T1`, `T1CE（增强）`, `T2-Flair`, `T2WI`, **`其他`**} |
-| `3_serieslabel.xlsx` | 团队工作区 `labels/`（**不是本赛道数据集的内容**，属另一个目标；仅兜底） | `AccessionNumber`, `SeriesUid`, `SeriesLabel` ∈ {`T1CE`, `T2`, `FLAIR`} |
+| `工作区兼容表` | 团队工作区 `labels/`（**不是本赛道数据集的内容**，属另一个目标；仅兜底） | `AccessionNumber`, `SeriesUid`, `SeriesLabel` ∈ {`T1CE`, `T2`, `FLAIR`} |
 
-> `1_abnormal.xlsx` / `2_duplicate.xlsx` / `3_serieslabel.xlsx` / `4_masklabel.xlsx` /
+> `1_abnormal.xlsx` / `2_duplicate.xlsx` / `工作区兼容表` / `4_masklabel.xlsx` /
 > `5_characteristics.xlsx` 这 5 张表**与赛道四数据集无关**，不必为它们去配置路径。
 >
 > **两个名字都找，但顺序不能反**：`SeriesType.xlsx` 先、且**只补缺不覆盖**。
 > 反过来会让工作区那份（取值更粗，只写 `T2`）静默覆盖数据集的 `T2WI` / `T2-Flair` ——
 > 表现是"模态看着都认出来了、通道里却是错的对比度"，比直接报错难查得多。
-> 现在统一按候选目录搜（`$GLIOMA_LABELS_DIR` → `<工程>/labels` → `$WORKSPACE` 下 3 层 →
-> 数据根/父/祖父 → 像标注容器的子目录），所以把数据根指成 `.../training`、
-> `annotation/` **或**某一病例目录都能命中 —— 现场表现就是"表就在磁盘上，报错却说没找到"。
+> 现在**只从数据根找**（数据根/父/祖父 → 像标注容器的子目录，如 `annotation/`、`original/`、
+> `标注结果/`），所以把数据根指成 `.../training`、`annotation/` **或**某一病例目录都能命中
+> —— 现场表现就是"表就在磁盘上，报错却说没找到"。
+> **不再隐式搜 `<工程>/labels` 与 `$WORKSPACE`**（会串表）；表确在别处时用
+> `export GLIOMA_LABELS_DIR=<目录>` **显式**指定。
 >
 > `SeriesType` 里的 **`其他`** 是权威结论（该序列不是 T1/T1CE/T2-Flair/T2WI 中的任何一个），
 > 探针会直接排除、**不交给体素判别模型猜**：模型只认识 4 类，容易把 DWI/ADC 判成
@@ -207,18 +209,18 @@ bash scripts/01_probe.sh
 
 ### 表在哪：默认会自动找（零配置）
 
-探针按这个顺序定位**序列类型表**，**命中即止**（`SeriesType.xlsx` 与 `3_serieslabel.xlsx`
+探针按这个顺序定位**序列类型表**，**命中即止**（`SeriesType.xlsx` 与 `工作区兼容表`
 走**同一批**候选目录，两个名字分别找）：
 
 ```text
-显式 --labels / $GLIOMA_LABELS_DIR  →  <工程>/labels  →  $WORKSPACE 下 3 层内所有 labels/  →  数据根/父/祖父
+显式 --labels / $GLIOMA_LABELS_DIR（可选）  →  数据根/父/祖父  →  像标注容器的子目录
 ```
 
 最后两项就是为**数据集里的** `SeriesType.xlsx` 准备的：它与病例目录同层（都在
 `annotation/` 里），所以数据根填 `.../training`、`.../training/annotation` 或
 `annotation/<某病例目录>` 都能命中。
 
-团队工作区里那份 `3_serieslabel.xlsx`（`/2026aicompetition/workspace/dcs/goal1and2/Goal1and2/labels/`，
+团队工作区里那份 `工作区兼容表`（`/2026aicompetition/workspace/dcs/goal1and2/Goal1and2/labels/`，
 **与数据集无关**）**通常不做任何操作就能被找到**（搜索有界：深度 ≤ 3、只认名为 `labels`
 的目录、跳过 `cache`/`logs` 等），只在数据集那份读不到时才起作用。工作区在别处或层级更深时，
 二选一显式接上：
@@ -239,14 +241,14 @@ export GLIOMA_LABELS_DIR=/2026aicompetition/workspace/dcs/goal1and2/Goal1and2/la
 ```bash
 # ① 表到底在哪（两个命名都搜：平台那份在数据里，团队那份在工作区）
 find /2026aicompetition/datasets /2026aicompetition/workspace -maxdepth 5 \
-     \( -name "SeriesType.xlsx" -o -name "3_serieslabel.xlsx" \) 2>/dev/null
+     \( -name "SeriesType.xlsx" -o -name "工作区兼容表" \) 2>/dev/null
 
 # ② 表与影像是不是同一批（看 SeriesUid ∩ 磁盘序列名 是否 > 0）
 python3 - <<'PY'
 import os, pandas as pd
 ACC  = sorted(os.listdir("/2026aicompetition/datasets/training/annotation"))[0]
 ROOT = f"/2026aicompetition/datasets/training/annotation/{ACC}"
-# 平台下发的那份：与病例目录同层；若换成团队那份，指向 labels/3_serieslabel.xlsx
+# 平台下发的那份：与病例目录同层；若换成团队那份，指向 labels/工作区兼容表
 LAB  = "/2026aicompetition/datasets/training/annotation/SeriesType.xlsx"
 df   = pd.read_excel(LAB, dtype=str)
 uid  = next(c for c in df.columns if c.lower() in ("seriesuid", "series_uid", "序列号"))
@@ -284,7 +286,7 @@ python3 scripts/31_train_modality_model.py --root $DATASET_ROOT
 python3 scripts/31_train_modality_model.py --root $DATASET_ROOT --dry-run
 
 # 本地模拟集（标签来自目录名 flair_0000 / t1c_0000 …）
-python3 scripts/31_train_modality_model.py --root /path/to/track4_sim
+python3 scripts/31_train_modality_model.py --root /path/to/本地演练集
 ```
 
 > 训练侧那条 `无任何可用序列` 报错**已经自带自检**：会打印"标注表找到了没 / 体素模型
@@ -306,7 +308,7 @@ T1CE 的增强灶（高强度尾部）—— 权重可直接打印检视。
 
 | 训练数据 | 5 折准确率 | 对**评测集**的可靠性 |
 |---|---|---|
-| 本地模拟集（BraTS 派生，750 例） | **0.960** | **未知** —— 与官方数据不同厂商/协议，存在域差 |
+| 本地模拟集（同类数据集 派生，750 例） | **0.960** | **未知** —— 与官方数据不同厂商/协议，存在域差 |
 | 官方训练集（`--root $DATASET_ROOT`） | 现场测得 | 同分布，**这才是生产路径** |
 
 模拟集训出的模型只保证**管线是通的**（`scripts/25_verify_tasks_integration.py`

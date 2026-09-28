@@ -10,7 +10,7 @@
    "瘤体"误判成 core 并写错空间。同一角色多个掩码取**并集**。
 3. **缺失序列降级**：T1C 缺失用 T1/T2 顶替，FLAIR 缺失用 T2（日志记录）。
 4. **强增广**：翻转 / 90°旋转 / 随机缩放 / 弹性形变 / 强度扰动 / 偏置场 / 噪声，
-   显著提升小样本泛化（BraTS 类任务上通常 +2~4 Dice）。
+   显著提升小样本泛化（这类脑肿瘤分割任务上通常 +2~4 Dice）。
 5. **特殊影像与重复影像**：`SpecialImageDataset` 训练假人体/拼接头（目标一二），
    `DuplicatePairDataset` 训练嵌入（目标一二的重复影像）。
 """
@@ -321,9 +321,10 @@ def build_case_volume(case: dict, cfg: dict, log: list | None = None
                 f"模态来源自检：{describe_modality_sources(case.get('dir'))}。"
                 f"注意：**只有 `其他` 序列/只有 DWI 的病例不算这一类** —— 那种情况会"
                 f"全零通道照训（全放开口径）。这里失败说明连几何都借不到。"
-                f"按顺序试：① export GLIOMA_LABELS_DIR=<含数据信息表 "
-                f"{SERIES_TYPE_TABLE} 的目录>（或 ln -s 到 <工程>/labels），数据的表就在 "
-                f"annotation/ 下、与病例目录同层；然后重跑 bash scripts/01_probe.sh 与 "
+                f"按顺序试：① 数据的表就在 annotation/ 下、与病例目录同层 —— 先确认数据根"
+                f"指向的是那一层；表确在别处就 export GLIOMA_LABELS_DIR=<含数据信息表 "
+                f"{SERIES_TYPE_TABLE} 的目录>（**显式**指定，不做隐式搜索）；"
+                f"然后重跑 bash scripts/01_probe.sh 与 "
                 f"bash scripts/02_build_dataset.sh；"
                 f"② 没有类型表时训练体素判别模型："
                 f"python3 scripts/31_train_modality_model.py --root <数据根>"
@@ -609,7 +610,9 @@ def build_volume_from_arrays(available: dict[str, tuple[np.ndarray, np.ndarray]]
                      if v is not None and v[0] is not None), None)
         if _any is None:
             raise RuntimeError(
-                "没有任何可用序列（t1c/flair/t2/t1 全部缺失，且没有任何影像数组）")
+                "没有任何可用序列（t1c/flair/t2/t1 全部缺失，且**没有任何影像数组**）。"
+                "注意：**只有 `其他` 序列 / 只有 DWI 的检查不算这一类** —— "
+                "那种情况会全零通道照走；这里失败说明调用方连一个数组都没传进来")
         if log is not None:
             log.append(f"4 个通道都填不上（可用模态={sorted(available)}）→ **全零通道**，"
                        f"几何借用 {_any[0]}")
@@ -1029,7 +1032,7 @@ def build_folds(manifest_path: str, n_folds: int = 5, val_ratio: float = 0.2,
       且它在所有折都是训练样本）。
 
     实测 624 例 / 5 折下出现了 3 例重复（FAKE_000/FAKE_001/COMP_002）
-    与 2 例完全缺失（BraTS2021_00085/00318）。
+    与 2 例完全缺失（本地留出病例）。
 
     现改为标准做法：对 pos / neg 分别"轮流发牌"（``items[i::n_folds]``），
     各折 val 天然**互斥**且**并集为全集**，同时每折阳性比例保持均衡

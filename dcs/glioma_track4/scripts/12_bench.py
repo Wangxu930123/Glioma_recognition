@@ -20,8 +20,7 @@ sys.path.insert(0, ROOT)
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default=os.environ.get("DATASET_ROOT") or
-                    "/mnt/data_sdb/wangx/data/Brain_MRI/track4_sim")
+    ap.add_argument("--root", default=os.environ.get("DATASET_ROOT"))
     ap.add_argument("--patch", type=int, default=96)
     ap.add_argument("--batch", type=int, default=2)
     ap.add_argument("--steps", type=int, default=12)

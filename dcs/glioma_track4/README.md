@@ -180,9 +180,9 @@ glioma_track4/
 - **掩膜靠文件名后缀认**（`…_mask.nii.gz`），且**角色语义依赖它所在序列的模态**：`肿瘤瘤体`→core；`瘤体`/`水肿`/`全肿瘤`→ FLAIR/T2 上为 peri；`异常信号`按所在序列归位。掩膜与影像同目录，所以**不能**拿"所在目录名"当序列 UID —— 掩膜的序列 UID 只到主干里**第一个 `_` 之前**（DICOM UID 只含数字与点、不含下划线），代码按候选逐级剥短去查 `SeriesType.xlsx`。
   漏这一步是**静默**错：掩膜查不到模态 → `瘤体` 被判成 **core**（规范里它是 FLAIR/T2 上的 peri）→ 任务B 的掩膜并进任务A，且几何来自另一条序列，指标只会悄悄偏低。
 - 判不出角色的掩膜（`RoiName` 在关键词表之外，如你描述里的"等等"）会被探针**告警 + 跳过**：既不算掩膜、也**不进输入通道**（否则会被体素模型猜成 t1c/t2，标签当输入）；`瘤体` 在模态确实未知时按 core 兜底，并同样告警。
-- 序列目录/文件名是 DICOM UID，**靠关键词猜不出模态**，必须靠 `SeriesType.xlsx`；探针按候选目录搜该表（`$GLIOMA_LABELS_DIR` → `<工程>/labels` → `$WORKSPACE` 下 3 层 → 数据根/父/祖父），所以数据根填哪一层都能命中。
+- 序列目录/文件名是 DICOM UID，**靠关键词猜不出模态**，必须靠 `SeriesType.xlsx`；探针**只在数据根**找它（数据根本身 / `annotation` / `original` / 父目录 / 祖父目录 + 像标注容器的子目录），所以数据根填 `.../training`、`annotation/` **或**某一病例目录都能命中。**不再隐式扫 `<工程>/labels` 与 `$WORKSPACE`**（会串表：工作区残留另一份数据的表会先被命中 → "表读到几千条却一条都查不中"）；表确在别处就用 `export GLIOMA_LABELS_DIR=<含表目录>` **显式**指定。
 - `SeriesType=其他` 是**权威排除**：探针**不会**把它交给体素模型猜模态（报告里的 `cases_with_declared_other_series` 是它的计数，非 0 属正常）。**整例都是 `其他`** 时这例就一个真通道都填不上 → 按**全放开**口径 4 通道全零照训（见 §7.2.1），一例不丢。
-- **`3_serieslabel.xlsx` 不是本赛道数据集的内容**（属工作区里另一个目标的产物），**与赛道四数据集没有关系**：它取值粗（只写 `T2`），混用会把 `T2WI`/`T2-Flair` 静默覆盖成 `T2`。模态只认数据集自带的 `SeriesType.xlsx`。
+- **`工作区兼容表` 不是本赛道数据集的内容**（属工作区里另一个目标的产物），**与赛道四数据集没有关系**：它取值粗（只写 `T2`），混用会把 `T2WI`/`T2-Flair` 静默覆盖成 `T2`。模态只认数据集自带的 `SeriesType.xlsx`。
 - 字段金标准 `annotation/脑胶质瘤标注结果-训练集.xlsx` 有 **3 张工作表**（`检查级别`/`序列级别`/`ROI级别`）：**病例级字段只取 `检查级别`**；序列级/ROI 级的行按病例嵌套保留（`__series_rows__`/`__roi_rows__`）但**不写进 `manifest.json`**（一例多行，按检查号硬合并会覆盖病例级字段且不报错）。
   **唯一例外**：某病例在 `检查级别` 里没有行、只出现在序列级/ROI 级表里时，若该病例**所有子行的标签列**（`病理结果` / `WHO分级` / `Glioma`）取值**完全一致**，就把这一个值补进病例级；不一致则告警且**不采纳**。只放开标签列是因为只有丢它们会静默缩小评测分母——整行兜底会**任取一行**（实测同一病例两条序列行的 `Signal_T2WI` 分别是 `High`/`Low`），比读不到更难查。
 - `检查级别` 的**实测排版**（别按"第一行就是表头"去读）：**表头在第 2 行**（第 1 行是标题），第 **H** 列 `StudyUid`、第 **I** 列 `AccessionNumber`（行键取**它**、**不是** `StudyUid`），第 **N** 列 `Study->CLINICAL->病理结果`（列名是**字段路径**，末段才是字段名）。取值形如 `脑胶质瘤2级` / `脑胶质瘤4级` / `其他肿瘤或病变` / `病因不明`。
@@ -501,7 +501,7 @@ python scripts/13_build_cache.py --workers 8
 | `threshold_grid` | 0.10~0.90（18 档） | 阈值标定搜索范围（`14_calibrate_thresholds.py`） |
 | `model.*` | `mednext` / base32 / depth4 / k3 | `arch: resunet` 可回退轻量版 |
 | `sampler.pos_ratio` | 0.7 | 含病灶 patch 比例（病灶极小时可调高） |
-| `augment.*` | 见文件 | 小样本泛化主要来源（BraTS 类通常 +2~4 Dice） |
+| `augment.*` | 见文件 | 小样本泛化主要来源（同类通常 +2~4 Dice） |
 | `global_view.size_mm/out/every` | 192 / 96 / 4 | 全局头物理立方体边长；**训练与推理必须一致** |
 | `aux.special_batch/pair_batch/neg_per_pos` | 2 / 2 / 3 | 目标一二与重复影像的每步样本量 |
 | `loss.*` | dice 1.0 / ce 1.0 / cls 1.0 / special 1.0 / embed 0.3 / contain 0.2 | 含 `deep_sup`、`boundary`、各类 `pos_weight` |
@@ -564,7 +564,7 @@ bash scripts/01_probe.sh                                            # 看 series
 
 - **`series_type_rows=0` 但有 `series_desc_rows>0`**：类型表没到手，②级已顶上（探针会打印"已用标注表的「序列描述」作模态旁证：N 路 / M 例"）。这是**正常兜底**，不是错误。
 - **两级都是 0**：模态只能靠 ⑤ 体素判别；先训练那个模型，否则整批 `unknown`。
-- 注意只认数据集自带的 `SeriesType.xlsx`；`3_serieslabel.xlsx` 与本赛道无关（会把 `T2WI`/`T2-Flair` 覆盖成 `T2`）。
+- 注意只认数据集自带的 `SeriesType.xlsx`；`工作区兼容表` 与本赛道无关（会把 `T2WI`/`T2-Flair` 覆盖成 `T2`）。
 
 #### 7.2.1 只有 `其他` 序列 / 只有 DWI 的病例：**全放开，照训**
 
@@ -674,7 +674,7 @@ bash scripts/00_setup_env.sh --mode system --offline --wheels wheels
 | `31_train_modality_model.py` | 训练"序列类型"兜底判别模型（模态表缺失时） |
 | `32_apply_abnormal_patch.py` | 标签表修补核验/合并（`--patch`、`--apply`、`--dry-run` 语义见 `--help`） |
 | `33_fix_abnormal_labels.sh` | 一键修 `1_abnormal` 标签表并重跑探针（`--dry-run`） |
-| `10_brats_to_track4.py` | 公共 BraTS → track4 目录结构（本地实验） |
+| `10_brats_to_track4.py` | 公共 同类数据集 → track4 目录结构（本地实验） |
 | `17_reset_for_official.sh` | 归档本地产物，切官方数据前清场 |
 | `18_retrain_new_folds.sh` / `19_safe_retrain_pipeline.sh` | 重训新折 / 安全重训流水线 |
 | `11_dicom_selftest.py` | DICOM 读取链路自检 |
@@ -708,5 +708,5 @@ bash scripts/00_setup_env.sh --mode system --offline --wheels wheels
 - 掩码写盘必须与**对应模态原图**同仿射同尺寸；体素只能是 0/1 —— 违反该例分割直接 0 分。
 - 日志必须写 `{workspace}/logs`，字段名按规范（评测会校验）。
 - `/call` 必须 5s 内回 200；结果写 `answer/{evaluation_id}/`，`prediction.json` / `duplicate_pairs.jsonl` 格式与命名按规范。
-- 不得使用与赛道四无关的标注表（`3_serieslabel.xlsx` 等）推断模态。
+- 不得使用与赛道四无关的标注表（`工作区兼容表` 等）推断模态。
 - 本地演练数据训出的权重不得当作正式交付结果。

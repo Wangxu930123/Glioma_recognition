@@ -109,8 +109,8 @@ labels_dir:      ./labels          # 5 张标注表所在目录，可用配置�
 | 现象 | 说明 |
 |---|---|
 | `training/` 下**只有** `annotation/` | 影像不直接在 `training/` 里，第一次很容易指错一层 |
-| **数据信息 `SeriesType.xlsx` 与病例目录同层**（`annotation/` 下） | 它**不是**数据根的下一层、也不在团队工作区；表里 `SeriesType` 是模态的唯一可靠来源。以前只认工作区那份 `3_serieslabel.xlsx`、且只在少数目录里找，于是"表明明在磁盘上却读不到" → 模态全是 `other` → 取数时报「无任何可用序列」。 |
-| **序列类型表按"数据优先"查找**（防**跨数据集串表**） | 先查 `<数据根>` 本身 / `annotation/` / `original/` / 父目录，**找不到才**退回 `$GLIOMA_LABELS_DIR` → `<工程>/labels` → `$WORKSPACE` 下 3 层。顺序反了会串表：工作区 `labels/` 里若残留另一份数据的 `SeriesType.xlsx`（如训练集的拷贝），它会先被命中 → **拿训练集的键查验证集**，表读到几千条却一条都对不上（2026-09-24 排查过的真实故障）。 |
+| **数据信息 `SeriesType.xlsx` 与病例目录同层**（`annotation/` 下） | 它**不是**数据根的下一层、也不在团队工作区；表里 `SeriesType` 是模态的唯一可靠来源。以前只认工作区那份 `工作区兼容表`、且只在少数目录里找，于是"表明明在磁盘上却读不到" → 模态全是 `other` → 取数时报「无任何可用序列」。 |
+| **序列类型表只从数据根找**（防**跨数据集串表**） | 只查 `<数据根>` 本身 / `annotation/` / `original/` / 父/祖父 + 像标注容器的子目录；**不再隐式扫** `<工程>/labels` 与 `$WORKSPACE`（那会让工作区里残留的另一份 `SeriesType.xlsx` 先被命中 → **拿训练集的键查验证集**，表读到几千条却一条都对不上，2026-09-24 排查过的真实故障）。表确在别处时用 `GLIOMA_LABELS_DIR` **显式**指定。 |
 
 ### 2.3 数据路径与数据信息路径（平台实测）
 
@@ -142,11 +142,11 @@ labels_dir:      ./labels          # 5 张标注表所在目录，可用配置�
 | 取值 → 通道键 | `T1`→`t1`，`T1CE（增强）`→`t1c`，`T2-Flair`→`flair`，`T2WI`→`t2`，`其他`→**排除**（不是模态，不交给体素模型猜） |
 | 评测集 | 同样有 `SeriesType.xlsx`，**正式测试时与测试数据一起下发**；路径由 `input.dataset_path` 给出，不需要猜 |
 
-> ⚠️ **`1_abnormal.xlsx` / `2_duplicate.xlsx` / `3_serieslabel.xlsx` / `4_masklabel.xlsx` /
+> ⚠️ **`1_abnormal.xlsx` / `2_duplicate.xlsx` / `工作区兼容表` / `4_masklabel.xlsx` /
 > `5_characteristics.xlsx` 这 5 张表与赛道四数据集没有关系**（属工作区里另一个目标的产物）。
 > 赛道四的数据信息就是数据集自带的 `SeriesType.xlsx`（加上训练集的
 > `脑胶质瘤标注结果-训练集.xlsx` 字段金标准）。
-> 代码保留对 `3_serieslabel.xlsx` 的查找**只为兼容兜底**：仅在数据集的 `SeriesType.xlsx`
+> 代码保留对 `工作区兼容表` 的查找**只为兼容兜底**：仅在数据集的 `SeriesType.xlsx`
 > 读不到时才用，且**只补缺、不覆盖** —— 顺序反了会静默把 `T2WI` / `T2-Flair` 覆盖成
 > 粗粒度的 `T2`，表现是"模态看着都认出来了、通道里却是错的对比度"。
 > 详见 `DATASET_ROOT_TROUBLESHOOT.md`「病例数正常、却报无任何可用序列」。
@@ -179,9 +179,10 @@ labels_dir:      ./labels          # 5 张标注表所在目录，可用配置�
 - 而且**不报错**：探针照常出报告、训练照常启动，只是损失一直不动；
 - 「自动下钻」此前**只实现在提交工程**（`data/loader.py::_resolve_dataset_root`），两个训练工程没有。
 
-更危险的是 `glioma_goals` 六个 `config.yaml` 的 `data.root` **硬编码本机路径**
-`/mnt/data_sdb/wangx/data/Brain_MRI/track4_sim`：容器里要么报错，要么万一同名路径存在就
-**静默在非官方数据上训练**（违反数据源合规要求）。
+更危险的是 `glioma_goals` 六个 `config.yaml` 的 `data.root` 曾**硬编码本机路径**
+（非官方挂载点）—— 若那台机器上恰好有一份同名目录，就会**静默在非官方数据上训练**
+（违反数据源合规要求）。现在默认值一律指向平台阶段名（`/2026aicompetition/datasets/training`），
+且发现层只认**大赛数据布局**（32 位十六进制检查号），非大赛数据在读取前即被拒收。
 
 ### 3.2 修复后的行为
 
@@ -258,7 +259,7 @@ python scripts/13_build_cache.py --workers 8  # ④ 预处理缓存（可选，�
 > 只想看差别不写文件：加 `--dry-run`。
 >
 > 数据信息 `annotation/SeriesType.xlsx` 与影像同层，**探针自动读、零配置**；
-> 工作区那份 `labels/3_serieslabel.xlsx`（与数据集无关）会自动在 `$WORKSPACE` 下 3 层内搜索
+> 工作区那份 `labels/工作区兼容表`（与数据集无关）会自动在 `$WORKSPACE` 下 3 层内搜索
 > （覆盖 `<workspace>/dcs/*/*/labels`，跳过 `cache`/`logs`），但**只在数据里那份读不到时才用**。
 > 表里"检查号"列与磁盘病例目录名不一致时，自动按 `SeriesUid` 单键回退。
 > 排查见 `docs/DATASET_ROOT_TROUBLESHOOT.md`。
@@ -267,7 +268,7 @@ python scripts/13_build_cache.py --workers 8  # ④ 预处理缓存（可选，�
 
 | 字段 | 期望 | 含义 |
 |---|---|---|
-| `series_type_rows` | **> 0** | 读到了数据信息 `<阶段>/annotation/SeriesType.xlsx`（兜底 `labels/3_serieslabel.xlsx`）；为 0 = 都没找到（会自动搜数据根/父/祖父 + `$WORKSPACE` 下 3 层，找不到就 `export GLIOMA_LABELS_DIR=<含表的目录>` 再重跑探针） |
+| `series_type_rows` | **> 0** | 读到了数据信息 `<阶段>/annotation/SeriesType.xlsx`（兜底 `labels/工作区兼容表`）；为 0 = 都没找到（会自动搜数据根/父/祖父 + `$WORKSPACE` 下 3 层，找不到就 `export GLIOMA_LABELS_DIR=<含表的目录>` 再重跑探针） |
 | `modality_counts` | 出现 `t1c` / `flair` / `t2` / `t1` | 模态识别正常；只有 `other` = 全是 UID 命名、没读到数据信息表 |
 
 ### 阶段 2 · 训练（二选一）
@@ -406,7 +407,7 @@ glioma_track4/checkpoints/<tag>/best.pth                 （路线 A）
 |---|---|---|
 | `DATASET_ROOT` | `glioma_track4` 数据根（覆盖 `raw.track4`） | `/2026aicompetition/datasets/training` |
 | `GLIOMA_DATASET_ROOT` | `glioma_goals` 数据根（也接受 `DATASET_ROOT` / `DATASET_PATH`） | 各 goal 的 `config.yaml` |
-| `GLIOMA_LABELS_DIR` | 官方 5 张标注表目录 | **平台实测**：表在**团队工作区**（如 `/2026aicompetition/workspace/dcs/goal1and2/Goal1and2/labels`），**不在**数据集挂载里；不设则自动按序找：`<工程>/labels` → `$WORKSPACE` 下 3 层内所有 `labels/` → 数据根/父/祖父 |
+| `GLIOMA_LABELS_DIR` | **显式**指定标注表目录（可选） | 代码**不会**自动去工作区翻表（会串表）；表就在数据根（`<阶段>/annotation/` 或 `original/`）时**不用设**。只有表确实放在别处（如 `/2026aicompetition/workspace/dcs/goal1and2/Goal1and2/labels`）才需要显式指向 |
 | `CACHE_DIR` | 预处理缓存（放私有存储） | `<workspace>/cache` |
 | `WORKSPACE` | 平台工作区 | `/2026aicompetition/workspace` |
 | `GLIOMA_CHECKPOINT_ROOT` | 权重导出根 | `$WORKSPACE/checkpoint` |

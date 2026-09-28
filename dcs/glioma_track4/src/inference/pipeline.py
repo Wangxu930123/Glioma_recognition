@@ -71,7 +71,7 @@ def load_ensemble(ckpt_paths: list[str], device: str = "cuda") -> dict:
 # --------------------------------------------------------------------------- #
 def postprocess(core: np.ndarray, peri: np.ndarray, min_vox: int, spacing=(1.0, 1.0, 1.0),
                 keep_n: int = 3, bridge_mm: float = 10.0):
-    """连通域后处理（BraTS 类任务的稳定涨点手段）。
+    """连通域后处理（这类脑肿瘤分割任务的稳定涨点手段）。
 
     1. 按体积过滤碎片（< ``min_vox`` 体素）；
     2. core 保留最大的若干连通域（``keep_n``，默认 3）——**不能只留最大**，

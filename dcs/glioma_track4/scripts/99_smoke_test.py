@@ -64,11 +64,21 @@ def _syn_case(cdir: str, shape=(32, 32, 24), spacing=(1.0, 1.0, 2.0), seed=0,
 
 def make_synthetic(root: str, n: int = 6) -> dict:
     import csv
+    import hashlib
+
+    def _acc(tag: str) -> str:
+        """派生**大赛形态**检查号（32 位十六进制）。
+
+        检查号必须长这样：平台的病例目录名就是检查号，``scan_real``/``probe``
+        只认 32 位十六进制（见 ``src/data/labels.py::is_official_accession``），
+        ``GLIOMA_000`` 这类名字在发现层就被挡掉、整批一例都扫不到。
+        """
+        return hashlib.md5(tag.encode("utf-8")).hexdigest()
 
     os.makedirs(root, exist_ok=True)
     accs = []
     for i in range(n):
-        acc = f"GLIOMA_{i:03d}"
+        acc = _acc(f"glioma{i}")
         accs.append(acc)
         _syn_case(os.path.join(root, acc), seed=i, with_masks=True)
 
@@ -87,8 +97,9 @@ def make_synthetic(root: str, n: int = 6) -> dict:
                         "有", "花环状", "有", "无", "无", "无", "无/不清", "有/清", "3高", "3高"])
 
     # 目标一/二：特殊影像（正样本内含影像，可被探针合并）
-    for cls, ids in (("fake", ["FAKE_001", "FAKE_002"]),
-                     ("Composition", ["COMP_001", "COMP_002"])):
+    # 用例 ID 同样是**检查号**，必须 32 位十六进制（否则在发现层被挡掉）。
+    for cls, ids in (("fake", [_acc("fake0"), _acc("fake1")]),
+                     ("Composition", [_acc("comp0"), _acc("comp1")])):
         for k, ident in enumerate(ids):
             _syn_case(os.path.join(root, "annotation", cls, ident), seed=100 + k,
                       with_masks=False, fake=(cls == "fake"))

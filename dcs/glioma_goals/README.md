@@ -106,7 +106,7 @@ python evaluate.py --ckpt runs/<goal>/checkpoints/best.pth
   `AccessionNumber / SeriesUid / SeriesType`，取值 5 类：`T1`、`T1CE（增强）`、
   `T2-Flair`、`T2WI`、`其他`；`其他` 是**权威排除**，不交给模型猜）。查表先按
   `(检查号, 序列号)`，对不上再按 `SeriesUid` 单键回退，最后退同名 `.json` sidecar / 目录名。
-  工作区那份 `labels/3_serieslabel.xlsx` **已不再被读**（取值粗，会把 `T2WI`/`T2-Flair`
+  工作区那份 `labels/工作区兼容表` **已不再被读**（取值粗，会把 `T2WI`/`T2-Flair`
   压成 `T2` 且不报错）；缺表就是缺表，会响亮地报出来。
 - 缺模态**零占位**（不会崩，但会记为 warning）；
 - **掩码角色由"文件名 + 所在序列的模态"共同判定**：

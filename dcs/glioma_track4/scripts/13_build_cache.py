@@ -64,8 +64,7 @@ def _worker(arg):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default=os.environ.get("DATASET_ROOT") or
-                    "/mnt/data_sdb/wangx/data/Brain_MRI/track4_sim")
+    ap.add_argument("--root", default=os.environ.get("DATASET_ROOT"))
     ap.add_argument("--cache", default=os.environ.get("CACHE_DIR") or "data/preprocess_cache")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--force", action="store_true")

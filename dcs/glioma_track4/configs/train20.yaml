@@ -1,13 +1,29 @@
-# 全量训练配置 · 20 epoch（赛道4）
+# 20 epoch 训练配置（赛道4）★ 当前采用的方案
 # ----------------------------------------------------------------------------
 # 与 configs/train.yaml 完全一致，**只把 epochs 从 100 改成 20**。
-# 用法（全量模式：train = 清单全部病例，val = 官方验证集）：
+#
+# 当前方案：**训练集按 8:2 固定折内划分**，训 20 个 epoch。
+#   为什么不用"全量训练"（`--fold full`）：官方验证集实测 777 例、**带掩膜的 0 例**，
+#   而 `--fold full` 必须用验证集掩膜算 Dice 来选 best，会当场报错。
+#   折内划分的 val 来自**训练集**（有掩膜、也有字段金标准），所以分割与字段指标都算得了。
+#
+# 用法：
 #
 #   export DATASET_ROOT=/2026aicompetition/datasets/training/annotation
-#   export VAL_ROOT=/2026aicompetition/datasets/verification
-#   bash scripts/01_probe.sh --val            # 先产出 data/manifest_val.json
-#   CONFIG=train20 bash scripts/03_train.sh full
-#   → checkpoints/g4_full/best.pth
+#   bash scripts/01_probe.sh                 # → data/manifest.json
+#   bash scripts/02_build_dataset.sh         # → data/folds.json（**固定划分**，只建一次）
+#   CONFIG=train20 bash scripts/03_train.sh 0
+#   → checkpoints/g4_fold0/best.pth          （train 80% / val 20%）
+#   → 收尾：FOLDS="0" bash scripts/16_finalize.sh
+#
+# 8:2 是怎么来的：
+#   · 切分由 `folds: 5` 决定 —— 每折的 val ≈ 全集 1/5 = 20%，train = 其余 80%；
+#   · `val_ratio: 0.2` 在当前 `build_folds` 实现里**不参与切分**，保留它只是与该口径
+#     保持一致（改动它不会让划分变成别的比例）；
+#   · 划分结果**落盘在 `data/folds.json`**，之后每次启动都复用它 →
+#     同一次实验、重启/续训后 val 都是**同一批病例**（这就是"固定划分"）。
+#   ⚠️ 不要手工覆盖 `data/folds.json`：换了划分，已训练的权重就与它的训练集不再对应
+#      （旧折 train 与新折 val 会大范围重叠 → 评估泄漏）。
 #
 # 说明：
 #   · 训练侧 epoch 数在**本文件**；03_train.sh 只透传 --config，没有 --epochs 参数。

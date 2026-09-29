@@ -40,11 +40,28 @@ def guess_modality(text: str | None) -> str | None:
     return None
 
 
+#: 内部模态键（``_key_of`` 的合法返回值）
+_INTERNAL_KEYS = frozenset({"t1c", "flair", "dwi", "adc", "swi", "t2", "t1"})
+
+
 def _key_of(series: Series) -> str | None:
-    """优先用显式标记的模态，其次从描述/UID 推断。"""
+    """优先用显式标记的模态，其次从描述/UID 推断。
+
+    ⚠️ 显式模态值**必须先归一化**：``metadata['modality']`` 可能是官方表的**原值**
+    （如 ``T1CE(增强)`` / ``T2WI`` / ``T2-Flair``）。旧实现直接 ``str(explicit).lower()``
+    当键用 → 得到 ``t1ce(增强)``，永远匹配不上内部键 ``t1c``；更糟的是它属于**最高优先级**，
+    会把"从描述推断"和后面两条模态兜底**全部短路掉** ——
+    实测症状就是：日志里官方表读得到几千条，兜底却一条都改不动、`select()` 恒为空。
+    这里先判"是不是内部键"，不是就走关键词归一。
+    """
     explicit = (series.metadata or {}).get("modality")
     if explicit:
-        return str(explicit).lower()
+        low = str(explicit).strip().lower()
+        if low in _INTERNAL_KEYS:
+            return low
+        guessed = guess_modality(low)
+        if guessed:
+            return guessed
     return guess_modality(series.modality) or guess_modality(series.series_uid)
 
 
@@ -81,7 +98,15 @@ def select(study: Study, wanted: Iterable[str]) -> dict[str, Series]:
         return out
     from data.modality_fallback import recover_study
 
-    return _select_picked(recover_study(study), wanted)
+    out = _select_picked(recover_study(study), wanted)
+    if out:
+        return out
+    # 第三条腿：**表也匹配不上时**用体素统计判模态重挑。
+    # 这是唯一不依赖"表里的键与磁盘一致"的兜底 —— 序列描述认不出、序列表对不上时仍能救回通道。
+    # 缺了它，Goal5 的输入通道会全零、掩膜退化写入参考序列 → 该例分割必然 0 分。
+    from data.voxel_modality import recover_study as recover_by_voxels
+
+    return _select_picked(recover_by_voxels(study), wanted)
 
 
 def select_first(study: Study, wanted: Iterable[str]) -> Series | None:

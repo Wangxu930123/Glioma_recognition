@@ -76,10 +76,28 @@ class Goal5Task(StudyTask[Goal5Result]):
         core_bin, flair_bin = clean_pair(core_p, flair_p, _T())
 
         # ---- 逆变换：恢复到各自源序列空间（shape/affine 必须与源图一致）----
-        core_mask, core_uid = self._restore(study, prepared, core_bin, CORE_SOURCE_MODALITIES,
-                                            context.warnings)
-        flair_mask, flair_uid = self._restore(study, prepared, flair_bin, FLAIR_SOURCE_MODALITIES,
-                                              context.warnings)
+        core_mask, core_uid, core_fb = self._restore(
+            study, prepared, core_bin, CORE_SOURCE_MODALITIES, context.warnings)
+        flair_mask, flair_uid, flair_fb = self._restore(
+            study, prepared, flair_bin, FLAIR_SOURCE_MODALITIES, context.warnings)
+
+        # Writer 的契约（output/writer.py）：**core 与 flair 落同一条序列时，两份掩膜必须完全相同**
+        # （URI 是 `<uid>/<uid>.nii.gz`，同一路径装不下两份不同的掩膜）。
+        # 正常路径不会撞——`guess_modality` 一个序列只映射一个模态，t1c/flair 必是不同 Series；
+        # 只有"走了兜底"时两路才会同时退化到同一个参考序列。此时保留**可信的那一路**作为唯一掩膜，
+        # 两路共用（既满足契约，又不丢正确信息；若两路都兜底则取并集，符合 core ⊆ peri 语义）。
+        if core_uid == flair_uid and not np.array_equal(core_mask, flair_mask):
+            if core_fb and not flair_fb:
+                keep = flair_mask
+            elif flair_fb and not core_fb:
+                keep = core_mask
+            else:
+                keep = np.maximum(core_mask, flair_mask)
+            context.warnings.append(
+                f"goal5: core/flair 退化到同一序列 {core_uid} 且掩膜不同 → "
+                f"两路统一为同一份掩膜（避免违反输出契约）"
+            )
+            core_mask = flair_mask = keep
 
         context.diagnostics["goal5"] = {
             "missing_channels": list(prepared.missing),
@@ -112,11 +130,12 @@ class Goal5Task(StudyTask[Goal5Result]):
 
     def _restore(self, study, prepared: PreparedVolume, mask: np.ndarray,
                  modalities: tuple[str, ...], warnings: list | None = None
-                 ) -> tuple[np.ndarray, str]:
+                 ) -> tuple[np.ndarray, str, bool]:
         """把公共网格掩膜恢复到指定模态的源序列空间。
 
-        找不到目标模态时**退化为参考序列**（保证仍能写出、shape/affine 自洽），
-        并把所用序列 UID 一并返回，供 Writer 决定输出目录。
+        返回 ``(掩膜, 目标序列 UID, 是否走了兜底)``。
+
+        找不到目标模态时**退化为参考序列**（保证仍能写出、shape/affine 自洽）。
 
         ⚠️ 这里**绝不能返回空字符串**（旧实现的 bug）：空 UID 会让
         `OutputWriter._write_masks` 里的 `study.series_by_uid("")` 抛
@@ -129,7 +148,7 @@ class Goal5Task(StudyTask[Goal5Result]):
         if fell_back:
             src = self._reference_series(study, prepared)
         if src is None:                                   # 极端：study 一条序列都没有（构造时已拦）
-            return mask.astype(np.uint8), ""
+            return mask.astype(np.uint8), "", True
         if fell_back and warnings is not None:
             warnings.append(
                 f"goal5: 挑不出 {'/'.join(modalities)} 模态 → 掩膜退化写入参考序列 "
@@ -140,7 +159,7 @@ class Goal5Task(StudyTask[Goal5Result]):
             mask, prepared.affine, np.asarray(src.affine, dtype=np.float64),
             tuple(int(x) for x in src.image.shape),
         )
-        return restored.astype(np.uint8), infer_uid_from_path(src)
+        return restored.astype(np.uint8), infer_uid_from_path(src), fell_back
 
 
 def build_task(settings: Settings | None = None, **kwargs: Any) -> Goal5Task:

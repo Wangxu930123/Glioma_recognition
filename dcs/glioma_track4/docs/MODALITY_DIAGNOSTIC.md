@@ -26,7 +26,7 @@
 
 | 日志/报错 | 卡在哪 | 看哪个诊断 |
 |---|---|---|
-| `[selector][模态回退] 挑不出序列，序列表在 .../SeriesType.xlsx 但按 (检查号,序列号) / UID 都匹配不到` | ② 匹配不上 | **§1** |
+| `[selector][模态回退] 挑不出序列，序列表在 .../SeriesType.xlsx 但按 (检查号,序列号) / UID 都匹配不到` | ② 匹配上了**表**，但 UID 键对不上 | **§1c**（表已找到 → 跳到 §1c） |
 | `[selector][模态回退] study '...' 原描述认不出模态，已按官方表重贴：{...: 其他, ...}` | ② 匹配上了，但表值是 `其他` | **§1 + §2** |
 | `ValueError: study ... 没有任何可用影像` | 三条腿全失败 | **§1 + §2** |
 | `KeyError: unknown series UID` | 掩膜绑定了不存在的序列 | 已修（见 MIGRATE 文档 §8） |
@@ -108,8 +108,199 @@ PY
 | `读到的条数` 是几千，取值分布里大量 `T1CE/T2/FLAIR`，`其他` 只占少数 | ✅ 表正常，`其他` 是真的（少数序列） | 那些例靠体素兜底 → 跑 **§2** |
 | **取值分布几乎全是 `其他`** | 表把绝大多数序列标成 `其他` | 跑 **§2** 确认体素兜底可用；若一致率低，得看官方表口径 |
 | 取值分布是**一堆不像模态的值**（UID、数字、空、`SeriesUid` 字面量） | ❌ **读错列了** | 把本段输出贴出来，需要修 `_read_rows` 的列识别 |
-| `命中 UID = 0%` | 文件名不是 `SeriesUid` | 表对不上不奇怪；体素兜底是唯一出路 → **§2** |
+| **`前20例共 0 个序列`（分母为 0）** | ❌ **假信号**：文件不在 `<检查号>/*.nii.gz` 的**一层**结构里 | **不要据此下结论**，跑 **§1b** 看真实布局 |
+| `命中 UID = 0%` 但分母 > 0 | 文件名确实不是 `SeriesUid` | 对比 §1b 打印的 `repr(key)` 与真实文件名 → 改成正确的匹配形式 |
 | `读到的条数 = 0` | 表没读到或表结构不认 | 检查 §表头原文；或 `export GLIOMA_LABELS_DIR=<表所在目录>` |
+| 取值分布里 `其他` 只占几个百分点 | ✅ **表是健康的**，`其他` 是真的（少数异常序列） | 那些例靠体素兜底 → 跑 **§2** |
+| 取值分布里出现**两种序列号格式**（纯 `2.25.x` 与 `md5*…*2.25.x*` 混用） | ⚠️ 匹配规则必须同时兼容这两种 | 见 §1b 的 `repr(key)` 输出 |
+
+---
+
+## 1b. 诊断①续 · 目录真实布局（约 10 秒，**纯观测**）
+
+> 只在 §1 出现**分母为 0**（`共 0 个序列`）时跑。它不判断对错，只把事实摊开：
+> 文件后缀分布、检查号内第 1 层子目录名、完整树、以及表 key 的 `repr` 原文。
+
+```bash
+cd /2026aicompetition/workspace/dcs/Glioma_recognition-main
+python3 - <<'PY'
+from pathlib import Path
+from collections import Counter
+from data.modality_fallback import _read_rows, _table_in
+
+ROOT = Path('/2026aicompetition/datasets/verification')
+SUB = ROOT / 'original' if (ROOT / 'original').is_dir() else ROOT
+print("ROOT =", ROOT, "| 存在:", ROOT.is_dir())
+print("SUB  =", SUB, "| 存在:", SUB.is_dir())
+accs = sorted(p for p in SUB.iterdir() if p.is_dir())
+print("检查号目录数:", len(accs), "| 样例:", [a.name for a in accs[:2]])
+
+ext, depth1 = Counter(), Counter()
+for a in accs[:20]:
+    for p in a.rglob('*'):
+        if p.is_file():
+            ext[''.join(p.suffixes[-2:]) or '<无后缀>'] += 1
+        elif len(p.relative_to(a).parts) == 1:
+            depth1[p.name] += 1
+
+print("\n--- 文件后缀 top15（下钻全部层级，20 个检查号）---")
+if not ext:
+    print("  !! 一个文件都没有 → 数据没挂在这个路径，或全在更深层")
+for k, v in ext.most_common(15):
+    print(f"  {k:<24} {v}")
+
+print("\n--- 检查号目录内的第 1 层子目录名（top10）---")
+for k, v in depth1.most_common(10):
+    print(f"  {k[:88]:<90} {v}")
+
+print("\n--- 完整树（前 2 个检查号，最多 30 项）---")
+for a in accs[:2]:
+    print(f"\n[{a.name}]")
+    for n, p in enumerate(sorted(a.rglob('*'))):
+        rel = p.relative_to(a)
+        if len(rel.parts) > 3:
+            continue
+        tag = "DIR" if p.is_dir() else f"{p.stat().st_size:>11,}B"
+        print(f"  {tag}  {rel}")
+        if n >= 30:
+            print("  …")
+            break
+
+table = _table_in(SUB)
+rows = _read_rows(table)
+print("\n--- 表的 key 原样（repr，看清分隔符与格式）---")
+for k in list(rows)[:6]:
+    print("  ", repr(k), "->", repr(rows[k]))
+PY
+```
+
+**怎么读**
+
+| 看到 | 含义 |
+|---|---|
+| 后缀是 `.nii.gz`，但都在 `<检查号>/<子目录>/` 里 | 代码的文件发现路径少下钻了一层 → 修发现逻辑 |
+| 后缀是 `.nii` / `.npz` / `.dcm` / 无后缀 | 后缀假设错了 |
+| 后缀分布是**空的** | 数据没挂在 `SUB`；把 §1b 第 2~3 行（`ROOT`/`SUB`）贴出来 |
+| `repr(key)` = `('检查号', '2.25.x')` | 匹配规则按**纯 UID** 比 |
+| `repr(key)` = `('检查号', 'md5*md5*2.25.x*')` | 匹配规则必须按**复合串**比，且要兼容另一种格式 |
+
+---
+
+## 1c. 诊断①终 · UID 键到底为什么匹配不到（约 15 秒）
+
+> 只在「日志说**序列表找到了**、但按 `(检查号,序列号)` / UID 都匹配不到」时跑。
+>
+> **前置事实（已核对代码）**：三层布局 `<检查号>/<序列号>/<序列号>.nii.gz` 是被支持的 ——
+> `data/loader.py:123-151` 会把 `parts>2` 的按父目录分组、**单文件直接选中**；
+> `data/loader.py:492-495` 取 `series_uid = path.parent.name`。
+> 所以文件发现与 `series_uid` 取值都没问题，**只剩"拿 UID 去表里查"这一环**。
+>
+> **关键**：全部用 `repr()` 打印 —— 这样即使复制粘贴把字符拼坏，也能看出哪一段被重复了。
+
+```bash
+cd /2026aicompetition/workspace/dcs/Glioma_recognition-main
+python3 - <<'PY' 2>&1 | tee /tmp/modality_probe.txt
+import re
+from pathlib import Path
+
+from data.loader import DatasetLoader, _nifti_stem
+from data.modality_fallback import _read_rows, _table_in, _uid_candidates, _norm
+from data.series_selector import guess_modality
+
+ROOT = Path('/2026aicompetition/datasets/verification')
+if (ROOT / 'original').is_dir():
+    ROOT = ROOT / 'original'
+print("ROOT =", ROOT, "| 存在:", ROOT.is_dir())
+print("ROOT 子目录:", sorted(p.name for p in ROOT.iterdir() if p.is_dir())[:6])
+
+studies = []
+try:
+    for st in DatasetLoader().iter_studies(ROOT):
+        studies.append(st)
+        if len(studies) >= 2:
+            break
+except Exception as exc:
+    print("!! iter_studies 失败:", type(exc).__name__, exc)
+print("取到检查号:", [s.accession_number for s in studies])
+if not studies:
+    raise SystemExit("没有检查号 → 先看上面 ROOT 对不对")
+
+print("\n" + "=" * 78)
+print("①  磁盘侧：loader 实际给出的 series_uid / 候选 / sidecar")
+print("=" * 78)
+for st in studies:
+    print(f"\n[{st.accession_number!r}]  序列数={len(st.series)}")
+    for s in st.series[:8]:
+        print(f"  uid            = {s.series_uid!r}")
+        print(f"  modality(描述) = {s.modality!r}   guess={guess_modality(s.modality)!r}")
+        print(f"  sidecar UID    = {s.metadata.get('SeriesInstanceUID')!r}")
+        print(f"  parent.name    = {s.source_path.parent.name!r}")
+        print(f"  stem           = {_nifti_stem(s.source_path)!r}")
+        print(f"  candidates     = {list(_uid_candidates(s))}")
+        print(f"  source         = {s.source_path}")
+
+print("\n" + "=" * 78)
+print("②  表的键（原样 repr）")
+print("=" * 78)
+table = _table_in(ROOT)
+print("table =", table)
+if table is None:
+    print("!! 表没定位到 → 兜底模块拿不到任何数据")
+else:
+    rows = _read_rows(table)
+    index = {}
+    for (_a, u), v in rows.items():
+        index.setdefault(u, v)
+    print("条数 =", len(rows), "| UID 单键索引 =", len(index))
+    st = studies[0]
+    acc = _norm(st.accession_number)
+    same = {k: v for k, v in rows.items() if k[0] == acc}
+    print(f"\n表里属于 [{st.accession_number!r}] 的行：{len(same)} 条")
+    for (a, u), v in list(same.items())[:10]:
+        print(f"  key_acc = {a!r}")
+        print(f"  key_uid = {u!r}   ->  {v!r}")
+
+    print("\n" + "=" * 78)
+    print("③  逐候选命中判定 + 最相近的表 uid（差异点就在这里）")
+    print("=" * 78)
+    pool = [u for (_a, u) in same] or list(index)
+    for s in st.series[:8]:
+        print(f"\n uid = {s.series_uid!r}")
+        for c in _uid_candidates(s):
+            n = _norm(c)
+            print(f"   候选 {n!r}")
+            print(f"     精确键 (acc, 候选) 命中 = {(acc, n) in rows}")
+            print(f"     UID 单键           命中 = {n in index}   -> {index.get(n)!r}")
+            if n not in index:
+                import difflib
+                for near in difflib.get_close_matches(n, pool, n=1, cutoff=0.3):
+                    print(f"     最相近表 uid = {near!r}")
+                    print(f"       磁盘片段 = {[p for p in re.split(r'[^0-9A-Za-z]+', n) if p]}")
+                    print(f"       表片段   = {[p for p in re.split(r'[^0-9A-Za-z]+', near) if p]}")
+PY
+```
+
+**判读（③ 的「磁盘片段 / 表片段」对照）**
+
+| 看到 | 结论 | 修法 |
+|---|---|---|
+| 表片段**多一段**（如同一 hash 出现两次） | 表 uid 是 `<hash>*<hash>*<UID>*` 复合串 | 加"片段集合匹配"（见下） |
+| 磁盘/表**只有尾随 `*` 不同** | 前后缀未归一 | `_norm` 里剥掉首尾非字母数字字符 |
+| 片段里**都有同一个 `2.25.x`** | 纯 DICOM UID 是共同锚点 | 按 `2.25.x` 段匹配 |
+| `UID 单键索引 << 条数` | 有跨检查号重名的 UID | 精确键优先，别只靠单键 |
+| `table = None` | 表没定位到 | 给 `data/loader._series_type_table_path` 补 `GLIOMA_LABELS_DIR` |
+
+**预判的补丁（待 ③ 确认后再落）** —— 给 `modality_fallback._match` 加第三级「片段集合」匹配：
+
+```python
+def _uid_segments(value: str) -> frozenset[str]:
+    """UID 按非字母数字切段；含 '.' 的 DICOM UID 段优先，用于复合串容错匹配。"""
+    parts = [p for p in re.split(r"[^0-9A-Za-z.]+", _norm(value)) if p]
+    return frozenset(p for p in parts if "." in p) or frozenset(parts)
+```
+
+> ⚠️ 这一级**必须放在最后**（精确键 → UID 单键 → 片段集合），否则会引入误命中：
+> 片段匹配比精确匹配宽，只有前两级全落空才用它兜底。
 
 ---
 
@@ -251,6 +442,7 @@ PY
 | **几乎全是 `其他`** | <80% | 通道空 | ❌ 上游未解决 | 先重训；仍不行则把 ① 的表头原文贴出来查列识别 |
 | 取值**不像模态** | — | — | ❌ **读错列** | 修 `_read_rows` 的列识别（贴 ① 输出） |
 | `读到的条数 = 0` | — | — | ❌ 表没读到 | `export GLIOMA_LABELS_DIR=<表所在目录>` 后重试 |
+| **`前20例共 0 个序列`（分母 = 0）** | — | — | ❓ **假信号**，暂不可判定 | 跑 **§1b**，按真实布局定位文件发现逻辑 |
 
 ---
 
@@ -279,7 +471,13 @@ echo "已写入 /tmp/modality_dump.txt"
 
 ## 6. 一句话
 
-**先跑 §1**（10 秒）——它会直接区分「表值是 `其他`」和「读错列」这两种完全不同的成因；
-**再跑 §2**（40 秒）——它决定体素兜底能不能信（≥80% 可用）；
-最后跑完推理看 **§3**，用 `missing_channels` 与掩膜的 `体素和` 判断是否真的救回来了。
+**先跑 §1**（10 秒）——它会直接区分「表值是 `其他`」和「读错列」这两种完全不同的成因；<br>
+若 §1 打印 **`共 0 个序列`**（分母为 0）→ 那是**假信号**，接着跑 **§1b** 看真实目录布局；<br>
+若日志说**表已找到、但 UID 匹配不到**（本仓真实布局 `<检查号>/<序列号>/<序列号>.nii.gz` 已确认支持）
+→ 直接跑 **§1c**，它的「磁盘片段 / 表片段」对照会指出分隔符或前后缀差异；<br>
+**再跑 §2**（40 秒）——它决定体素兜底能不能信（≥80% 可用）；<br>
+最后跑完推理看 **§3**，用 `missing_channels` 与掩膜的 `体素和` 判断是否真的救回来了。<br>
 三份结论按 **§4** 的表组合，就知道下一步该改什么。
+
+> **别把「0%」当结论。** `0/0` 表示"我没找到文件"，不表示"匹配不上"——
+> 这两种成因的修法完全不同（前者改文件发现路径，后者改 UID 匹配规则）。

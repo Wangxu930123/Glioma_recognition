@@ -436,6 +436,109 @@ PY
 
 ---
 
+## 1f. 诊断①尾 · 「挑不出序列」到底卡在哪一阶段（约 10 秒）
+
+### 先分清 4 种来源 —— **只有 3 种是真失败，1 种是预期行为**
+
+| 日志原文 | 出处 | 性质 |
+|---|---|---|
+| `[selector][模态回退] 挑不出序列，且未找到数据集自带的 SeriesType.xlsx…` | `modality_fallback` 的 `warned_missing` | ❌ **真失败**：表没定位到 |
+| `[selector][模态回退] 挑不出序列，序列表在 X 但按 (检查号,序列号) / UID 都匹配不到` | `modality_fallback` 的 `warned_unmatched` | ❌ **真失败**：UID 对不上 |
+| `goal5: 挑不出 t1c/t1 模态 → 掩膜退化写入参考序列 …（答案仍合规但该例分割可能不准）` | `goal5_segmentation/task.py:152-156` | ⚠️ **预期行为**：缺 T1 增强的检查（约 47%）**必然**出现这一行 |
+| `ValueError: study … 没有任何可用影像（共 N 条…）` | `goal5_segmentation/preprocess.py:90` | ❌ **真失败**：一条影像都没读进来 |
+
+> **判据**：前两条说「**序列**」，第三条说「**模态**」（t1c/t1 这种）。
+> 看到第三条不要慌 —— 那是数据缺模态 + 退化写掩膜正常工作的证据，不是 bug。
+
+### 分阶段定位脚本
+
+`select()` 有**四条腿**依次兜底，`_select_picked` 返回空就是该阶段失败。
+这段把每一阶段的输出都打出来，**第一个空的阶段就是失败点**：
+
+```bash
+cd /2026aicompetition/workspace/dcs/GliomaRecognition/dcs/Glioma_recognition-main
+python3 - <<'PY' 2>&1 | tee /tmp/series_pick_trace.txt
+from pathlib import Path
+
+from data.loader import DatasetLoader
+from data.modality_fallback import (
+    _table_maps, _uid_candidates, _norm, find_label_table, recover_study)
+from data.series_selector import _key_of, _select_picked, select
+from data.voxel_modality import recover_study as recover_by_voxels
+from tasks.goal5_segmentation.preprocess import CHANNEL_ORDER
+
+ROOT = Path('/2026aicompetition/datasets/verification')
+if (ROOT / 'original').is_dir():
+    ROOT = ROOT / 'original'
+print("ROOT =", ROOT, "| CHANNEL_ORDER =", CHANNEL_ORDER)
+
+studies = []
+for i, st in enumerate(DatasetLoader().iter_studies(ROOT)):
+    studies.append(st)                      # 只取前 3 例，内存可控
+    if i >= 2:
+        break
+
+table = find_label_table([s.source_path for st in studies for s in st.series])
+rows, index = _table_maps(table)
+print("表定位 =", table)
+print(f"表条目 = {len(rows)} | UID 单键索引 = {len(index)}")
+
+for st in studies:
+    print("\n" + "=" * 76)
+    print(f"[{st.accession_number}]  序列数={len(st.series)}")
+    for s in st.series:
+        print(f"  desc = {s.modality!r}")
+        print(f"    _key_of  -> {_key_of(s)!r}")
+        print(f"    sidecar  -> {(s.metadata or {}).get('SeriesInstanceUID')!r}")
+        print(f"    候选     -> {list(_uid_candidates(s))}")
+
+    print("--- 分阶段 select：第一个空的就是失败点 ---")
+    print(f"  stage0 原始描述       -> {sorted(_select_picked(st, CHANNEL_ORDER))}")
+    print(f"  stage1 官方表重贴     -> {sorted(_select_picked(recover_study(st), CHANNEL_ORDER))}")
+    print(f"  stage2 体素判别       -> {sorted(_select_picked(recover_by_voxels(st), CHANNEL_ORDER))}")
+    print(f"  stage3 连「其他」也猜 -> "
+          f"{sorted(_select_picked(recover_by_voxels(st, allow_excluded=True), CHANNEL_ORDER))}")
+    print(f"  select() 最终         -> {sorted(select(st, CHANNEL_ORDER))}")
+
+    acc = _norm(st.accession_number)
+    same = {k: v for k, v in rows.items() if k[0] == acc}
+    print(f"--- 表里属于该检查号的行：{len(same)} 条 ---")
+    for (a, u), v in list(same.items())[:8]:
+        print(f"  表 uid len={len(u):>3} -> {v!r}")
+
+    if st.series:
+        print("--- 逐候选命中判定（用长度，绕开 Markdown 吃掉 * 的问题）---")
+        for s in st.series[:3]:
+            for c in _uid_candidates(s):
+                n = _norm(c)
+                print(f"  候选 len={len(n):>3}  精确键={(acc, n) in rows}  单键={n in index}")
+PY
+```
+
+**判读**
+
+| 现象 | 成因 | 动作 |
+|---|---|---|
+| `表定位 = None` | 表没找到 | 设 `GLIOMA_SERIES_TYPE_XLSX=<表路径>` 或 `GLIOMA_LABELS_DIR=<表所在目录>` |
+| `表条目 = 0` | 表读不出来 | 跑 §1 看表路径与表头原文 |
+| 所有 `候选 ... 精确键=False 单键=False` | 表与磁盘的 UID 口径不一致 | 贴输出（含 `len`）→ 需要第三级「片段匹配」 |
+| **stage0 空、stage1 非空** | 原描述认不出，靠官方表救回 | ✅ 正常（正是兜底在工作） |
+| **stage1 也空** | 表匹配不上 | 同上第 3 行 |
+| **stage1 有 t1c/flair，但 stage3 仍缺 t1c/t1** | 该检查**真的**没有这些模态 | ⚠️ 预期行为（约 47%），不是 bug |
+| 全阶段都空 | 序列被标 `其他` 或只有 DWI/ADC/SWI | 看 `goal5: 缺通道 [...]` 告警；属数据特性 |
+
+### 已知风险（**已修**）：UID 候选集塌缩
+
+`data.loader` 按官方契约把 `Series.series_uid` 定为**磁盘目录名**之后，
+`_uid_candidates` 里 `series_uid` / `parent.name` / `stem` **三者变成同一个值** ——
+去重后只剩 1 个候选，**sidecar 的 `SeriesInstanceUID` 再也进不了候选集**。
+
+而官方表的 `SeriesUid` 列写的是哪一边，数据方**并没有承诺**（实测带装饰的 `*2.25.…*`
+与纯 `2.25.…` 两种形态都存在）。所以已在 `_uid_candidates` 里**把 sidecar 值加回候选**
+（只排序、不裁剪）—— 否则本来能匹配上的检查会直接变成「挑不出序列」。
+
+---
+
 ## 2. 诊断② · 体素判别与官方表的一致率（约 40 秒，最多 40 例）
 
 **回答**：第三条腿能不能用？`其他` 到底该不该猜？

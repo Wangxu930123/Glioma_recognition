@@ -243,14 +243,28 @@ def describe_sources(source_paths: Iterable[Path] = ()) -> str:
 
 
 def _uid_candidates(series: Series) -> tuple[str, ...]:
-    """按可靠性降序：表/元数据里的 UID → 目录名 → 文件名主干。"""
+    """按可靠性降序：磁盘目录名（官方契约的 ``{SeriesUid}``）→ sidecar UID → 文件名主干。
+
+    ⚠️ **``sidecar`` 的 ``SeriesInstanceUID`` 必须仍然是一个候选**：
+    ``data.loader`` 现在把 ``Series.series_uid`` 定为**磁盘推导值**
+    （官方契约要求 —— 掩膜 URI 的 ``{SeriesUid}`` 要能解析回输入数据的目录名），
+    于是 ``series.series_uid`` 与 ``parent.name``、``stem`` **三者变成同一个值**，
+    去重后只剩一个候选。
+
+    但**官方表里的 ``SeriesUid`` 列写的是哪一边，数据方并没有承诺** ——
+    实测两种形态都存在（带装饰的 ``*2.25.…*`` 与纯 ``2.25.…``）。
+    少列一个候选 = 把本来能匹配上的检查直接变成「挑不出序列」，
+    所以这里只做**排序**、绝不做**裁剪**。
+    """
     name = series.source_path.name
     stem = name[:-7] if name.lower().endswith(".nii.gz") else Path(name).stem
+    sidecar = (getattr(series, "metadata", None) or {}).get("SeriesInstanceUID")
     return tuple(dict.fromkeys(
         str(value) for value in (
-            series.series_uid,
-            series.source_path.parent.name,
-            stem,
+            series.series_uid,                 # = 磁盘目录名（loader 已按契约设定）
+            series.source_path.parent.name,    # 同一值，保留以兼容 2 层/1 层布局
+            stem,                              # 同一值，保留同上
+            sidecar,                           # ← 关键：sidecar 原始 UID 仍要试
         ) if value
     ))
 
@@ -298,18 +312,53 @@ def recover_study(study: Study) -> Study:
 
     accession = study.accession_number
     changed: dict[str, str] = {}
+    pending: list[tuple[Series, tuple[str, ...]]] = []
     for series in study.series:
         if guess_modality(series.modality) is not None:
             continue                                   # 原描述已能用 → 不动
         label = _match(exact, index, accession, series)
         if label:
             changed[series.series_uid] = label
+        else:
+            pending.append((series, _uid_candidates(series)))
     if not changed:
+        # ⚠️ 必须把**两种完全不同的情况**分开报。旧版统一写成
+        # 「挑不出序列，序列表在 X 但按 (检查号,序列号) / UID 都匹配不到」，
+        # 于是「整例只有 DWI/ADC/SWI、原描述全都认得出来」这种**与表无关**的情况
+        # 也被说成"表匹配不到"，把排查方向直接带偏。
+        if not pending:
+            # 没有任何序列需要重贴：原描述都认得出来，只是都不在目标模态集合里。
+            if not _CACHE.get("warned_no_target"):
+                _CACHE["warned_no_target"] = True
+                print(
+                    f"[selector][模态回退] 挑不出序列：{len(study.series)} 条序列的"
+                    f"**原描述全都认得出来**，但都不在目标模态集合里"
+                    f"（示例 study={accession!r} "
+                    f"modality={[s.modality for s in study.series][:4]}）→ "
+                    f"属于**该检查本来就没有目标模态**，与序列表匹配无关",
+                    flush=True,
+                )
+            return study
+
         if not _CACHE.get("warned_unmatched"):
             _CACHE["warned_unmatched"] = True
-            print(f"[selector][模态回退] 挑不出序列，序列表在 {table} "
-                  f"但按 (检查号,序列号) / UID 都匹配不到（示例 study={accession!r} "
-                  f"uid={[s.series_uid for s in study.series][:3]}）", flush=True)
+            first_series, first_cands = pending[0]
+            acc_rows = sum(1 for (a, _u) in exact if a == _norm(accession))
+            # 候选**长度**单独列出：``*`` 在 Markdown 里会被吃掉，
+            # 长度才是粘贴到聊天里之后仍然可信的信息。
+            print(
+                f"[selector][模态回退] 挑不出序列，序列表在 {table} 但 "
+                f"{len(pending)}/{len(study.series)} 条序列按 "
+                f"(检查号,序列号) / UID 都匹配不到"
+                f"（示例 study={accession!r} "
+                f"uid={[s.series_uid for s in study.series][:3]}）"
+                f"；该检查号在表里命中 {acc_rows} 行"
+                f"；首个未命中 desc={first_series.modality!r} "
+                f"候选长度={[len(c) for c in first_cands]} "
+                f"候选={list(first_cands)} "
+                f"sidecar={(first_series.metadata or {}).get('SeriesInstanceUID')!r}",
+                flush=True,
+            )
         return study
 
     recovered = tuple(

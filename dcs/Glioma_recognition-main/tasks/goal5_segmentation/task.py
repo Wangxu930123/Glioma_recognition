@@ -76,8 +76,10 @@ class Goal5Task(StudyTask[Goal5Result]):
         core_bin, flair_bin = clean_pair(core_p, flair_p, _T())
 
         # ---- 逆变换：恢复到各自源序列空间（shape/affine 必须与源图一致）----
-        core_mask, core_uid = self._restore(study, prepared, core_bin, CORE_SOURCE_MODALITIES)
-        flair_mask, flair_uid = self._restore(study, prepared, flair_bin, FLAIR_SOURCE_MODALITIES)
+        core_mask, core_uid = self._restore(study, prepared, core_bin, CORE_SOURCE_MODALITIES,
+                                            context.warnings)
+        flair_mask, flair_uid = self._restore(study, prepared, flair_bin, FLAIR_SOURCE_MODALITIES,
+                                              context.warnings)
 
         context.diagnostics["goal5"] = {
             "missing_channels": list(prepared.missing),
@@ -94,17 +96,45 @@ class Goal5Task(StudyTask[Goal5Result]):
         )
 
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _reference_series(study, prepared: PreparedVolume):
+        """挑不出目标模态时的**退化目标**：公共网格的参考序列。
+
+        一定要返回**真实存在于 `study.series` 里**的那一条 —— 掩膜只有落在真实序列的
+        空间里，`OutputWriter` 才能查到它、`OutputValidator` 才会通过。
+        """
+        by_uid = {s.series_uid: s for s in study.series}
+        for info in (prepared.channel_sources or {}).values():
+            uid = str((info or {}).get("series_uid") or "").strip()
+            if uid in by_uid:
+                return by_uid[uid]
+        return study.series[0] if study.series else None
+
     def _restore(self, study, prepared: PreparedVolume, mask: np.ndarray,
-                 modalities: tuple[str, ...]) -> tuple[np.ndarray, str]:
+                 modalities: tuple[str, ...], warnings: list | None = None
+                 ) -> tuple[np.ndarray, str]:
         """把公共网格掩膜恢复到指定模态的源序列空间。
 
-        找不到目标模态时退化为参考网格本身（保证仍能写出、shape 自洽），
+        找不到目标模态时**退化为参考序列**（保证仍能写出、shape/affine 自洽），
         并把所用序列 UID 一并返回，供 Writer 决定输出目录。
+
+        ⚠️ 这里**绝不能返回空字符串**（旧实现的 bug）：空 UID 会让
+        `OutputWriter._write_masks` 里的 `study.series_by_uid("")` 抛
+        `KeyError: unknown series UID ''`，而 `core/runner.py` 的 `_run_streaming`
+        对整批只包了一层 try（**没有 per-case 容错**）→ **一例失败 = 整批评测作废**。
         """
         picked = select_series(study, modalities)
         src = next(iter(picked.values()), None)
-        if src is None:
+        fell_back = src is None
+        if fell_back:
+            src = self._reference_series(study, prepared)
+        if src is None:                                   # 极端：study 一条序列都没有（构造时已拦）
             return mask.astype(np.uint8), ""
+        if fell_back and warnings is not None:
+            warnings.append(
+                f"goal5: 挑不出 {'/'.join(modalities)} 模态 → 掩膜退化写入参考序列 "
+                f"{src.series_uid}（模态识别失败，答案仍合规但该例分割可能不准）"
+            )
 
         restored = restore_binary_to_source(
             mask, prepared.affine, np.asarray(src.affine, dtype=np.float64),

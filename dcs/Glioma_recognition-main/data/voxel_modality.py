@@ -72,6 +72,14 @@ _EXCLUDED = ("其他", "其它", "other", "无", "none", "正常", "平扫")
 #: 低于该置信度宁可不用（把 FLAIR 当 T1C 比留空通道更有害）
 _MIN_CONF = 0.5
 
+#: 已就"体素判别结果"打过日志的 ``(检查号, allow_excluded)``。
+#:
+#: **只存字符串/布尔**，绝不缓存 Study —— 后者会拖住 ``Series.image``，几百例下来就是内存暴涨。
+#: 为什么需要它：``series_selector.select()`` 对同一检查会被调**多次**（建体积 → 指纹 →
+#: 各自模态的 `_restore`），每次都要重跑整条兜底链 → **同一结果实测会打 8 遍**。
+#: 按 ``allow_excluded`` 分开记，是为了保留"哪一级腿救回来的"这一信息（最多 2 行/检查）。
+_LOGGED: set[tuple[str, bool]] = set()
+
 #: 内嵌系数（在官方训练集上拟合；与 ``glioma_track4/data/modality_model.json`` 同源）。
 #: 顺序：``CLASSES × FEATURE_NAMES``。
 _MEAN = (0.3478613793849945, 0.6432385444641113, 0.8277721405029297, 1.0,
@@ -235,6 +243,24 @@ def _is_excluded(series) -> bool:
     return any(tok in text for tok in _EXCLUDED)
 
 
+def _log_excluded(study: Study, skipped: int, allow_excluded: bool) -> None:
+    """报告"因权威排除而未参与判别"的序列数（每 ``(检查号, 模式)`` 只报一次）。
+
+    ⚠️ 调用点必须在 ``if not cand: return`` **之前**：当**全部**序列都被排除时
+    ``cand`` 就是空的，若把打印放在后面，这条信息会**在最需要的时候沉默** ——
+    而它恰恰说明"该例是靠权威排除挡下来的"，是判断后续策略的关键。
+    """
+    if not skipped:
+        return
+    key = (study.accession_number, allow_excluded)
+    if key in _LOGGED:
+        return
+    _LOGGED.add(key)
+    print(f"[voxel-modality] study {study.accession_number!r}: "
+          f"{skipped} 条为权威排除（其他/正常/平扫），不猜"
+          f"（allow_excluded={allow_excluded}）", flush=True)
+
+
 def recover_study(study: Study, allow_excluded: bool = False) -> Study:
     """用体素统计给"认不出模态"的序列重贴模态；挑不出就原样返回。
 
@@ -259,6 +285,7 @@ def recover_study(study: Study, allow_excluded: bool = False) -> Study:
 
     model = load_model()
     cand: list[tuple[float, str, str]] = []
+    runner_up: dict[str, float] = {}
     skipped = 0
     for series in study.series:
         if guess_modality(series.modality) is not None:
@@ -272,16 +299,21 @@ def recover_study(study: Study, allow_excluded: bool = False) -> Study:
             print(f"[voxel-modality] {study.accession_number} 判别失败 "
                   f"{series.series_uid}: {type(exc).__name__}: {exc}", flush=True)
             continue
+        ranked = sorted((float(v) for v in probs.values()), reverse=True)
+        runner_up[series.series_uid] = ranked[1] if len(ranked) > 1 else 0.0
         for cls, p in probs.items():
             cand.append((float(p), series.series_uid, cls))
 
     if not cand:
+        _log_excluded(study, skipped, allow_excluded)                 # ← 必须在这里，见其 docstring
         return study
 
     cand.sort(key=lambda x: -x[0])
     used_series: set[str] = set()
     used_cls: set[str] = set()
-    changed: dict[str, tuple[str, float]] = {}
+    # 三元组：(判定类别, 该类别概率, 次优类别概率) —— 次优用于识别**概率饱和**
+    # （top≈1.0 且次优≈0.0 说明输入远超训练分布，此时 0.5 门槛形同虚设）
+    changed: dict[str, tuple[str, float, float]] = {}
     for p, uid, cls in cand:
         if p < _MIN_CONF:
             break                                                     # 已降序 → 可直接停
@@ -289,18 +321,20 @@ def recover_study(study: Study, allow_excluded: bool = False) -> Study:
             continue
         used_series.add(uid)
         used_cls.add(cls)
-        changed[uid] = (cls, p)
+        changed[uid] = (cls, p, runner_up.get(uid, 0.0))
 
     if not changed:
-        if skipped:
-            print(f"[voxel-modality] study {study.accession_number!r}: "
-                  f"{skipped} 条为权威排除（其他/正常/平扫），不猜", flush=True)
+        _log_excluded(study, skipped, allow_excluded)
         return study
 
-    print(f"[voxel-modality] study {study.accession_number!r} 体素判别 → "
-          f"{ {k: v[0] for k, v in changed.items()} }"
-          f"（置信 {[round(v[1], 2) for v in changed.values()]}，"
-          f"共 {len(study.series)} 条序列）", flush=True)
+    if (study.accession_number, allow_excluded) not in _LOGGED:
+        _LOGGED.add((study.accession_number, allow_excluded))
+        print(f"[voxel-modality] study {study.accession_number!r} 体素判别 → "
+              f"{ {k: v[0] for k, v in changed.items()} }"
+              f"（置信 {[round(v[1], 3) for v in changed.values()]}，"
+              f"次优 {[round(v[2], 3) for v in changed.values()]}，"
+              f"allow_excluded={allow_excluded}，"
+              f"共 {len(study.series)} 条序列）", flush=True)
     return replace(study, series=tuple(
         replace(s, modality=changed[s.series_uid][0]) if s.series_uid in changed else s
         for s in study.series

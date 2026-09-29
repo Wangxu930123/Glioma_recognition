@@ -1,7 +1,11 @@
 # 模态识别 1 分钟诊断（上游问题定位）
 
 > 目的：一条命令定位"**为什么挑不出序列**"，并判断体素兜底能不能用。
-> 三个诊断合计约 1 分钟（② 较慢，最多 40 例）。
+> 三个诊断合计约 1 分钟（② 较慢，最多 60 例）。
+>
+> **路径说明**：文中 `cd` 到**提交侧工程**（Python 包 `data/`、`tasks/`、`pipeline/` 所在的那一层）。
+> 若你的工程根不同（例如还在旧位置 `…/dcs/Glioma_recognition-main`，
+> 或已迁回 `…/dcs/glioma_track4` 隔壁），把 `cd` 那行换成你自己的路径即可 —— 其余命令不用动。
 >
 > 关联文档：
 > - [`INFERENCE_EVAL_AND_SUBMIT_GUIDE.md`](INFERENCE_EVAL_AND_SUBMIT_GUIDE.md) —— 推理/测评/提交全链路
@@ -32,6 +36,9 @@
 | `KeyError: unknown series UID` | 掩膜绑定了不存在的序列 | 已修（见 MIGRATE 文档 §8） |
 | `ValueError: core and flair masks target the same series but differ` | 两路退化到同一序列 | 已修（同上） |
 | 推理跑得完但 `core_voxels=0` | 通道全零 → 预测为空 | **§3** |
+| `[runner] #N … 开始` 后很长时间没有 `完成` | 该例正在跑滑窗推理，**或**真的卡住 | **§3b** |
+| `[runner] #N … 完成 Nms goal5{missing=[...], core=…, flair=…}` | 逐例进度（新）：直接看缺通道与掩膜体素数 | **§3b** |
+| `[voxel-modality] …（置信 [1.0]，次优 [0.0]，allow_excluded=True，…）` | **概率饱和** + 覆盖了表的 `其他` | **§2** |
 
 ---
 
@@ -539,57 +546,170 @@ PY
 
 ---
 
-## 2. 诊断② · 体素判别与官方表的一致率（约 40 秒，最多 40 例）
+## 2. 诊断② · 体素判别的**准确率 + 概率饱和度**
 
-**回答**：第三条腿能不能用？`其他` 到底该不该猜？
+> 脚本：`scripts/voxel_consistency.py`（**不占 GPU、不读权重**，可与推理并行）
+> 前台约 40 秒（默认 60 例）；后台用 nohup 见 §2.1
+
+**回答两个问题**：第三条腿能不能用？`其他` 到底该不该猜？
 
 > 原理：训练集里**表能匹配上**的序列自带权威模态标签 → 拿它当金标准，测体素判别的准确率。
-> 体素判别只读 `.nii.gz`，**不需要任何 xlsx**。
+> 体素判别只读 `.nii.gz`，**不需要任何 xlsx**，也**不碰 GPU**。
+>
+> ⚠️ **只看准确率不够** —— 必须同时看 **top-2 间隔（饱和度）**：见下面的判据。
+
+### 2.1 后台跑（推荐：nohup，不占终端）
 
 ```bash
-cd /2026aicompetition/workspace/dcs/Glioma_recognition-main
-python3 - <<'PY'
-import itertools
-import sys
-sys.path.insert(0, '.')
-from pathlib import Path
-import numpy as np
-import nibabel
-from data.modality_fallback import _read_rows, _table_in
-from data.voxel_modality import load_model, describe
+cd /2026aicompetition/workspace/dcs/GliomaRecognition/dcs/Glioma_recognition-main
 
-SUB = Path('/2026aicompetition/datasets/training/annotation')
-table = _table_in(SUB)
-print("训练集表:", table, "|", describe())
-if table is None:
-    raise SystemExit("✗ 训练集里没找到 SeriesType.xlsx")
-rows = _read_rows(table)
-print("表条数:", len(rows))
+# ① 先确认脚本在位（它随仓库一起走）
+test -f scripts/voxel_consistency.py && echo "脚本就位" \
+  || echo "!! 缺少 scripts/voxel_consistency.py —— 先同步代码再跑"
 
-model = load_model()
-hits = tot = 0
-for (acc, uid), label in itertools.islice(rows.items(), 0, 800):
-    cands = list(SUB.glob(f"*/{uid}.nii.gz")) or list(SUB.glob(f"*/{uid}*.nii.gz"))
-    if not cands:
-        continue
-    try:
-        vol = np.squeeze(np.asanyarray(nibabel.load(cands[0]).dataobj)).astype(np.float32)
-    except Exception as exc:                                       # noqa: BLE001
-        print(f"  [skip] {uid[:20]}: {type(exc).__name__}")
-        continue
-    lab, p = model.predict(vol)
-    hit = lab.lower().replace('ce', 'c') in str(label).lower().replace('ce', 'c')
-    tot += 1
-    hits += hit
-    if tot <= 12:
-        print(f"  {uid[:24]:<26} 表={str(label):<14} 判别={lab:<6} "
-              f"{max(p.values()):.2f}  {'OK' if hit else 'X'}")
-    if tot >= 40:
-        break
-print(f"\n与官方表一致: {hits}/{tot} = {hits/max(1,tot):.1%}")
-print("判据：>=80% 可用；50~80% 建议重训；<50% 需排查")
-PY
+# ② 后台启动，日志落盘
+mkdir -p logs
+nohup python3 scripts/voxel_consistency.py > logs/voxel_consistency.log 2>&1 &
+echo $! > logs/voxel_consistency.pid
+echo "已后台启动，PID=$(cat logs/voxel_consistency.pid)"
 ```
+
+```bash
+cd /2026aicompetition/workspace/dcs/GliomaRecognition/dcs/Glioma_recognition-main
+
+# 实时跟进（Ctrl-C 只退出 tail，**不影响**后台任务）
+tail -f logs/voxel_consistency.log
+
+# 只看结论几行
+grep -E "一致率|top-2 间隔|按表标签|判据" logs/voxel_consistency.log
+
+# 确认后台任务是否还在跑（无输出 = 已跑完）
+ps -o pid,etime,time --no-headers -p "$(cat logs/voxel_consistency.pid)"
+```
+
+### 2.2 前台跑 / 调规模
+
+```bash
+cd /2026aicompetition/workspace/dcs/GliomaRecognition/dcs/Glioma_recognition-main
+
+# 前台直接跑（默认 60 例）
+python3 scripts/voxel_consistency.py
+
+# 指定数据根 + 最多比对 300 例（例数越多，一致率越可靠）
+python3 scripts/voxel_consistency.py /2026aicompetition/datasets/training/annotation 300
+
+# 后台 + 300 例
+GLIOMA_VOXEL_MAX=300 nohup python3 scripts/voxel_consistency.py \
+  > logs/voxel_consistency.log 2>&1 &
+```
+
+| 参数 | 位置 | 默认 |
+|---|---|---|
+| 数据根 | 第 1 个位置参数 | `/2026aicompetition/datasets/training/annotation` |
+| 最多比对例数 | 第 2 个位置参数 / `GLIOMA_VOXEL_MAX` | `60` |
+| 外部模型 | `GLIOMA_MODALITY_MODEL` | 不设 → 用**内嵌系数** |
+
+**退出码**：`0` = 正常跑完；`1` = 中途异常（回溯已打在日志末尾）；`2` = 数据根下没有 `SeriesType.xlsx`。
+
+### 2.3 输出长什么样（**格式示意**，数字是编的）
+
+```text
+[1/5] 数据根: /2026aicompetition/datasets/training/annotation | 存在=True
+      体素模型: 体素判别模型=内嵌系数（默认）
+      最多比对: 60 例（第二个参数或 GLIOMA_VOXEL_MAX 可改）
+[2/5] 序列表: /2026aicompetition/datasets/training/annotation/SeriesType.xlsx
+      表条数: 1735
+[3/5] 磁盘影像数: 6980   索引键数: 6980
+  SR-A-0001                表=T1CE (增强)      判别=T1CE  top=0.998 次优=0.002 OK
+  SR-B-0002                表=T2-Flair       判别=FLAIR top=0.991 次优=0.009 OK
+      [miss] acc='acc002' uid='ghost'
+[4/5] 参与比对 60 例；表里有但磁盘找不到文件而跳过 3 行
+      一致率: 48/60 = 80.0%
+      top-2 间隔：中位数=0.976 最小=0.213 饱和(<0.01)占比=0.0%
+      按表标签分组（看是哪一类在拖后腿）：
+        T1CE (增强)        20/24 = 83.3%
+        T2-Flair          28/36 = 77.8%
+[5/5] 判据：一致率 >=80% 且 饱和占比 <20% → 可覆盖「其他」；一致率 <50%（≈随机）→ 不该覆盖
+```
+
+> **重点看每行的 `top` 与 `次优`**。若你看到的输出是
+> `（置信 [1.0], 共 N 条序列）` 而**没有 `次优`**，说明跑的是**旧代码**（见 §3c）。
+
+### 2.4 参数与脚本位置
+
+脚本：`scripts/voxel_consistency.py`（**不占 GPU、不读权重**，可与推理并行跑）。
+它的逻辑与本文件 §2 完全同源 —— 早期版本是内联 heredoc，现已收进脚本，
+**以后只维护脚本一处**。
+
+**判读**
+
+> ### 如果输出停在某一步（这次遇到的"只到 `表条数` 就没了"）
+>
+> 脚本刻意打了 `[1/5]`~`[5/5]` 五个进度点，**停在哪一步就能直接定位**：
+>
+> | 停在 | 含义 | 处理 |
+> |---|---|---|
+> | `[1/5]` 之后 | 数据根不存在（那行会打 `存在=False`） | 改 `SUB` 路径 |
+> | **`[2/5]` 之后（只到 `表条数`）** | **正在建索引**：`SUB.iterdir()` + 每个检查号 `rglob` 遍历整棵树 | ⚠️ **是慢，不是死** —— 见下 |
+> | `[3/5]` 之后 | 正在逐例读 NIfTI 并判别（每例约 71 MB 读盘） | 正常，60 例约 40 秒 |
+> | 出现 `!!!!` 前缀 | 抛异常，**完整回溯就在下一行** | 整段贴回来 |
+>
+> **「建索引」是唯一可能明显耗时的一步。** 想确认它只是慢，另开终端量一下：
+
+```bash
+R=/2026aicompetition/datasets/training/annotation
+echo "检查号目录数: $(ls "$R" | wc -l)"
+echo "影像文件数  : $(find "$R" -name '*.nii*' | wc -l)"
+```
+
+> 几千个文件时「建索引」应**几秒内**出现 `[3/5]`。若超过一分钟仍没有，
+> 用 `Ctrl-C` 中断并把已打印的前几行贴回来（那说明该目录下混进了别的大子树）。
+
+| 看到 | 结论 | 动作 |
+|---|---|---|
+| 一致率 **≥80%**，`饱和(<0.01)占比` **<20%** | 判别器可信 | 保留"覆盖 `其他`"的逻辑 |
+| 一致率 **≥80%**，但**饱和占比很高** | "看起来准"但概率不可信 | 见下方「为什么必须看饱和度」 |
+| 一致率 **50~80%** | 边缘 | 用训练集重训（见下） |
+| 一致率 **<50%**（≈随机猜） | ❗ **置信 1.0 毫无意义** | **应关掉对 `其他` 的覆盖** |
+
+### 为什么必须同时看饱和度
+
+`voxel_modality.py` 用 0.5 置信门槛兜住乱猜，注释写着「把 FLAIR 当 T1C 比留空通道更有害」。
+**但对 3 类逻辑回归，概率压到 1.0 说明 top-2 的 logit 差极大 —— 这通常是"输入远超训练分布"
+（特征标准化后落在极端区）的特征，而不是"非常确信"。** 实跑日志里已经出现过：
+
+```text
+[voxel-modality] study '...' 体素判别 → {'2.25.2588...': 'T1CE'}（置信 [1.0]，allow_excluded=True，共 2 条序列）
+```
+
+此时 **0.5 的门槛形同虚设**。而那种场景恰恰是**表明确标了 `其他`**的序列 ——
+它们最可能是定位像 / 非脑 / calibration 之类的异常序列，
+**把定位像当 T1CE 填进 `t1c` 通道，比留空通道更有害**。
+
+> 所以 `voxel_modality` 的日志已经改成同时打 **`次优`** 与 **`allow_excluded`**：
+> `置信 1.0 / 次优 0.0` = **饱和**（不可信）；`置信 0.9 / 次优 0.1` = 正常高置信。
+> 看到饱和占比高，就该考虑关掉对 `其他` 的覆盖。
+
+### 若结论是「不该覆盖」
+
+目前**没有**单独开关，覆盖发生在 `data/series_selector.select()` 的**最后一句**：
+
+```python
+    # 最后一遍：连"权威排除（表里明写 `其他`/`正常`/`平扫`）"的序列也允许猜。
+    return _select_picked(recover_by_voxels(study, allow_excluded=True), wanted)
+```
+
+两种处置（都不影响其他任何路径）：
+
+| 处置 | 效果 | 代价 |
+|---|---|---|
+| 把最后一句改成 `return {}` | 尊重表的「权威排除」，`其他` 序列一律不猜 | **整例全 `其他`** 的检查会变成通道全零（**该例分割 0 分**） |
+| 加一个环境开关（约 10 行，可随时回切） | 同上，但保留一条"再打开"的路 | 需要改代码 |
+
+> 判据是**期望值**：设判别器对 `其他` 序列的准确率为 `p`，则
+> 覆盖的收益 ≈ `p × 救回的分数`，代价 ≈ `(1−p) × 用错通道造成的额外损失`。
+> `p` 就在 §2 的「一致率」里 —— 但注意它是在**表有真标签**的序列上测的，
+> 对**异常序列（`其他`）**这个 OOD 子集只会更低。所以一致率 <50% 时应当关掉。
 
 **一致率低时怎么重训**（**纯 CPU，约 3~6 分钟，不碰 GPU、不碰 `best.pth`**）：
 
@@ -663,6 +783,100 @@ PY
 | `SegmentationMaskURI` 两个键都在，且 `存在=True` | ✅ 输出合规 |
 | 掩膜 `体素和=0` | ⚠️ 预测为空（通常是通道全零所致）→ 回到 §1/§2 |
 | 答案是**0 例** 或日志有 traceback | 批次被中断 → 看 traceback 最后一层的 `AccessorNumber`，该例单独查 |
+
+---
+
+## 3b. 「卡住了」还是「很慢」？—— 先分清，别急着 Ctrl-C
+
+**这一节是踩过坑写下来的**：一次 700+ 例的推理要跑很久，而 runner 原来**每例之间不打任何日志** ——
+于是「进程死锁」和「某例正在跑分钟级滑窗推理」在日志上**完全一样**，只能靠猜。
+
+### 现在 runner 每例打两行
+
+```text
+[runner] #1 04c210eaffa444e9b02ef1aaefda4365 开始 …
+[runner] #1 04c210eaffa444e9b02ef1aaefda4365 完成 41230ms goal5{missing=[], core=1234, flair=5678}
+```
+
+| 看到 | 结论 | 动作 |
+|---|---|---|
+| `#N … 开始` 后**没有** `完成`，已过几分钟 | 正在跑该例的滑窗推理（分钟级） | **等**；用下面的命令确认它在吃 CPU/GPU |
+| `#N … 开始` 后没有 `完成`，且**进程 CPU 时间不再增长** | ❗ 真的卡住（死锁 / 等 IO） | `Ctrl-C`，贴出最后 20 行 |
+| **完全没有** `[runner]` 行 | 卡在 **loader 首帧**（建索引 / 读表 / 扫不到 NIfTI） | 见 §2 的「停在某一步」 |
+| `完成` 里有 `goal5{missing=[t1c]}` | 缺通道（数据特性） | 正常，见 §0 与 §1f |
+| `完成` 里有 **`core=0` 或 `flair=0`** | ❗ 掩膜为空 | 需要查（通道 / 阈值 / 后处理） |
+
+### 不看日志也能判断的 3 条命令（另开一个终端）
+
+```bash
+PID=$(pgrep -f "uvicorn app.server" | head -1)
+echo "PID=$PID"
+ps -o pid,etime,time,stat,rss --no-headers -p "$PID"
+nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv
+sleep 10
+echo "--- 10 秒后再看一次 ---"
+ps -o pid,etime,time,stat,rss --no-headers -p "$PID"
+```
+
+**判据**：`TIME` 是累计 CPU 时间 —— **它在增长就说明进程在干活**（哪怕日志一行不出）。
+两次 `TIME` 相同且 GPU 利用率 0 → 才可能是真的卡住。
+
+关掉逐例进度（日志太长时）：`GLIOMA_PROGRESS=0 ./start.sh`。
+
+---
+
+## 3c. 重启 + 确认新代码生效（改过 `data/`、`core/`、`start.sh` 后必做）
+
+**为什么必须重启**（两者都**不能**热加载）：
+
+| 状态 | 位置 | 求值时机 |
+|---|---|---|
+| `GLIOMA_LOADER_TOLERANT` | `data/loader.py` 的 `_TOLERANT` | **模块导入期** —— 进程起来后再 `export` **不生效** |
+| `GLIOMA_PROGRESS` | `core/runner.py` 的 `_PROGRESS` | 同上 |
+| `voxel_modality._LOGGED`（日志去重） | 进程内状态 | 新进程才会是空的 |
+
+```bash
+cd /2026aicompetition/workspace/dcs/GliomaRecognition/dcs/Glioma_recognition-main
+
+# ① 看清现有进程（确认没杀错）
+pgrep -af "uvicorn app.server"
+
+# ② 停掉。若同机还有别的 uvicorn 服务，就别用 pkill，改用 kill <上面列出的 PID>
+pkill -f "uvicorn app.server" && echo "已停止" || echo "没有找到在跑的进程"
+
+# ③ 启动（start.sh 内已 : "${GLIOMA_LOADER_TOLERANT:=1}" 并 export）
+mkdir -p logs
+nohup ./start.sh > logs/start.log 2>&1 &
+echo $! > logs/start.pid
+
+# ④ 确认服务活着
+sleep 5
+curl -s http://127.0.0.1:8000/health; echo
+```
+
+**⑤ 确认新代码真的生效**（直接问进程，不靠肉眼看日志）：
+
+```bash
+python3 -c "
+from data import voxel_modality as vx
+from data.loader import tolerant_mode
+print('容错开关 tolerant_mode() =', tolerant_mode(), '(期望 True)')
+print('日志去重 _LOGGED 存在   =', hasattr(vx, '_LOGGED'), '(期望 True)')
+"
+```
+
+**日志里出现这些 = 新代码生效**
+
+| 标志 | 说明 | 出处 |
+|---|---|---|
+| `[runner] #1 … 开始 …` / `完成 Nms goal5{…}` | 逐例进度生效 | §3b |
+| 体素判别行含 **`次优`** 与 **`allow_excluded=`** | 新格式生效 | §2 |
+| 同一 study 的体素判别**只出现 1~2 次** | 日志去重生效 | 旧版会重复 **8 次** |
+| `warned_unmatched` 告警结尾有 **`【本进程只报这一次…】`** | 新文案生效 | §1f |
+
+> ⚠️ **反过来的判据同样有用**：若体素判别行仍是 `（置信 [1.0], 共 N 条序列）`
+> —— 没有 `次优`、没有 `allow_excluded` —— 那说明**跑的还是旧代码**，
+> 这时看到的一切重复/噪声都是已修过的老问题，不必再分析。
 
 ---
 

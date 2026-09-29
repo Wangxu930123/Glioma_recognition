@@ -306,7 +306,9 @@ def recover_study(study: Study) -> Study:
         if not _CACHE.get("warned_missing"):
             _CACHE["warned_missing"] = True
             print(f"[selector][模态回退] 挑不出序列，且{describe_sources(sources)}；"
-                  f"保持原报错（可 export GLIOMA_LABELS_DIR=<表所在目录> 后重跑）",
+                  f"保持原报错（可 export GLIOMA_LABELS_DIR=<表所在目录> 后重跑）"
+                  f"【本进程只报这一次：后续同类检查不再打印，"
+                  f"它描述的是**首次触发的那一例**，不代表整批都这样】",
                   flush=True)
         return study
 
@@ -356,7 +358,9 @@ def recover_study(study: Study) -> Study:
                 f"；首个未命中 desc={first_series.modality!r} "
                 f"候选长度={[len(c) for c in first_cands]} "
                 f"候选={list(first_cands)} "
-                f"sidecar={(first_series.metadata or {}).get('SeriesInstanceUID')!r}",
+                f"sidecar={(first_series.metadata or {}).get('SeriesInstanceUID')!r}"
+                f"【本进程只报这一次：它描述的是**首次触发的那一例**；"
+                f"若后面还能看到「已按官方表重贴」，说明其余检查匹配正常】",
                 flush=True,
             )
         return study

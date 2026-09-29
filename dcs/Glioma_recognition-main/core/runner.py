@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import threading
 import time
@@ -14,6 +15,25 @@ from observability.competition_logger import CompetitionLogger
 from output.validator import OutputValidator
 from output.writer import OutputWriter
 from pipeline.inference import InferencePipeline
+
+#: 是否逐例打印进度（``GLIOMA_PROGRESS=0`` 可关）。
+#:
+#: 为什么默认**开**：一次 700+ 例的推理要跑很久，而循环里原来**每例之间不打任何日志** ——
+#: 于是「进程卡死」与「某例正在跑分钟级滑窗推理」在日志上**完全一样，无法区分**
+#: （实测踩过：日志停在某例之后不动，分不清要不要 Ctrl-C）。
+#: 每例两行（开始 / 完成 + 耗时 + goal5 摘要）就够分辨，还能直接估出剩余时长。
+_PROGRESS = os.environ.get("GLIOMA_PROGRESS", "").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+
+
+def _diag_brief(context: object) -> str:
+    """一行 goal5 摘要：缺通道 + 两侧掩膜体素数（判断"是否真的救回来了"）。"""
+    goal5 = ((getattr(context, "diagnostics", None) or {}).get("goal5")) or {}
+    if not goal5:
+        return ""
+    return (f"goal5{{missing={goal5.get('missing_channels')}, "
+            f"core={goal5.get('core_voxels')}, flair={goal5.get('flair_voxels')}}}")
 
 
 @dataclass(frozen=True)
@@ -74,12 +94,18 @@ class EvaluationRunner:
             staging = self.writer.begin(job.evaluation_id)
             accessions: set[str] = set()
             self.pipeline.reset_dataset_task()
+            processed = 0
             for study in self.loader.iter_studies(job.dataset_path):
                 current_accession = study.accession_number
                 if current_accession in accessions:
                     raise ValueError(
                         f"dataset has duplicate accession number: {current_accession}"
                     )
+                processed += 1
+                study_started = time.perf_counter()
+                if _PROGRESS:
+                    # 「开始」与「完成」成对出现 → 卡死与"某例很慢"立刻可分辨
+                    print(f"[runner] #{processed} {current_accession} 开始 …", flush=True)
                 try:
                     context = self.pipeline.run_study(study)
                     self.pipeline.update_dataset_task(study, context)
@@ -116,6 +142,10 @@ class EvaluationRunner:
                     current_accession = None
                     del study
                     continue
+                if _PROGRESS:
+                    elapsed_ms = round((time.perf_counter() - study_started) * 1000)
+                    print(f"[runner] #{processed} {current_accession} 完成 "
+                          f"{elapsed_ms}ms {_diag_brief(context)}".rstrip(), flush=True)
                 accessions.add(current_accession)
                 del context, study
                 current_accession = None

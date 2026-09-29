@@ -22,6 +22,16 @@ from data.structures import CompetitionDataset, Series, Study
 _TOLERANT = os.environ.get("GLIOMA_LOADER_TOLERANT", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def tolerant_mode() -> bool:
+    """加载容错是否开启（``GLIOMA_LOADER_TOLERANT=1``）。
+
+    **单点定义**，供 ``core/runner`` 等模块复用 —— 各处自己解析环境变量会导致口径漂移，
+    尤其本变量是在**模块导入期**求值：进程跑起来之后再改环境变量**不生效**，
+    所以必须在启动脚本里 export（见 ``start.sh``）。
+    """
+    return _TOLERANT
+
+
 _NIFTI_SUFFIXES = (".nii", ".nii.gz")
 
 #: 掩膜文件名关键词（**与训练侧 ``shared/data.py`` 的 ``MASK_HINTS`` 同一语义**）。
@@ -368,6 +378,34 @@ def _read_series_types(root: Path) -> dict[tuple[str, str], str]:
         workbook.close()
 
 
+def _safe_read_series_types(root: Path) -> dict[tuple[str, str], str]:
+    """读 ``SeriesType.xlsx``；**容错模式下**失败降级为"无表继续"（返回空表）。
+
+    为什么这里也必须容错（否则开关只做了一半）：
+    表读失败（文件损坏 / 表头认不出 / 同键冲突）原本抛 ``InvalidInputError``，而
+    :meth:`DatasetLoader.iter_studies` 是**生成器** —— 异常在**首次推进时**抛出，
+    被 ``core/runner.py::_run_streaming`` 那唯一一层 try 接住并 ``rmtree(staging)``
+    → **一例都不产出，整批评测作废**。
+
+    可这一种失败**恰恰是有兜底的**：描述会退回 sidecar / 目录名，随后
+    :mod:`data.modality_fallback` 会用同一张表再兜一次（它自带 try/except 与告警）。
+    也就是说"表读不到"本该只损失一点精度，不该让整批归零。
+
+    **默认（容错关闭）行为完全不变**：原样抛出。
+    """
+    try:
+        return _read_series_types(root)
+    except InvalidInputError as exc:
+        if not _TOLERANT:
+            raise
+        print(
+            f"[loader][容错] 读取序列表失败，改为**无表继续**"
+            f"（模态将走 sidecar / 文件名关键词 / 体素判别兜底）: {exc}",
+            flush=True,
+        )
+        return {}
+
+
 class DatasetLoader:
     """Load a NIfTI tree into the competition domain model."""
 
@@ -399,7 +437,9 @@ class DatasetLoader:
         )
         if not nifti_files:
             raise InvalidInputError(f"no readable NIfTI images under {root}")
-        yield from self._iter_nifti(root, nifti_files, _read_series_types(root))
+        # 容错模式下，表读失败降级为"无表继续"（见 _safe_read_series_types）；
+        # 默认模式行为不变（原样抛出）。
+        yield from self._iter_nifti(root, nifti_files, _safe_read_series_types(root))
 
     @staticmethod
     def _resolve_dataset_root(dataset_path: str | Path) -> Path:
@@ -505,10 +545,20 @@ class DatasetLoader:
             if array.ndim != 3:
                 raise InvalidInputError(f"NIfTI image must be 3-D: {path} -> {array.shape}")
 
-            uid = _clean_identifier(
-                metadata.get("SeriesInstanceUID"),
-                series_uid,
-            )
+            # 官方契约（README「当前规范解释」）把 ``SeriesUid`` 定义为**磁盘上的那一层**：
+            # ``<AccessionNumber>/<SeriesUid>/<SeriesUid>.nii.gz``；并且
+            # ``SegmentationMaskURI = ./{SeriesUid}/{SeriesUid}.nii.gz`` 要能被平台按
+            # **病例目录**解析回输入数据。所以这里必须以**磁盘推导值**（3 层→目录名、
+            # ≤2 层→文件主干）为准，sidecar 的 ``SeriesInstanceUID`` 只在前者拿不到时兜底。
+            #
+            # ⚠️ 反过来（旧行为：sidecar 优先）在两者不一致时会写出**答案目录名 ≠ 输入目录名**：
+            # 答案 URI 指向一个输入数据里不存在的目录，而本地 ``OutputValidator`` 只拿答案
+            # 目录名去内存里的 ``Study`` 查（writer/validator 用同一个 uid，必然自洽），
+            # **查不出这个错** —— 本地全绿、平台取不到参考几何。
+            # 真实数据的目录名带 ``*`` 装饰（如 ``*2.25.…*``），而 DICOM UID 只含数字与点，
+            # 两者本就可能不同，因此这个优先级必须按契约来。
+            sidecar_uid = metadata.get("SeriesInstanceUID")
+            uid = _clean_identifier(series_uid or sidecar_uid, str(sidecar_uid or ""))
             description = str(
                 series_types.get((_metadata_key(accession), _metadata_key(uid)))
                 or metadata.get("SeriesDescription")

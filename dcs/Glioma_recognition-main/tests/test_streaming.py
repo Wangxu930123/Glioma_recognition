@@ -13,7 +13,7 @@ from openpyxl import Workbook
 from core.config import Settings
 from core.exceptions import InvalidInputError, OutputValidationError
 from core.runner import EvaluationJob, EvaluationRunner
-from data.loader import DatasetLoader
+from data.loader import DatasetLoader, tolerant_mode
 from output.validator import OutputValidator
 
 
@@ -40,13 +40,27 @@ class StreamingTest(unittest.TestCase):
             self.assertEqual("from-original-sidecar", study.series[0].modality)
 
     def test_loader_rejects_multiple_files_without_exact_original(self) -> None:
+        """无「主名 == 目录名」唯一原件时：fail-fast 报错 / 容错模式只跳过该序列。
+
+        上游 README §3 要求「没有唯一匹配时明确报错」；正式评测默认打开
+        ``GLIOMA_LOADER_TOLERANT`` 时改为跳过该序列目录 —— 1 个脏目录不该换整批 0 分。
+        两种模式都**不得**静默采纳错误的影像：fail-fast 报错，容错模式则必须让同检查
+        下**正常的那一路序列照常产出**。
+        """
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "dataset"
             directory = root / "ACC001" / "SERIES"
             directory.mkdir(parents=True)
             self._save_image(directory / "first.nii", 1)
             self._save_image(directory / "second.nii", 2)
+            good = root / "ACC001" / "SERIES-OK"
+            good.mkdir(parents=True)
+            self._save_image(good / "SERIES-OK.nii.gz", 3)
 
+            if tolerant_mode():
+                study = next(DatasetLoader().iter_studies(root))
+                self.assertEqual(["SERIES-OK"], [s.series_uid for s in study.series])
+                return
             with self.assertRaisesRegex(InvalidInputError, "exactly one original"):
                 tuple(DatasetLoader().iter_studies(root))
 
@@ -72,6 +86,11 @@ class StreamingTest(unittest.TestCase):
             self.assertEqual("SERIES-B", by_uid["SERIES-B"].modality)
 
     def test_loader_rejects_conflicting_xlsx_series_types(self) -> None:
+        """表里同键冲突：fail-fast 报错 / 容错模式整表降级为「无表继续」。
+
+        容错模式降级后描述退回 ``series_uid``（本例无 sidecar），模态识别随后接手
+        兜底 —— 比让整批评测因为一行脏标注作废要合适。
+        """
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "dataset"
             directory = root / "ACC001" / "SERIES-A"
@@ -85,6 +104,11 @@ class StreamingTest(unittest.TestCase):
             sheet.append(["A CC001", "SERIES- A", "T2"])
             workbook.save(root / "SeriesType.xlsx")
 
+            if tolerant_mode():
+                study = next(DatasetLoader().iter_studies(root))
+                self.assertEqual(["SERIES-A"], [s.series_uid for s in study.series])
+                self.assertEqual("SERIES-A", study.series[0].modality)
+                return
             with self.assertRaisesRegex(InvalidInputError, "conflicting SeriesType"):
                 next(DatasetLoader().iter_studies(root))
 
@@ -151,12 +175,19 @@ class StreamingTest(unittest.TestCase):
 
             settings = self._settings(root)
             runner = EvaluationRunner(settings, validator=FailingValidator())
-            with self.assertRaises(OutputValidationError):
+            with self.assertRaises(Exception) as raised:           # noqa: B017 - 下面按名字精确断言
                 runner.run(
                     EvaluationJob("request-fail", "evaluation-fail", dataset_path),
                     send_callback=False,
                 )
 
+            # fail-fast（默认）：单例失败 → 整批作废，抛 OutputValidationError。
+            # 容错模式（正式评测）：单例被跳过；本测试两例都失败 → 因「没有任何一例
+            # 成功产出」抛 ValueError。**两种模式都不得留下 staging 或已发布目录。**
+            self.assertEqual(
+                "ValueError" if tolerant_mode() else "OutputValidationError",
+                type(raised.exception).__name__,
+            )
             self.assertFalse((settings.answer_root / "evaluation-fail").exists())
             self.assertEqual([], list(settings.answer_root.glob(".*.tmp-*")))
 

@@ -9,7 +9,7 @@ from pathlib import Path
 from app.callback import CompetitionCallback
 from core.config import Settings
 from core.registry import build_pipeline
-from data.loader import DatasetLoader
+from data.loader import DatasetLoader, tolerant_mode
 from observability.competition_logger import CompetitionLogger
 from output.validator import OutputValidator
 from output.writer import OutputWriter
@@ -69,6 +69,7 @@ class EvaluationRunner:
         )
         staging: Path | None = None
         current_accession: str | None = None
+        skipped: list[tuple[str, str]] = []
         try:
             staging = self.writer.begin(job.evaluation_id)
             accessions: set[str] = set()
@@ -79,13 +80,69 @@ class EvaluationRunner:
                     raise ValueError(
                         f"dataset has duplicate accession number: {current_accession}"
                     )
-                context = self.pipeline.run_study(study)
-                self.pipeline.update_dataset_task(study, context)
-                accession_dir = self.writer.write_study(staging, context)
-                self.validator.validate_study(accession_dir, study)
+                try:
+                    context = self.pipeline.run_study(study)
+                    self.pipeline.update_dataset_task(study, context)
+                    accession_dir = self.writer.write_study(staging, context)
+                    self.validator.validate_study(accession_dir, study)
+                except Exception as exc:                          # noqa: BLE001
+                    # ---- 逐例容错（**仅 GLIOMA_LOADER_TOLERANT=1 时生效**）----
+                    # 评测**不可重跑**：1 例脏数据 / 1 次推理异常，不该让其余几百例
+                    # 一起作废。默认（容错关闭）保持严格 fail-fast：原样抛出。
+                    if not tolerant_mode():
+                        raise
+                    skipped.append(
+                        (current_accession, f"{type(exc).__name__}: {exc}")
+                    )
+                    print(
+                        f"[runner][容错] 跳过检查 {current_accession!r}: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    self.logger.write(
+                        request_id=job.request_id,
+                        evaluation_id=job.evaluation_id,
+                        phase="test",
+                        message="study_skipped",
+                        data_source=data_source,
+                        accession_number=current_accession,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    # 清掉该例可能已写了一半的目录：否则 validate_final_layout
+                    # 会因为"多出一个目录"而整批失败（它要求 staging 的子目录
+                    # 与发布集合**完全相等**）。
+                    shutil.rmtree(staging / current_accession, ignore_errors=True)
+                    current_accession = None
+                    del study
+                    continue
                 accessions.add(current_accession)
                 del context, study
                 current_accession = None
+
+            if skipped:
+                print(
+                    f"[runner][容错] 跳过 {len(skipped)} 例，"
+                    f"正常发布 {len(accessions)} 例："
+                    f"{[item[0] for item in skipped[:10]]}"
+                    f"{' …' if len(skipped) > 10 else ''}",
+                    flush=True,
+                )
+                self.logger.write(
+                    request_id=job.request_id,
+                    evaluation_id=job.evaluation_id,
+                    phase="test",
+                    message="studies_skipped",
+                    data_source=data_source,
+                    skipped_count=len(skipped),
+                    written_count=len(accessions),
+                    skipped=[item[0] for item in skipped[:50]],
+                )
+            if not accessions:
+                raise ValueError(
+                    "容错模式下没有任何一例成功产出，无可发布的答案"
+                    f"（全部 {len(skipped)} 例失败）"
+                )
 
             duplicates = self.pipeline.finalize_dataset_task()
             duplicate_path = self.writer.write_duplicates(

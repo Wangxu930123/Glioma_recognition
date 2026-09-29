@@ -139,9 +139,25 @@ def _sanitize_uid(uid: str) -> str:
 
 
 def infer_uid_from_path(series) -> str:
-    """稳定的序列标识：优先 metadata/UID，退化为目录名。"""
-    uid = str((series.metadata or {}).get("SeriesInstanceUID")
-              or series.series_uid or "").strip()
+    """稳定的序列标识：**磁盘推导值优先**（官方契约的 ``{SeriesUid}`` 就是它）。
+
+    官方 README「当前规范解释」规定：
+    ``SegmentationMaskURI`` 相对于病例目录，格式为 ``./{SeriesUid}/{SeriesUid}.nii.gz`` ——
+    平台要按这个相对路径解析回**输入数据**的同名目录，所以 ``{SeriesUid}`` 必须是
+    ``<AccessionNumber>/<SeriesUid>/<SeriesUid>.nii.gz`` 里的那一层目录名。
+
+    优先级因此固定为：``series_uid``（Loader 已按磁盘推导：3 层取目录名、≤2 层取文件主干）
+    → 目录名 → sidecar 的 ``SeriesInstanceUID``。
+
+    ⚠️ **不能反过来（旧行为：sidecar 优先）**：sidecar 与目录名不一致时会写出一个输入数据里
+    不存在的目录，而本地 ``OutputValidator`` 只拿答案目录名去内存里的 ``Study`` 查
+    （writer/validator 共用同一个 uid，必然自洽），**查不出这个错** —— 本地全绿、平台取不到。
+    """
+    uid = str(getattr(series, "series_uid", "") or "").strip()
     if uid:
         return _sanitize_uid(uid)
-    return _sanitize_uid(series.source_path.parent.name)
+    parent = getattr(getattr(series, "source_path", None), "parent", None)
+    if parent is not None and parent.name:
+        return _sanitize_uid(parent.name)
+    sidecar = str((getattr(series, "metadata", None) or {}).get("SeriesInstanceUID") or "").strip()
+    return _sanitize_uid(sidecar) if sidecar else ""

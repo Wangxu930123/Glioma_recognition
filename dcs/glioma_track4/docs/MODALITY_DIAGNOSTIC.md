@@ -304,6 +304,138 @@ def _uid_segments(value: str) -> frozenset[str]:
 
 ---
 
+## 1d. 诊断①全量 · 表行 ↔ 磁盘逐条核对（约 15 秒，**不读影像**）
+
+> **什么时候跑**：§1c 已证明"匹配链路通"（候选命中 `True`），但某个模态的通道仍然是空的。
+> 这时要分清两种**完全不同**的成因 —— 它们的修法相反：
+>
+> | 情况 | 含义 | 处置 |
+> |---|---|---|
+> | 该模态的表行**能**对上磁盘 | 数据**本来**就缺这个模态 | 数据特性，**不要改代码**；模型必须容忍缺模态 |
+> | 该模态的表行**对不上**磁盘 | **匹配 bug**，该通道被人为清零 | 必须修 `_match`（加片段匹配，见 §1c 末尾） |
+>
+> **只比路径、不读 NIfTI**，所以 1700+ 条几秒跑完。
+
+```bash
+cd /2026aicompetition/workspace/dcs/Glioma_recognition-main
+python3 - <<'PY' 2>&1 | tee /tmp/modality_sweep.txt
+from collections import Counter, defaultdict
+from pathlib import Path
+
+from data.modality_fallback import _read_rows, _table_in, _norm
+from data.series_selector import guess_modality
+
+ROOT = Path('/2026aicompetition/datasets/verification')
+if (ROOT / 'original').is_dir():
+    ROOT = ROOT / 'original'
+table = _table_in(ROOT)
+rows = _read_rows(table)
+print("表 =", table, "| 条数 =", len(rows))
+
+by_dir, by_stem, n_dir = {}, {}, 0
+for acc_dir in sorted(p for p in ROOT.iterdir() if p.is_dir()):
+    for uid_dir in sorted(p for p in acc_dir.iterdir() if p.is_dir()):
+        n_dir += 1
+        by_dir.setdefault((_norm(acc_dir.name), _norm(uid_dir.name)), uid_dir)
+        for f in uid_dir.glob('*.nii*'):
+            stem = f.name[:-7] if f.name.lower().endswith('.nii.gz') else f.stem
+            by_stem.setdefault((_norm(acc_dir.name), _norm(stem)), f)
+print(f"磁盘：检查号 {len({a for a, _ in by_dir})} 个 | 序列目录 {n_dir} 个 | 文件名主干 {len(by_stem)} 条")
+
+stat = defaultdict(lambda: [0, 0, 0])
+miss = []
+for (acc, uid), label in rows.items():
+    ok_dir = (acc, uid) in by_dir
+    ok_stem = (acc, uid) in by_stem
+    s = stat[label]
+    s[2] += 1
+    s[0] += ok_dir
+    s[1] += ok_stem
+    if not (ok_dir or ok_stem) and len(miss) < 12:
+        miss.append((acc, uid, label))
+
+print("\n--- 按模态统计：表行 → 磁盘是否真有该序列 ---")
+print(f"  {'模态':<16} {'表行':>6} {'目录名命中':>16} {'文件名命中':>16} {'模态键':>8}")
+for label, (d, st, n) in sorted(stat.items(), key=lambda kv: -kv[1][2]):
+    print(f"  {label:<16} {n:>6} {d:>7} ({d / n:6.1%}) {st:>7} ({st / n:6.1%}) {str(guess_modality(label)):>8}")
+
+print("\n--- 未命中样例（前 12）---")
+for acc, uid, label in miss:
+    print(f"  acc={acc!r}  uid={uid!r}  label={label!r}")
+n_miss = sum(1 for (a, u) in rows if (a, u) not in by_dir and (a, u) not in by_stem)
+print("未命中总数 =", n_miss, "/", len(rows))
+
+# 找一个表里**有 T1CE** 的检查号，把表行与磁盘目录并列打印
+print("\n--- 抽样：表里有 T1CE 的检查号，表行 vs 磁盘目录名 ---")
+targets = [a for (a, u), l in rows.items() if 't1c' == guess_modality(l)]
+if targets:
+    acc = targets[0]
+    print(f"\n[{acc}]  表行：")
+    for (a, u), l in rows.items():
+        if a == acc:
+            print(f"   {u!r}  ->  {l!r}")
+    print("  磁盘目录名：")
+    for uid_dir in sorted(p for p in (ROOT / acc).iterdir() if p.is_dir()) if (ROOT / acc).is_dir() else []:
+        files = [f.name for f in uid_dir.glob('*.nii*')]
+        print(f"   {uid_dir.name!r}   文件={files}")
+    print(f"  → 表行的 uid 是否能在磁盘目录名里找到："
+          f"{[(_norm(u) in {_norm(d.name) for d in (ROOT / acc).iterdir() if d.is_dir()}) for (a, u) in rows if a == acc]}")
+else:
+    print("!! 表里没有一条 T1CE → 结论更直接：数据/表本身就缺 t1c")
+PY
+```
+
+**判读**
+
+| 看到 | 结论 | 动作 |
+|---|---|---|
+| 某模态命中率 **≈100%** | 数据**真的**缺这个模态 | 不改代码；报告里说明"缺模态条件下的指标" |
+| 某模态命中率 **明显 <100%** | **匹配 bug**，该通道被人为清零 | 修 `_match`（§1c 末尾的片段匹配） |
+| 全表命中率都低 | 目录结构 / `_norm` 口径问题 | 把输出贴出来 |
+| 表里**一条某模态都没有** | 数据/表本身缺该模态 | 同上第一行 |
+
+---
+
+## 1e. 已验证：表取值 → 模态键的映射（无需再查）
+
+对本数据集表的 **5 个取值**逐个实测（`data/series_selector.guess_modality`）：
+
+| 表取值 | 归一结果 | 结论 |
+|---|---|---|
+| `T2-Flair` | `flair` | ✅ |
+| `T1CE (增强)` | `t1c` | ✅ |
+| `T1` | `t1` | ✅ |
+| `T2WI` | `t2` | ✅ |
+| `其他` | `None` | ✅ 正确排除 |
+
+变体也全对：`T1CE（增强）` / `t1ce(增强)` / `T1 CE` / `CE增强` → `t1c`；
+` T2-FLAIR ` / `T2Flair` / `FLAIR` → `flair`；`T1WI` → `t1`。
+`_key_of` 分支也正确：`metadata['modality']='其他'` → `None`（不短路后续兜底）。
+
+> **所以：`表 → 描述 → 模态键` 这条链是通的。若某通道仍为空，病因只可能在 §1d 的"表行对不上磁盘"。**
+
+### ⚠️ 但 `t1c` 的关键词里有**过宽的词**（已知隐患，本数据集暂不触发）
+
+```21:22:Glioma_recognition-main/data/series_selector.py
+    ("t1c", ("t1c", "t1ce", "t1_ce", "t1+c", "t1wi+c", "postcontrast", "post_contrast",
+             "post contrast", "post", "enhance", "增强", "ce+", "+c", "gd")),
+```
+
+`"post"` / `"gd"` / `"+c"` 都是**子串**匹配，且 `t1c` 排在关键词表**第一位**（顺序敏感设计），
+一旦命中就短路，后面的 `flair/t2/t1` 全被吃掉。实测：
+
+```
+'post contrast t2' -> 't1c'   ← 错，应为 t2
+'gd-t2'            -> 't1c'   ← 错
+'T2WI+c'           -> 't1c'   ← 含糊
+```
+
+`"post"` 会吞 `posterior` / `post-op`，`"gd"` 会吞任何含 `gd` 的串。
+本数据集的 5 个取值不含这些词，所以**当前不触发**；但官方表/测试集描述一变就会踩。
+收窄建议：删掉裸 `"post"`（`postcontrast`/`post contrast` 已单列），`"gd"` 改 `"gd-"`/`"-gd"`/`"gd "`。
+
+---
+
 ## 2. 诊断② · 体素判别与官方表的一致率（约 40 秒，最多 40 例）
 
 **回答**：第三条腿能不能用？`其他` 到底该不该猜？

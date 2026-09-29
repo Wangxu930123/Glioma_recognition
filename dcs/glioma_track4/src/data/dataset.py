@@ -754,7 +754,10 @@ class GliomaDataset(Dataset):
 
     def __init__(self, cases: list[dict], train: bool = True, patch: tuple = (96, 96, 96),
                  pos_ratio: float = 0.7, pre_cfg: dict | None = None, label_fields: list | None = None,
-                 seed: int = 42, aug_cfg: dict | None = None, cache_size: int = 8,
+                 #: 整脑视图 LRU 容量。⚠️ 实际上限是 ``max(16, cache_size*4)`` **个整脑视图**
+                 #: （每个 4×96³×float32 ≈ 14 MB），而且**每个 DataLoader worker 各持一份**
+                 #: —— 4 workers 时可达 ~1.8 GB。容器内存紧张时下调它最有效（见 README §16）。
+                 seed: int = 42, aug_cfg: dict | None = None, cache_size: int = 4,
                  cache_dir: str | None = None):
         # ⚠️ 这里**不**按 `images` 过滤病例。`_SpecialSupervised`
         # （`tasks/_common/training/helpers.py`）用**同一个下标**同时索引本数据集
@@ -929,7 +932,9 @@ class SpecialImageDataset(_WholeViewMixin, Dataset):
 
     def __init__(self, cases: list[dict], pos_fake: set[str], pos_composition: set[str],
                  pre_cfg: dict | None = None, aug_cfg: dict | None = None,
-                 seed: int = 42, n_per_epoch: int = 1024, cache_size: int = 64,
+                 #: 整脑视图 LRU 容量；本数据集在主进程（``num_workers=0``），
+                 #: 64 个 ≈ 0.9 GB，是容器 OOM 的主要来源之一（见 README §16）。
+                 seed: int = 42, n_per_epoch: int = 1024, cache_size: int = 8,
                  pos_ratio: float = 0.5):
         # 与 `build_case_volume` **同源**判据：只要能借到几何就收（全放开口径 ——
         # "没有真通道但有影像"的病例也会建出全零整脑视图，照常参与特殊影像监督）。
@@ -975,7 +980,8 @@ class DuplicatePairDataset(_WholeViewMixin, Dataset):
 
     def __init__(self, cases: list[dict], gold_pairs: list[list[str]], n_neg_per_pos: int = 3,
                  seed: int = 42, pre_cfg: dict | None = None, aug_cfg: dict | None = None,
-                 cache_size: int = 128):
+                 #: 整脑视图 LRU 容量；128 个 ≈ 1.8 GB，是最大的单项常驻（见 README §16）。
+                 cache_size: int = 8):
         # 同上：配对嵌入也走整脑视图（`build_case_volume`），用**同源**判据收，
         # 全放开口径（只要有影像就收）。
         self.by_acc = {c["accession"]: c for c in cases if _geometry_source(c)}

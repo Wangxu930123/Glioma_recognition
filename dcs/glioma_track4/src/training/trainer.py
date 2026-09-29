@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import itertools
 import json
 import os
 import time
@@ -37,6 +36,25 @@ from ..models.unet3d import build_model, cls_spec_from_config
 from ..utils.config import (assert_data_source, data_source_tag, external_val_cases,
                             load_config, load_paths, resolve)
 from ..utils.logger import run_logger
+
+
+def _endless(loader):
+    """无限迭代一个 DataLoader，但**不缓存历史 batch**。
+
+    ⚠️ 为什么不能用 ``itertools.cycle``（这是一次真实 OOM 的根因）：
+    ``cycle`` 的语义是"首次遍历时把**每一个**元素都存进内部列表"，之后靠重放该列表
+    来无限循环 —— 于是**内存只增不减**。而 `special` 的 DataLoader 长度是
+    ``n_per_epoch=10**6`` ÷ ``special_batch``（见 :func:`make_loaders`），首轮遍历
+    永远跑不完，所以**每个 do_global 步就永久泄漏一个 batch**
+    （2 个 96³×4ch 视图 ≈ 28 MB）；按 steps/epoch=1331、every=4 算，约
+    **9.4 GB/epoch** 单调增长，必然 OOM。
+
+    这里改成"跑完一轮就重新开一轮迭代器"：语义与 ``cycle`` 完全一致
+    （同样无限轮转、同样每轮从头开始），但常驻内存是**常数**。
+    """
+    while True:
+        for batch in loader:
+            yield batch
 
 
 # --------------------------------------------------------------------------- #
@@ -279,37 +297,53 @@ def make_loaders(cfg: dict, fold: int | None):
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
 def validate(model, dl, cfg) -> dict:
+    """在 val 上逐例前向，**流式**累计"每通道 × 每阈值"的 Dice 分子/分母。
+
+    ⚠️ 为什么不能"先把所有概率体收起来再扫阈值"（这是第二个内存坑）：
+    val=666、patch 96³ 时，``probs`` + ``gts`` 两份 float32 体积合计
+    ``666 × 2 通道 × 2 × 96³ × 4B ≈ 9 GB``，而且**每个 epoch 都会出现一次这个高水位**
+    （`val_every: 1`）。容器内存紧张时，它会把已经被泄漏抬高的 RSS 直接顶穿。
+
+    逐例累计后常驻内存与 val 例数**无关**（只与阈值个数有关：2 × 18 个累加器），
+    且结果与"先收集再扫"**逐位等价** —— 因为对任一个 (通道, 阈值) 累加器而言，
+    参与相加的用例顺序没变，浮点累加次序完全一致。
+    """
     model.eval()
-    probs, gts = [], []
+    grid = [float(t) for t in (cfg.get("threshold_grid")
+                               or [round(0.05 * i, 2) for i in range(1, 20)])]
+    # stats[c][i] = [Dice 分子累加, Dice 分母累加]（第 c 通道、第 i 个阈值）
+    stats = [[[0.0, 0.0] for _ in grid] for _ in range(2)]
+    n = 0
     for batch in dl:
         x = batch["image"].cuda(non_blocking=True).float()
         with torch.autocast("cuda", dtype=getattr(torch, cfg.get("amp_dtype", "bfloat16")),
                             enabled=torch.cuda.is_available()):
             out = model(x)
-        probs.append(torch.sigmoid(out["seg"].float())[0].cpu().numpy())
-        gts.append(batch["target"][0].numpy())
-    if not probs:
+        # 只保留当前这一例，累计完即释放（不再进列表 → 不随 val 例数增长）
+        p = torch.sigmoid(out["seg"].float())[0].cpu().numpy()
+        g = batch["target"][0].numpy()
+        n += 1
+        for c in range(2):
+            gt = g[c] > 0.5
+            gsum = float(gt.sum())
+            for i, t in enumerate(grid):
+                pred = p[c] > t
+                acc = stats[c][i]
+                acc[0] += 2.0 * float((pred & gt).sum())
+                acc[1] += float(pred.sum()) + gsum
+    if n == 0:
         return {"dice_core": 0.0, "dice_peri": 0.0, "dice_mean": 0.0, "thresholds": [0.5, 0.5]}
 
-    grid = cfg.get("threshold_grid") or [round(0.05 * i, 2) for i in range(1, 20)]
     best_thr, dices = [], []
     for c in range(2):
         bc, bd = 0.5, -1.0
-        for t in grid:
-            num = den = 0.0
-            for p, g in zip(probs, gts):
-                pred = p[c] > t
-                gt = g[c] > 0.5
-                num += 2.0 * float((pred & gt).sum())
-                den += float(pred.sum() + gt.sum())
+        for i, t in enumerate(grid):
+            num, den = stats[c][i]
             d = num / den if den > 0 else 1.0
             if d > bd:
                 bc, bd = float(t), d
         best_thr.append(bc)
         dices.append(bd)
-    n = len(probs)
-    if cfg.get("verbose_eval", False):                            # 全网格 Dice（诊断用）
-        pass
     return {"dice_core": dices[0], "dice_peri": dices[1],
             "dice_mean": 0.5 * (dices[0] + dices[1]), "thresholds": best_thr, "n_val": n}
 
@@ -372,12 +406,14 @@ def train(cfg_path: str, fold: int | None, tag: str | None, no_resume: bool = Fa
         best_thr = list(ck.get("thresholds") or best_thr)
         loaded_pretrained = ck.get("pretrained_from", "")
         print(f"[trainer] 断点续训：epoch {start_epoch}/{cfg['epochs']}", flush=True)
+        del ck          # 及时释放 model/model_ema/optimizer 三份 state_dict（整跑不再常驻）
     elif pretrained and os.path.exists(resolve(pretrained)):
         ck = torch.load(resolve(pretrained), map_location="cpu", weights_only=False)
         sd = ck.get("model_ema") or ck.get("model") or ck
         missing = model.load_state_dict(sd, strict=False)
         loaded_pretrained = pretrained
         print(f"[trainer] 加载预训练权重 {pretrained}（缺失 {len(missing.missing_keys)} 键）", flush=True)
+        del ck, sd      # 同上：别让整份权重挂到训练结束
     else:
         print("[trainer] 从零训练：未加载预训练权重", flush=True)
 
@@ -392,8 +428,9 @@ def train(cfg_path: str, fold: int | None, tag: str | None, no_resume: bool = Fa
     log_every = max(1, int(cfg.get("log_every", 20)))
     n_spec_b = int((cfg.get("aux") or {}).get("special_batch", 2)) if aux.get("special") else 0
     n_pair_b = int((cfg.get("aux") or {}).get("pair_batch", 2)) if aux.get("pair") else 0
-    sp_iter = itertools.cycle(aux["special"]) if aux.get("special") else None
-    pr_iter = itertools.cycle(aux["pair"]) if aux.get("pair") else None
+    # 用 _endless 而不是 itertools.cycle：后者会把每个 batch 永久缓存（见 _endless 注释）
+    sp_iter = _endless(aux["special"]) if aux.get("special") else None
+    pr_iter = _endless(aux["pair"]) if aux.get("pair") else None
     print(f"[trainer] tag={tag} fold={'full' if fold is None else fold} train={n_tr} val={n_va} "
           f"steps/epoch={steps_per_epoch} "
           f"特殊影像正样本={aux['pos_counts']} 重复对={aux.get('pair') is not None}", flush=True)

@@ -220,12 +220,24 @@ def main() -> int:
         if len(cls) < len(fields):
             print(f"[fields] ⚠️ 权重只有 {len(cls)} 个分类头，少于 labels.yaml 的 "
                   f"{len(fields)} 个字段 → 后续字段将被跳过", flush=True)
+        if i == 0:                                         # 形状自检（只打一次，便于排错）
+            print("[fields] 头输出形状自检: " + ", ".join(
+                f"{fields[k]['key']}({fields[k]['type']})={tuple(cls[k].shape)}"
+                for k in range(min(3, len(cls)))), flush=True)
         for fi, f in enumerate(fields):
             if not m[fi] or fi >= len(cls):
                 if not m[fi]:
                     skipped[f["key"]] += 1
                 continue
-            p = cls[fi][0].float().cpu().numpy()
+            # ⚠️ `_forward_batch` 返回的 cls[fi] 是**已按样本/TTA/模型平均过**的向量：
+            #    二分类 → 形状 (1,)，多分类 → (n_cls,)
+            #    （`inference/sliding.py` 里 `cls = [torch.cat(v, dim=0).mean(0) ...]`）。
+            #    所以**不能**再写 `cls[fi][0]` —— 那会取成 0 维标量，`p[0]` 直接 IndexError。
+            #    这里统一 ravel 成 1 维；B>1 时也只取第 0 个样本（本脚本恒为单样本前向）。
+            t = cls[fi]
+            if t.dim() >= 2:
+                t = t[0]
+            p = t.float().cpu().numpy().reshape(-1)
             if f["type"] == "binary":
                 bin_rec[f["key"]]["p"].append(float(p[0]))
                 bin_rec[f["key"]]["y"].append(float(y[fi]))

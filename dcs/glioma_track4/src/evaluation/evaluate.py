@@ -26,16 +26,45 @@ from ..utils.config import (assert_data_source, external_val_manifest, fold_ckpt
 from . import metrics as M
 
 
-def _thr_scan(probs: list[np.ndarray], gts: list[np.ndarray], c: int,
-              grid=None) -> tuple[float, float]:
-    grid = grid or [round(0.05 * i, 2) for i in range(2, 19)]
+def _default_grid() -> list[float]:
+    return [round(0.05 * i, 2) for i in range(2, 19)]
+
+
+def _empty_stats(grid: list[float]) -> list[list[float]]:
+    """每阈值一个 ``[Dice 分子, Dice 分母]`` 累加器。"""
+    return [[0.0, 0.0] for _ in grid]
+
+
+def _accumulate(stats: list[list[float]], prob: np.ndarray, gt: np.ndarray,
+                grid: list[float]) -> None:
+    """把一例的**全图**概率图 + 真值图累计进 ``stats``，随后即可丢弃这两张图。
+
+    ⚠️ 为什么必须流式（这是一次真实 OOM 的根因之一）：
+    旧写法是 ``probs.append(res["seg"])`` + ``gts.append(gt)`` —— 而
+    ``res["seg"]`` 是**全图体积** ``(2, D, H, W)``（`inference/sliding.py` 的
+    `predict_volume` 会贴回原尺寸），``gt`` 同尺寸。按 4 通道体积约 71 MB 反推
+    （`dataset.py:649` 的注释），单例 probs+gts ≈ 71 MB；val=666 时
+    **≈ 47 GB** —— 32 GB 容器在收尾评估阶段必然 OOM（死在约 380 例处）。
+    累计后常驻内存 ``2 通道 × 阈值数 × 2 个浮点数``，**与病例数无关**。
+    """
+    gt_c = gt > 0.5
+    gsum = float(gt_c.sum())
+    for i, t in enumerate(grid):
+        pr = prob > t
+        stats[i][0] += 2.0 * float((pr & gt_c).sum())
+        stats[i][1] += float(pr.sum()) + gsum
+
+
+def _best_from_stats(stats: list[list[float]], grid: list[float]) -> tuple[float, float]:
+    """从流式累计里取最优 ``(阈值, Dice)``。
+
+    **与旧的 ``_thr_scan(probs, gts, c)`` 逐位等价**：对任一阈值而言，参与相加的
+    用例顺序没变、浮点累加次序完全一致；阈值遍历顺序也仍是 ``grid`` 的顺序
+    （所以并列时的取法不变）。
+    """
     best = (0.5, -1.0)
-    for t in grid:
-        num = den = 0.0
-        for p, g in zip(probs, gts):
-            pr, gt = p[c] > t, g[c] > 0.5
-            num += 2.0 * float((pr & gt).sum())
-            den += float(pr.sum() + gt.sum())
+    for i, t in enumerate(grid):
+        num, den = stats[i]
         d = num / den if den > 0 else 1.0
         if d > best[1]:
             best = (float(t), d)
@@ -94,7 +123,11 @@ def eval_cases(cases: list[dict], man: dict, ckpt: str | list[str], tag: str = "
     pre = load_config("preprocess.yaml")
     ckpts = [ckpt] if isinstance(ckpt, str) else [str(c) for c in ckpt]
     pipe = GliomaPipeline(ckpts)
-    probs, gts, rows, embeds, feats = [], [], [], {}, {}
+    # 阈值扫描**流式累计**（不再把每例的全图概率体/真值体留在内存里；见 _accumulate）
+    rows, embeds, feats = [], {}, {}
+    thr_grid = _default_grid()
+    thr_stats = [_empty_stats(thr_grid), _empty_stats(thr_grid)]
+    n_thr = 0
     from ..inference.pipeline import postprocess
     from ..inference.writer import case_fingerprint
 
@@ -115,7 +148,10 @@ def eval_cases(cases: list[dict], man: dict, ckpt: str | list[str], tag: str = "
             pc, pp = postprocess(res["seg"][0] > pipe.thresholds[0],
                                  res["seg"][1] > pipe.thresholds[1],
                                  int(pre["inference"]["min_tumor_voxels"]), spacing)
-            probs.append(res["seg"]); gts.append(gt)
+            # 累计后立即丢弃这两张全图（只留统计量）——这是 32 GB 容器能跑完的关键
+            for _c in range(2):
+                _accumulate(thr_stats[_c], res["seg"][_c], gt[_c], thr_grid)
+            n_thr += 1
             rows.append({"accession": acc,
                          "dice_core": M.dice(pc, gt[0] > 0.5),
                          "dice_peri": M.dice(pp, gt[1] > 0.5),
@@ -135,9 +171,9 @@ def eval_cases(cases: list[dict], man: dict, ckpt: str | list[str], tag: str = "
             rep[k] = float(np.mean([r[k] for r in rows]))
         rep["dice_mean"] = 0.5 * (rep["dice_core"] + rep["dice_peri"])
         rep["hd95_peri"] = float(np.nanmean([r["hd95_peri"] for r in rows]))
-        if probs:
-            rep["thr_scan_core"] = _thr_scan(probs, gts, 0)
-            rep["thr_scan_peri"] = _thr_scan(probs, gts, 1)
+        if n_thr:
+            rep["thr_scan_core"] = _best_from_stats(thr_stats[0], thr_grid)
+            rep["thr_scan_peri"] = _best_from_stats(thr_stats[1], thr_grid)
 
     gold = {tuple(sorted(p)) for p in (man.get("special", {}).get("gold_pairs") or [])}
     if gold and embeds:

@@ -117,7 +117,14 @@ def main() -> int:
     order = list(range(len(val)))
     futs = {i: ex.submit(_prep, val[i]) for i in order[:3]}
     nxt = 3
-    probs, gts = [], []
+    # ⚠️ **流式累计，不能先把 probs/gts 收起来**（这是一次真实 OOM 的根因之一）：
+    #   `res["seg"]` 是**全图体积** `(2, D, H, W)`（`inference/sliding.py` 的
+    #   `predict_volume` 会贴回原尺寸），`make_targets(...)` 同尺寸。
+    #   按 4 通道体积约 71 MB 反推（见 `dataset.py:649` 注释），单例 probs+gts ≈ 71 MB；
+    #   本脚本默认 `--limit 0`（全量 val=666）→ **≈ 47 GB**，32 GB 容器必然 OOM
+    #   （死在约 380 例处）。流式累计后常驻 = 2 通道 × 阈值数 × 2 个浮点数。
+    stats = [[[0.0, 0.0] for _ in grid] for _ in range(2)]
+    n_used = 0
     for i in order:
         while nxt < len(order) and len(futs) < 3:
             futs[nxt] = ex.submit(_prep, val[nxt])
@@ -132,22 +139,29 @@ def main() -> int:
         except Exception as e:                                    # noqa: BLE001
             print(f"[thr] ✗ {val[i]['accession']}: {e}")
             continue
-        probs.append(res["seg"])
-        gts.append(make_targets(masks, vol.shape[1:]))
+        gt = make_targets(masks, vol.shape[1:])
+        seg = res["seg"]
+        for c in range(2):
+            gt_c = gt[c] > 0.5
+            gsum = float(gt_c.sum())
+            for gi, t in enumerate(grid):
+                pr = seg[c] > t
+                acc = stats[c][gi]
+                acc[0] += 2.0 * float((pr & gt_c).sum())
+                acc[1] += float(pr.sum()) + gsum
+        n_used += 1
     ex.shutdown(wait=False)
-    if not probs:
+    if n_used == 0:
         print("[thr] ✗ 没有可用样本")
         return 1
 
+    # 与旧版"先收集再扫"**逐位等价**：对任一阈值，参与相加的用例顺序没变，
+    # 阈值遍历顺序也仍是 grid 的顺序 → 结果与取法完全一致。
     best_thr, best_dice = [], []
     for c in range(2):
         bt, bd = 0.5, -1.0
-        for t in grid:
-            num = den = 0.0
-            for p, g in zip(probs, gts):
-                pr, gt = p[c] > t, g[c] > 0.5
-                num += 2.0 * float((pr & gt).sum())
-                den += float(pr.sum() + gt.sum())
+        for gi, t in enumerate(grid):
+            num, den = stats[c][gi]
             d = num / den if den > 0 else 1.0
             if d > bd:
                 bt, bd = float(t), d
@@ -164,7 +178,7 @@ def main() -> int:
             ck = torch.load(_c, map_location="cpu", weights_only=False)
             ck["thresholds"] = [best_thr[0], best_thr[1]]
             ck["thresholds_source"] = {"method": "full-volume-sweep",
-                                       "n_val": len(probs), "n_ckpt": len(ckpts)}
+                                       "n_val": n_used, "n_ckpt": len(ckpts)}
             torch.save(ck, _c)
             print(f"[thr] 已写回 {_c}")
     return 0

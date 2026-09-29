@@ -5,10 +5,12 @@
 >
 > 文中命令都在工程根目录执行：`cd /2026aicompetition/workspace/dcs/glioma_track4`
 >
-> ✅ **代码修复已落地**（`src/training/trainer.py`，本次修改）：
-> ① `itertools.cycle` → `_endless`（消除 ~9.4 GB/epoch 的无界泄漏，**P0**）；
-> ② `validate()` 改为流式累计（消除每 epoch ~9 GB 的高水位，**P1**）；
-> ③ 续训后 `del ck`（释放常驻的 checkpoint state_dict）。
+> ✅ **代码修复已落地（5 处，本次修改）**：
+> ① `trainer.py`：`itertools.cycle` → `_endless`（消除 **≈9.4 GB/epoch 无界泄漏**，**P0**）；
+> ② `trainer.py`：`validate()` 流式累计（消除每 epoch **9 GB** 高水位，**P1**）；
+> ③ `trainer.py`：续训后 `del ck`（释放常驻的 checkpoint state_dict）；
+> ④ `scripts/14_calibrate_thresholds.py`：流式累计（消除 **≈47 GB**，收尾 1/5 步）；
+> ⑤ `src/evaluation/evaluate.py`：同上（消除 **≈47 GB**，收尾 2/5 步）。
 > 重启训练进程即生效（Python 不会热加载）。
 
 ---
@@ -336,14 +338,39 @@ state_dict），避免整份权重被函数作用域一直引用到训练结束�
 4. **不要**优先降 `patch_size`：`preprocess.yaml → inference.patch` 是 96³，训练 patch 必须与推理一致，不一致会显著掉点；
 5. **单卡不要设 `CUDA_VISIBLE_DEVICES=1`**（会把唯一的卡隐藏掉，`torch.cuda.is_available()` 变 False）。
 
-### 同型但**未**修改：两个评估脚本
+### 方案 A4（**根治**）· 已应用到收尾评估的两个脚本
 
-`scripts/14_calibrate_thresholds.py:135-136` 与 `src/evaluation/evaluate.py:118` 用的是和
-`validate()` **修复前**完全一样的写法（把整份 `probs` / `gts` 收进 list 再扫阈值）。
-它们与训练无关、只在收尾评估时跑一次，但 val = 666 时同样会打 **~9 GB** 的瞬时高水位。
+**这一处比 A2 严重一个数量级**，必须单独说明：
 
-- 若容器内存充裕（≥32 GB 且没有别的进程）→ 可以先不动；
-- 若 `FOLDS="0" bash scripts/16_finalize.sh` 阶段被杀 → 需要把这两处也改成流式累计（改法同方案 A2）。
+`scripts/14_calibrate_thresholds.py`（`16_finalize.sh` 的 **1/5 步**）与
+`src/evaluation/evaluate.py`（**2/5 步**）用的是和 `validate()` 修复前同型的写法，
+**但它们收集的是全图体积，不是 patch**：
+
+```163:166:glioma_track4/src/inference/sliding.py
+    seg_roi = (acc / wacc.clamp_min(1e-6))[0, :, :d, :h, :w].float()
+    seg_prob = torch.zeros((2, vol.shape[1], vol.shape[2], vol.shape[3]), device=dev)
+    seg_prob[:, off[0]:off[0] + d, off[1]:off[1] + h, off[2]:off[2] + w] = seg_roi
+    seg_prob = seg_prob.cpu().numpy()
+```
+
+即 `res["seg"]` 被**贴回原尺寸** `(2, D, H, W)`；`make_targets(...)` 同尺寸。
+
+| 量 | 值 | 依据 |
+|---|---|---|
+| 单例 full-volume `vol`（4 通道） | 71 MB | `dataset.py:649` 注释"避免每例全量载入 71MB" |
+| 单例 `res["seg"]` | ≈35.5 MB | `2 × D×H×W × 4B` |
+| 单例 `gt` | ≈35.5 MB | 同上 |
+| **单例 probs + gts** | **≈71 MB** | |
+| `14_calibrate_thresholds.py`（`--limit 0` = 全 666 例） | **≈47 GB** | 32 GB 容器**死在约 380 例处** |
+| `evaluate.py`（同样全 666 例） | **≈47 GB** | 同上 |
+
+> 结论：**32 GB 容器下，`16_finalize.sh` 的 1/5 与 2/5 步都会必然 OOM** ——
+> 训练就算跑完了，收尾也拿不到指标。所以这两处和 A/A2 一样是**必修项**。
+
+改法与 A2 完全一致（流式累计 → O(1) 常驻），并已验证**与旧结果逐位等价**
+（直接用真实模块 `src.evaluation.evaluate` 的 `_accumulate` / `_best_from_stats`
+对同一批随机数据跑，旧 `_thr_scan` 与新实现的阈值与 Dice 完全相同）。
+`_thr_scan` 已随之移除（全仓仅此一处引用）。
 
 ### 推荐顺序
 
@@ -437,6 +464,10 @@ bash scripts/09_export_submission.sh --verify
 - **判断**：`torch.load(...)["epoch"]` 是 **0 基**，`epoch: 0` = 第 1 轮已跑完。
 - **续训**：**重跑同一条命令**（同 `CONFIG`、同 tag），自动从 `last.pth` 的 `epoch+1` 开始；代价是 OneCycle 会重新 warmup。
 - **OOM 主因（已修）**：`trainer.py` 原来的 `itertools.cycle` 会**永久缓存每个 batch**，而 special 的 DataLoader 长度是 50 万 → **约 9.4 GB/epoch 的单调泄漏**，与 epoch 数线性相关。
-- **OOM 帮凶（已修）**：`validate()` 每个 epoch 把全部 val 概率体+真值体留在内存 → 666 例 ≈ **9 GB 瞬时高水位**。
-- **解决**：`itertools.cycle` → `_endless`（方案 A）、`validate` 流式化（方案 A2）、`del ck`（方案 A3）。
+  实测证实：迭代 200 次（每 batch 1 MB）后，`itertools.cycle` 常驻 **200.1 MB**，`_endless` 常驻 **1.0 MB**（200×）。
+- **OOM 帮凶一（已修）**：`validate()` 每个 epoch 把全部 val 概率体+真值体留在内存 → 666 例 ≈ **9 GB 瞬时高水位**。
+- **OOM 帮凶二（已修，比前者大一个数量级）**：收尾的 `14_calibrate_thresholds.py` / `evaluate.py`
+  收集的是**全图体积**（≈71 MB/例）→ 666 例 ≈ **47 GB**，32 GB 容器**必然在收尾阶段 OOM**。
+- **解决**：`itertools.cycle` → `_endless`（方案 A）、`validate` 流式化（A2）、`del ck`（A3）、
+  两个评估脚本流式化（A4）。
   `train20_lowmem` 之类的降配**只能延缓、且降 `batch_size` 会加速泄漏**（steps/epoch 翻倍）。

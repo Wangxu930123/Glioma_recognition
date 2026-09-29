@@ -235,11 +235,11 @@ def _is_excluded(series) -> bool:
     return any(tok in text for tok in _EXCLUDED)
 
 
-def recover_study(study: Study) -> Study:
+def recover_study(study: Study, allow_excluded: bool = False) -> Study:
     """用体素统计给"认不出模态"的序列重贴模态；挑不出就原样返回。
 
     与 `data.modality_fallback.recover_study` 的关系：那个靠**表**，这个靠**体素**。
-    两者互不依赖 —— 表匹配不上时这一步仍能生效（这正是本次修复的要点）。
+    两者互不依赖 —— 表匹配不上（或表也判不出模态）时这一步仍能生效。
 
     赋值方式：把 ``Series.modality`` 换成 ``T1CE`` / ``T2`` / ``FLAIR``，
     这三个词都能被 `series_selector.guess_modality` 正确识别；
@@ -248,6 +248,12 @@ def recover_study(study: Study) -> Study:
     采用**全局贪心的一对一指派**：一路序列只能是一个模态，按概率降序占用，
     避免"先到先得"在撞车时白丢一路（如真值 T1CE/T2/FLAIR 被判成 T2/T2/FLAIR 时，
     第三个还能靠次优标签救回来）。
+
+    ``allow_excluded=False``（默认）跳过表里明写 ``其他``/``正常``/``平扫`` 的序列
+    （那是**权威排除**，猜错比留空更糟）。但实测官方验证集上有**整例序列全被标成
+    `其他`** 的情况 —— 此时"不猜"等于**必然 0 分**。所以 `series_selector.select`
+    会在第一遍无果后再调一次 ``allow_excluded=True``（把权威排除也纳入猜测），
+    由 0.5 的置信度门槛兜住乱猜。
     """
     from data.series_selector import guess_modality                   # 局部导入：避免循环
 
@@ -257,7 +263,7 @@ def recover_study(study: Study) -> Study:
     for series in study.series:
         if guess_modality(series.modality) is not None:
             continue                                                  # 原描述已能用 → 不动
-        if _is_excluded(series):
+        if _is_excluded(series) and not allow_excluded:
             skipped += 1
             continue
         try:

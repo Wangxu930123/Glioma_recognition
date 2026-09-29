@@ -49,31 +49,55 @@ def _zscore(vol: np.ndarray, clip: tuple[float, float] = (0.5, 99.5)) -> np.ndar
     return ((x - m) / (s if s > 1e-6 else 1.0)).astype(np.float32)
 
 
+def _any_series_ref(study: Study):
+    """该 Study 里**任意一路有影像**的序列（几何参考用）；没有则 ``None``。
+
+    用途：4 个通道一路都填不上时（整例序列被数据信息表标成 `其他`，或只有 DWI/ADC/SWI），
+    公共网格仍需要一个参考几何 —— **几何与模态无关**，任意一路序列的 affine/shape
+    都能把网格建出来，掩膜也才有地方重采样。
+    """
+    for s in (getattr(study, "series", None) or ()):
+        if getattr(s, "image", None) is not None and getattr(s, "affine", None) is not None:
+            return s
+    return None
+
+
 def build_volume(study: Study, cfg: Goal5Config) -> PreparedVolume:
     """把 ``Study`` 归一化到 1mm 公共网格，返回多通道体积。
 
+    4 个通道**一个都填不上**时不再抛错（**全放开口径**）：改为"全零通道 + 借任意一路
+    序列的几何"，``missing`` 会把"四个通道全缺"暴露出来（`task.py` 会转成
+    ``context.warnings``），不静默。
+
+    ⚠️ 为什么必须这样（这是一次真实"整批评测作废"的根因）：
+    本文件此前是 `tasks/_common/volume.py` 的**早期副本**，那份已经改成全放开口径、
+    这份还保留着硬失败 —— 只要**一例**检查的序列全被表标成 `其他`（或没有目标模态），
+    这里就抛 `ValueError`；而 `core/runner.py::_run_streaming` 对整批只包了一层 try
+    （**没有 per-case 容错**）→ staging 被 rmtree、**777 例答案全部作废**。
+    审计要求两份实现**同源**，这里与 `tasks/_common/volume.py` 对齐。
+
     Raises:
-        ValueError: 该 Study 没有任何可用影像（规范 §9.1：属**不可降级**输入错误）。
+        ValueError: 该 Study **连一路影像都没有**（规范 §9.1：不可降级输入错误）。
+            注意这与"没有目标模态"是两回事：后者现在会全零通道照走。
     """
     picked = select_series(study, CHANNEL_ORDER)
     if not picked:
-        # 与 tasks/_common/volume.py 保持同一口径：报错要能自证"看到了什么序列"，
-        # 否则只能看到一句"无任何可用序列"，无法判断是命名问题还是数据缺模态。
-        seen = [(s.series_uid, s.modality) for s in list(study.series)[:6]]
-        from data.modality_fallback import describe_sources
+        ref = _any_series_ref(study)
+        if ref is None:
+            seen = [(s.series_uid, s.modality) for s in list(study.series)[:6]]
+            from data.modality_fallback import describe_sources
 
-        raise ValueError(
-            f"study {study.accession_number!r} 无任何可用序列"
-            f"（共 {len(study.series)} 条；uid/描述前几条={seen}）。"
-            f"若 uid 是哈希或 DICOM UID，说明序列类型没读到："
-            f"确认数据根下有 SeriesType.xlsx 或同名 .json sidecar"
-            f"（已自动尝试转模态识别："
-            f"{describe_sources([s.source_path for s in study.series])}）"
-        )
-
-    # 1) 选参考网格：优先 1mm 附近的模态，且必须在实际存在的序列中选择
-    ref_key = next((k for k in _REF_PRIORITY if k in picked), next(iter(picked)))
-    ref = picked[ref_key]
+            raise ValueError(
+                f"study {study.accession_number!r} 没有任何可用影像"
+                f"（共 {len(study.series)} 条；uid/描述前几条={seen}）。"
+                f"注意：**只有 `其他` 序列 / 只有 DWI 的检查不算这一类**，"
+                f"那种情况会全零通道照走。"
+                f"（已自动尝试转模态识别："
+                f"{describe_sources([s.source_path for s in study.series])}）"
+            )
+    else:
+        ref_key = next((k for k in _REF_PRIORITY if k in picked), next(iter(picked)))
+        ref = picked[ref_key]
     grid_shape, grid_affine = target_grid(ref.image.shape, ref.affine,
                                           tuple(cfg.common_spacing))
 

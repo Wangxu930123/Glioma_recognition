@@ -106,7 +106,14 @@ def select(study: Study, wanted: Iterable[str]) -> dict[str, Series]:
     # 缺了它，Goal5 的输入通道会全零、掩膜退化写入参考序列 → 该例分割必然 0 分。
     from data.voxel_modality import recover_study as recover_by_voxels
 
-    return _select_picked(recover_by_voxels(study), wanted)
+    out = _select_picked(recover_by_voxels(study), wanted)
+    if out:
+        return out
+    # 最后一遍：连"权威排除（表里明写 `其他`/`正常`/`平扫`）"的序列也允许猜。
+    # 实测验证集上存在**整例序列全被标成 `其他`** 的情况 —— 此时尊重"权威排除"就等于
+    # 必然 0 分（Goal5 输入通道全零、掩膜退化）。由体素判别的 0.5 置信门槛兜住乱猜，
+    # 猜错的期望也高于必得 0 分。
+    return _select_picked(recover_by_voxels(study, allow_excluded=True), wanted)
 
 
 def select_first(study: Study, wanted: Iterable[str]) -> Series | None:

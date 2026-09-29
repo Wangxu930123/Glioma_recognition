@@ -129,10 +129,13 @@ python3 -m src.training.trainer --config train20 --fold 0 --tag g4_fold0 --no-re
 PRETRAINED=checkpoints/g4_fold0/best.pth CONFIG=train20 bash scripts/03_train.sh 0
 ```
 
-> **动 `last.pth` 之前先备份**：
-> ```bash
-> cp -v checkpoints/g4_fold0/last.pth checkpoints/g4_fold0/last.pth.ep$(python3 -c "import torch;print(torch.load('checkpoints/g4_fold0/last.pth',map_location='cpu',weights_only=False).get('epoch'))")
-> ```
+**动 `last.pth` 之前先备份**：
+
+```bash
+cd /2026aicompetition/workspace/dcs/glioma_track4
+EP=$(python3 -c "import torch;print(torch.load('checkpoints/g4_fold0/last.pth',map_location='cpu',weights_only=False).get('epoch'))")
+cp -v checkpoints/g4_fold0/last.pth "checkpoints/g4_fold0/last.pth.ep${EP}"
+```
 
 ---
 
@@ -450,7 +453,9 @@ bash scripts/09_export_submission.sh --verify
 **OOM**
 
 - [ ] 已分型：主机 RAM（`Killed`/137）还是 GPU（`CUDA out of memory`）
-- [ ] 代码侧已确认：`grep -n "itertools.cycle" src/training/trainer.py` **只出现在注释里**
+- [ ] 代码侧已确认：`import itertools` 已删除，且真实代码里没有 `itertools.*` ——
+      ⚠️ **别用 `grep -n "itertools.cycle"` 判断**：它会把 `_endless` 的 **docstring** 也算进去，
+      给出"残留 1 行"的**误报**。用 AST 判定（见 `MIGRATE_AND_RESUME_GUIDE.md` §2）
 - [ ] 代码侧已确认：`grep -n "def _endless" src/training/trainer.py` 有定义，且两处 `cycle` 已被替换
 - [ ] 修复后 RSS **不再随 epoch 单调爬升**（每 epoch 不再 +9.4 GB）
 - [ ] 验证期不再出现 ~9 GB 的瞬时尖峰（`validate` 已流式化）

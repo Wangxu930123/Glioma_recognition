@@ -75,14 +75,33 @@ cd "$NEW"
 echo -n "trainer._endless（应为 3）        : "; grep -c "_endless" src/training/trainer.py
 echo -n "evaluate._best_from_stats（应≥3） : "; grep -c "_best_from_stats" src/evaluation/evaluate.py
 echo -n "阈值标定 n_used（应≥2）           : "; grep -c "n_used" scripts/14_calibrate_thresholds.py
-echo -n "残留的 itertools.cycle 代码行     : "
-grep -n "itertools.cycle" src/training/trainer.py | grep -v -E ':\s*(#|")' | wc -l
+
+# ⚠️ 判断"代码里还有没有 itertools.cycle"**不能只用 grep** ——
+#    grep 会把**注释和文档字符串**一起数进去（`_endless` 的 docstring 里就写了一次），
+#    于是你会看到一个"残留 1 行"的**误报**。用 AST 只看真实代码：
+python3 - <<'PY'
+import ast, pathlib
+src = pathlib.Path("src/training/trainer.py").read_text(encoding="utf-8")
+t = ast.parse(src)
+hits = [n.lineno for n in ast.walk(t)
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+        and n.value.id == "itertools"]
+imps = [n.lineno for n in ast.walk(t)
+        if isinstance(n, ast.Import) and any(a.name == "itertools" for a in n.names)]
+print("真实代码里引用 itertools.* 的行 :", hits or "无 ✓")
+print("是否还有 import itertools       :", "有（异常）" if imps else "无 ✓")
+PY
 ```
 
 | 输出 | 判定 |
 |---|---|
-| `3 / ≥3 / ≥2 / 0` | ✅ 修复齐全，可以继续 |
-| 任一为 `0` | ❌ 新代码缺该修复 → 按 §3.4 从旧目录（或你本地）覆盖这几个文件 |
+| `_endless=3`、`_best_from_stats≥3`、`n_used≥2`、`itertools.* = 无 ✓`、`import itertools = 无 ✓` | ✅ 修复齐全，可以继续 |
+| 前三项任一为 `0` | ❌ 新代码缺该修复 → 按 §3.4 从旧目录（或你本地）覆盖这几个文件 |
+| `itertools.*` 非空 / `import itertools` = 有 | ❌ 拿到的还是旧版 `trainer.py` → 按 §3.4 覆盖 |
+
+> **更硬的一条自证**：正常情况下 `import itertools` 已被删除，所以**任何**真实代码路径
+> 只要还调用 `itertools.cycle`，启动时就会 `NameError: name 'itertools' is not defined`，
+> 根本跑不起来。能看到 `断点续训：epoch N/20` 且持续输出 step 日志 = 它不在执行路径里。
 
 > 💡 **根治办法**：把你本地这几个文件的改动 `git add` + `commit` + `push`，以后无论怎么拉都不会丢。
 
@@ -147,6 +166,22 @@ md5sum "$KEEP/data/folds.json" "$KEEP/data/manifest.json" "$KEEP/checkpoints/g4_
 
 # ★ 闸门：这三个必须在，否则不许往下走
 ls -l "$KEEP/checkpoints/g4_fold0/last.pth" "$KEEP/data/folds.json" "$KEEP/data/manifest.json"
+
+# ★★ 闸门二：确认拿到的是**真权重**，不是 **Git LFS 指针**
+#    两者大小差 5 个数量级（几十 MB vs ~130 字节）；指针喂给 torch.load 会报
+#    `pickle.UnpicklingError: invalid load key, 'v'`（'v' 就是 "version ..." 的首字母）。
+python3 - "$KEEP/checkpoints/g4_fold0/last.pth" <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); n = p.stat().st_size; head = p.read_bytes()[:8]
+print(f"大小={n/1e6:.3f} MB | 前8字节={head}")
+if head.startswith(b"version "):
+    raise SystemExit("✗ 这是 Git LFS 指针 → 见 §8 故障 ⑩")
+if not (head.startswith(b"PK") or head.startswith(b"\x80\x02")):
+    raise SystemExit("✗ 不是 torch 权重（既非 zip 也非 legacy pickle）")
+if n < 1_000_000:
+    raise SystemExit("✗ 文件过小，疑似拷贝中断")
+print("✓ 是真权重")
+PY
 ```
 
 ### 3.3 顺便把"旧目录里的代码"也留一份（回滚 + 补修复都用它）
@@ -457,6 +492,80 @@ echo "✅ 已在后台续训；监控：tail -f logs/train_fold0.log"
 | ⑦ | 两个进程同时跑、结果互相覆盖 | 旧目录的进程没停 | §3.1 先 `pkill`，再启动新的 |
 | ⑧ | 显存/内存被挤爆 | 共卡跑着路线 B | 只保留一个训练进程；或按 `OOM_AND_RESUME_GUIDE.md` §5 降配 |
 | ⑨ | 预处理很慢、缓存像没生效 | `CACHE_DIR` 没设或目录被删 | `ls /2026aicompetition/workspace/cache \| head`；`paths.yaml` 默认已指向它，别删 |
+| ⑩ | `torch.load` 报 **`pickle.UnpicklingError: invalid load key, 'v'`** | 拿到的是 **Git LFS 指针**，不是真权重（`'v'` = `version ...` 首字母；文件只有 ~130 字节） | `find /2026aicompetition/workspace -name '*.pth' -size +1M -printf '%10s %p\n' \| sort -rn` 找真身 → `rsync` 覆盖；或 `git lfs pull`。**根治**：`git rm --cached -r glioma_track4/checkpoints` 让权重不再入库 |
+| ⑪ | `torch.load` 报 `invalid load key, '<'` / `{` / 其他字符 | 拷错了文件（拷到 HTML/JSON/脚本） | 按 §8 ⑩ 的 `find` 对照大小，重新 `rsync -avc` |
+| ⑫ | `torch.load` 报 `PytorchStreamReader failed` / `central directory not found` | 权重是 zip 格式但**被截断** | 重拷（`rsync -avc`），核对 md5 |
+| ⑬ | 全盘都找不到真权重（只有指针） | 训练在已销毁的容器里跑的，真文件从未搬出 | 先走 **§8.1 三条补救路线**；确认都没有才重训 |
+
+**判定真伪一行搞定**（比 `torch.load` 快得多，也不需要 torch）：
+
+```bash
+python3 -c "import pathlib,sys;p=pathlib.Path(sys.argv[1]);print(p.stat().st_size,'字节',p.read_bytes()[:8])" checkpoints/g4_fold0/last.pth
+```
+
+期望：`38765432 字节 b'PK\x03\x04'`（几十 MB + `PK`）。若看到 `130 字节 b'version '` → 就是 ⑩。
+
+### 8.1 权重丢了 / 不可读时，怎么补救（按优先级）
+
+#### 路线 1（最好）：从私有存储里"导出过的副本"恢复
+
+`09_export_submission.sh` 用的是 **`cp -f "$src" "$dst_dir/$n"`** —— 也就是说
+`/2026aicompetition/workspace/checkpoint/<goal>/model.pt` **是 `best.pth` 的字节级副本**，
+`model` / `model_ema` / `epoch` / `best_metric` / `thresholds` / `cls_spec` 全都在。
+**只要你曾经导出过一次，真权重就还在那里**（导出是复制，不是移动，所以原文件丢了它也不受影响）。
+
+```bash
+# ① 看有哪些、多大（几十 MB 才是真的）
+ls -l /2026aicompetition/workspace/checkpoint/*/
+
+# ② 挑一个验明正身（同时看它是不是正式权重、不是演练）
+EXPORTED=/2026aicompetition/workspace/checkpoint/goal1_authenticity/model.pt
+python3 - "$EXPORTED" <<'PY'
+import sys, torch
+ck = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+print("epoch =", ck.get("epoch"), "| best_metric =", ck.get("best_metric"))
+print("cls_spec 头数 =", len(ck.get("cls_spec") or []))
+print("special_head =", any(k.startswith("special_head") for k in ck["model"]),
+      "| embed_head =", any(k.startswith("embed_head") for k in ck["model"]))
+print("含 optimizer  =", "optimizer" in ck)
+PY
+
+# ③ 当作断点用：放到 last.pth 位置即可（缺 optimizer 会自动跳过）
+cd /2026aicompetition/workspace/dcs/glioma_track4
+mkdir -p checkpoints/g4_fold0
+cp -v "$EXPORTED" checkpoints/g4_fold0/last.pth
+CONFIG=train20 bash scripts/03_train.sh 0
+```
+
+⚠️ 三个注意点：
+
+- **导出的 `best.pth` 没有 `optimizer`** → 只恢复 `model`/`model_ema`/`epoch`/`best_metric`，
+  AdamW 从零起（本来 `OneCycleLR` 也会 re-warm，可接受）。
+- 它的 `epoch` 是"**选出 best 的那一轮**"，可能早于实际训练停下的轮次 → 会多训几轮，
+  **不会泄漏**（还是同一份训练集）。
+- **若 `epoch` 只有 1~2，那是演练/冒烟权重**（`--verify` 查不出"训没训过"），别当正式起点。
+
+#### 路线 2：路线 B（`glioma_goals`）的单任务权重，可作热启动
+
+```bash
+find /2026aicompetition/workspace/dcs -path '*glioma_goals*' -name 'best.pth' -size +1M \
+     -printf '%10s  %p\n' 2>/dev/null | sort -rn
+# 用它热启动（只加载权重，epoch 从 0 计）
+PRETRAINED=<上面某个 best.pth> CONFIG=train20 bash scripts/03_train.sh 0
+```
+
+#### 路线 3：确实都没有 → 重训，并立刻做两件事防止再丢
+
+```bash
+cd <仓库根>
+# ① 权重彻底移出 git：权重只走私有存储 + rsync（规范也是这么要求的）
+git rm --cached -r glioma_track4/checkpoints 2>/dev/null || true
+grep -n 'lfs' .gitattributes 2>/dev/null        # 若 *.pth 被 LFS 接管，删掉那一行
+git commit -m "chore: 权重不入库，改由私有存储/rsync 传递" && git push
+
+# ② 每个 epoch 结束后 rsync 一份到私有存储（引擎每轮都会写 last.pth）
+rsync -avc checkpoints/g4_fold0/ /2026aicompetition/workspace/_ckpt_backup/g4_fold0/
+```
 
 ---
 

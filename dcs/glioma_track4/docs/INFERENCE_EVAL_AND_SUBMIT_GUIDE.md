@@ -174,6 +174,80 @@ bash /2026aicompetition/workspace/dcs/glioma_track4/scripts/06_platform_serve.sh
 
 **结果异常时对照**（见 §5 排雷表）。
 
+### 4b. 手动模拟平台测评（两个终端 + curl，不烧测评次数）
+
+> 平台测评用的就是这套 HTTP 协议。先手动走一遍 = 零成本彩排。
+> 下方流程已修正五个已知坑（响应体、ID 复用、路径、精度、ID 记录），可直接照抄。
+
+**终端 1 · 启动系统**（回调地址见容器实例页面上方，逐字复制）：
+
+```bash
+cd /2026aicompetition/workspace/dcs/glioma_track4
+CALLBACK_URL='http://<容器实例页面上的完整地址>/api/competition/inference/callback/' \
+  nohup bash scripts/06_platform_serve.sh > logs/serve.log 2>&1 &
+sleep 30
+# 确认三行（/health 是假信号——它只查环境变量非空；真判定是「启动预检通过」）
+grep -E "启动预检通过|✓ 回调地址|推理权重" logs/serve.log | head -5
+curl -s http://127.0.0.1:8000/health
+```
+
+**终端 2 · 发起**（ID 每次换新；`dataset_path` 换成真实挂载）：
+
+```bash
+EID="$(date +%m%d%H%M%S)$RANDOM"          # 天然不重复的 evaluation_id
+echo "request_id=$EID-req  evaluation_id=$EID   ← 记下来，/status 用前者、答案目录用后者"
+
+curl -X POST http://127.0.0.1:8000/call \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"request_id\":\"$EID-req\",
+    \"team_id\":\"2054451790241292288\",
+    \"track_code\":\"2eaf6e36583b4d06af0f4582220956d0\",
+    \"input\":{
+      \"evaluation_id\":\"$EID\",
+      \"dataset_path\":\"/2026aicompetition/datasets/verification/original\"
+    }
+  }"
+```
+
+**响应体**（修正后会直接告诉你下一步）：
+
+```json
+{"code":200,"msg":"accepted","request_id":"...","evaluation_id":"...",
+ "status_url":"/status/<request_id>",
+ "hint":"推理在后台执行：GET /status/<request_id> 轮询到 done 或 failed 才有结论"}
+```
+
+**终端 3（或稍后）· 轮询到有结论** —— ⚠️ **200 只是"已受理"**，推理在后台线程，
+失败的报错只在 `/status` 和日志里：
+
+```bash
+curl -s http://127.0.0.1:8000/status/$EID-req
+#   {"status":"running"}   → 在跑（777 例约 1.5~2 小时），期间可看进度：
+#     grep -c "完成" /2026aicompetition/workspace/logs/serving.out
+#   {"status":"done","out":"..."}      → 成功，验收 ↓
+#   {"status":"failed","error":"..."}  → 失败，error 就是原因（对照 §5/§ZERO_SCORE_TROUBLESHOOT）
+```
+
+**done 后验收三件事**：
+
+```bash
+ls /2026aicompetition/workspace/answer/$EID/ | head        # 答案目录
+find /2026aicompetition/workspace/answer/$EID -name prediction.json | wc -l
+grep -o '"callback":"[^"]*"' /2026aicompetition/workspace/logs/serving.jsonl | tail -3
+#   "callback":"ok" 才是真的闭环送达；FAILED_no_callback_url / error:HTTP... → §3 重配
+```
+
+**这套流程修掉的五个坑**：
+
+| # | 坑 | 修法（代码 / 流程各一半） |
+|---|---|---|
+| 1 | **`/call` 200 被误读成"测评成功"** —— 失败只出现在后台日志 | 代码：响应体现在带 `status_url` + `hint`；流程：必须轮询 `/status` 到 done/failed |
+| 2 | **evaluation_id 复用 → 新旧答案静默混写**同一目录 | 代码：`/call` 受理前拦截（非空目录直接 400，附清理命令）；流程：`EID="$(date ...)…"` 天然不重复 |
+| 3 | `dataset_path` 填了占位路径 | 流程：发之前 `ls` 一下真实挂载；400 会即时报错，无害但别浪费一轮 |
+| 4 | **`evaluationId` 数值化超 JS 安全整数（2^53-1）被平台截断** → 平台对不上 | 代码：只在安全范围内转数值，超范围保持字符串；流程：evaluation_id 控制在 **15 位内**最稳 |
+| 5 | 两个 ID 混淆（`request_id` 查状态、`evaluation_id` 是答案目录名） | 流程：发的时候 `echo` 打印并记下来；代码：响应体两个字段都回显 |
+
 ---
 
 ## 5. 排雷表（按"静默失败"风险排序 —— 测评结果不对时先查这些）
@@ -229,6 +303,9 @@ bash /2026aicompetition/workspace/dcs/glioma_track4/scripts/06_platform_serve.sh
 | 验脚本没被 CRLF 污染 | `bash -n scripts/06_platform_serve.sh` |
 | 补依赖 | `bash scripts/00_setup_env.sh --mode system` |
 | 容器内探活 | `curl -s http://127.0.0.1:8000/health` |
+| **手动发起测评**（不烧次数） | §4b —— 生成新 `EID` → `POST /call` → 轮询 `/status/$EID-req` 到 done |
+| 查一次请求的状态 | `curl -s http://127.0.0.1:8000/status/<request_id>` |
+| 回调闭环确认 | `grep -o '"callback":"[^"]*"' /2026aicompetition/workspace/logs/serving.jsonl \| tail -3` |
 | 看答案（跑完后） | `ls /2026aicompetition/workspace/answer/<evaluation_id>/` |
 | 收尾（**训练结束后才许跑**） | `SKIP_MOCK=1 FOLDS="0" bash scripts/16_finalize.sh` |
 

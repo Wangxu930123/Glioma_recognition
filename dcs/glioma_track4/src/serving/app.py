@@ -142,6 +142,20 @@ def call(req: CallRequest, background: BackgroundTasks):
                    request_id=request_id, error=f"dataset_path 不存在: {dataset_path}")
         return {"code": 400, "msg": f"dataset_path 不存在: {dataset_path}"}, 400
 
+    # ⚠️ evaluation_id 复用会让新答案与旧答案**静默混写**进同一目录（answer_dir 是
+    # exist_ok=True，不报错）—— 旧运行留下的 prediction.json / 掩膜会和新结果混在一起，
+    # 平台取到的可能是陈旧答案。必须在**受理前**拒绝，而不是事后翻日志才发现。
+    _ans_root = PATHS.get("answer_root") or "/2026aicompetition/workspace/answer"
+    _ans = os.path.join(_ans_root, str(evaluation_id))
+    if os.path.isdir(_ans) and os.listdir(_ans):
+        LOGGER.log(phase="test", mode="inference", request_id=request_id,
+                   error=f"evaluation_id 已存在且非空: {_ans}")
+        return {
+            "code": 400,
+            "msg": f"evaluation_id 已存在且非空: {_ans} —— 每次测评必须换新的 "
+                   f"evaluation_id；确认旧答案不要了可先 rm -rf '{_ans}' 再重发",
+        }, 400
+
     out_dir = answer_dir(evaluation_id)
     _JOBS[request_id] = {"status": "running", "evaluation_id": evaluation_id, "out": out_dir}
     LOGGER.log(phase="test", mode="inference", data_source=data_source_tag(dataset_path, phase="test"),
@@ -149,7 +163,18 @@ def call(req: CallRequest, background: BackgroundTasks):
     print(f"[serving] /call 受理 request_id={request_id} evaluation_id={evaluation_id} "
           f"dataset={dataset_path}", flush=True)
     background.add_task(run_job, request_id, evaluation_id, dataset_path, out_dir)
-    return {"code": 200, "msg": "accepted", "request_id": request_id}
+    # ⚠️ 200 只是「已受理」：推理在后台线程执行（平台 /call 5s 超时逼出来的设计）。
+    # 响应体里把「用什么查、去哪看」直接告诉调用方 —— 否则「受理成功」很容易被
+    # 误读成「测评成功」，而失败的报错只出现在后台日志里（踩过：/call 200 后
+    # 权重 LFS 指针炸了，调用方全程不知情）。
+    return {
+        "code": 200, "msg": "accepted",
+        "request_id": request_id,            # ← /status 查询用的 key
+        "evaluation_id": evaluation_id,      # ← 答案目录名 answer/<evaluation_id>/
+        "status_url": f"/status/{request_id}",
+        "hint": "推理在后台执行：GET /status/<request_id> 轮询到 done（成功）"
+                "或 failed（看 error 字段）才有结论",
+    }
 
 
 @app.get("/status/{request_id}")
@@ -189,7 +214,13 @@ def callback(request_id: str, evaluation_id: str, out_dir: str) -> None:
     body = {"request_id": request_id, "evaluationId": evaluation_id,
             "evaluation_id": evaluation_id, "predPath": out_dir}
     try:
-        body["evaluationId"] = int(evaluation_id)          # 规范示例为数值
+        n = int(evaluation_id)
+        # 规范示例为数值，但**只在 JS 安全整数范围内才转**（Number.MAX_SAFE_INTEGER
+        # = 2^53-1 ≈ 9.0e15）：超出后转成 JSON 数值会被平台的 JS 侧截断成**另一个数**，
+        # 平台就对不上这次测评。超范围时保持字符串 —— body 里本就有同名冗余字段，
+        # 字符串形式对任何平台实现都安全。
+        if abs(n) <= 2 ** 53 - 1:
+            body["evaluationId"] = n
     except (TypeError, ValueError):
         pass
     for attempt in range(3):

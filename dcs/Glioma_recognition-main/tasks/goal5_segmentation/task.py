@@ -75,6 +75,15 @@ class Goal5Task(StudyTask[Goal5Result]):
 
         core_bin, flair_bin = clean_pair(core_p, flair_p, _T())
 
+        # ---- 诊断：把"掩膜为空"的成因拆开（概率不够 vs 后处理吃掉了）----
+        # 这两种成因的修法完全不同，而只看 ``core_voxels=0`` 无法区分：
+        #   · ``core_p.max() < thr`` → 模型输出本身就不够高（通道零占位 / 权重 / 预处理）
+        #   · ``core_p.max() >= thr`` 但终值为 0 → **后处理**（阈值化后的连通域 / 最小体素 /
+        #     形态学桥接）把它吃掉了，见 postprocess.clean_mask
+        _thr = tuple(float(t) for t in self._loaded.thresholds)
+        _core_pre = int(np.count_nonzero(core_p > _thr[0])) if _thr else 0
+        _flair_pre = int(np.count_nonzero(flair_p > _thr[1])) if len(_thr) > 1 else 0
+
         # ---- 逆变换：恢复到各自源序列空间（shape/affine 必须与源图一致）----
         core_mask, core_uid, core_fb = self._restore(
             study, prepared, core_bin, CORE_SOURCE_MODALITIES, context.warnings)
@@ -101,9 +110,18 @@ class Goal5Task(StudyTask[Goal5Result]):
 
         context.diagnostics["goal5"] = {
             "missing_channels": list(prepared.missing),
-            "thresholds": list(self._loaded.thresholds),
+            "thresholds": [round(float(t), 3) for t in self._loaded.thresholds],
+            # 最大概率：**低于阈值**说明模型输出就不够高（不是后处理的问题）
+            "max_probs": [round(float(core_p.max()), 3), round(float(flair_p.max()), 3)],
+            # 阈值以上的体素数（后处理**之前**）：>0 而终值 =0 → 是后处理吃掉的
+            "core_pre_voxels": _core_pre,
+            "flair_pre_voxels": _flair_pre,
             "core_voxels": int(core_mask.sum()),
             "flair_voxels": int(flair_mask.sum()),
+            # 后处理参数（min_tumor_voxels / keep_components / bridge_mm）—— 空掩膜的嫌疑点
+            "postprocess": {"min_tumor_voxels": cfg_pp.min_tumor_voxels,
+                            "keep_components": cfg_pp.keep_components,
+                            "bridge_mm": cfg_pp.bridge_mm},
             "ckpt": self._loaded.ckpt_path,
         }
         return Goal5Result(

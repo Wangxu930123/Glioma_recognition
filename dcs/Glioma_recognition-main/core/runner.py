@@ -28,12 +28,25 @@ _PROGRESS = os.environ.get("GLIOMA_PROGRESS", "").strip().lower() not in {
 
 
 def _diag_brief(context: object) -> str:
-    """一行 goal5 摘要：缺通道 + 两侧掩膜体素数（判断"是否真的救回来了"）。"""
+    """一行 goal5 摘要 —— 目标是**能直接定位"掩膜为空"的成因**。
+
+    格式：``goal5{missing=[…], thr=[…], pmax=[…], core=终值/阈值以上, flair=…}``
+
+    三种空掩膜的成因**修法完全不同**，所以必须分开看：
+
+    * ``missing`` 非空 → 该通道是**零占位**的（数据本身缺这个模态）；
+    * ``pmax`` **低于** ``thr`` → 模型输出就不够高（通道零占位 / 权重 / 预处理问题）；
+    * ``pmax`` 够高，但 ``阈值以上 > 0`` 而 ``终值 = 0`` → **后处理吃掉了**
+      （见 ``tasks/goal5_segmentation/postprocess.py``：连通域保留 / 最小体素 / 形态学桥接）。
+    """
     goal5 = ((getattr(context, "diagnostics", None) or {}).get("goal5")) or {}
     if not goal5:
         return ""
     return (f"goal5{{missing={goal5.get('missing_channels')}, "
-            f"core={goal5.get('core_voxels')}, flair={goal5.get('flair_voxels')}}}")
+            f"thr={goal5.get('thresholds')}, "
+            f"pmax={goal5.get('max_probs')}, "
+            f"core={goal5.get('core_voxels')}/{goal5.get('core_pre_voxels')}, "
+            f"flair={goal5.get('flair_voxels')}/{goal5.get('flair_pre_voxels')}}}")
 
 
 @dataclass(frozen=True)

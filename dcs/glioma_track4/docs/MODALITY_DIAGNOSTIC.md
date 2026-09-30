@@ -876,6 +876,60 @@ ps -o pid,etime,time,stat,rss --no-headers -p "$PID"
 
 关掉逐例进度（日志太长时）：`GLIOMA_PROGRESS=0 ./start.sh`。
 
+### 「有 `完成` 但没有答案」—— 答案在**隐藏的** staging 目录里
+
+**这不是故障，是路径可见性问题。** `OutputWriter` 用**两段式**：
+
+| 阶段 | 路径 | 可见性 |
+|---|---|---|
+| **运行期间** | `<answer_root>/.<evaluation_id>.tmp-<uuid>/<检查号>/…` | ❗ **以 `.` 开头 → 普通 `ls` 看不见** |
+| 全部跑完后 | `<answer_root>/<evaluation_id>/`（staging 被 `rename` 过来） | 这时才可见 |
+
+所以运行中途 `ls /2026aicompetition/workspace/answer/` **是空的**，
+而正式目录要等**全部检查跑完**才出现。
+
+```bash
+WS=/2026aicompetition/workspace
+
+# ① 用 -a 看（关键：隐藏目录）
+ls -la "$WS/answer/"
+
+# ② 找 staging
+ST=$(find "$WS/answer" -maxdepth 1 -type d -name '.*.tmp-*' 2>/dev/null | head -1)
+echo "staging = $ST"
+
+# ③ 已完成例数（应与日志里的 #N 对得上）
+echo -n "已完成: "; find "$ST" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l
+
+# ④ 抽一例看实际产物
+ACC=$(find "$ST" -maxdepth 1 -mindepth 1 -type d | head -1)
+echo "--- $ACC ---"; ls -lR "$ACC"; cat "$ACC/prediction.json"
+```
+
+预期结构：
+
+```text
+<staging>/
+├── <检查号>/
+│   ├── prediction.json
+│   ├── <core_uid>/<core_uid>.nii.gz      ← 核心区掩膜
+│   └── <flair_uid>/<flair_uid>.nii.gz    ← 周围区掩膜
+├── <检查号>/...
+└── duplicate_pairs.jsonl                 ← **只在最后**写
+```
+
+**`完成 Nms` 是在 `write_study()` + `validate_study()` 都成功之后才打印的** ——
+所以那一例的目录必然已经存在。若确实没有，只有三种情况：
+
+| 现象 | 原因 | 处置 |
+|---|---|---|
+| `goal5{core=0, flair=0}` | 掩膜**写出来了但是空的** | 查通道缺失 / 阈值 / 后处理 |
+| 该检查号目录**完全不存在** | 那行"完成"是**别的检查号**的 | 按检查号逐个对 |
+| 进程被 `Ctrl-C` / OOM 杀掉 | staging 被 `rmtree`（**设计如此**：半成品不发布） | 见 §3c 重启；或打开 `GLIOMA_LOADER_TOLERANT=1` 只丢单例 |
+
+**顺带把耗时换算**：`完成 25581ms ≈ 25.6 s/例`，777 例 ≈ **5.5 小时**。
+若平台有时限，按性价比依次调：`tta_flips` 减轴 → 滑窗 `overlap` 0.5→0.3 → `tta_batch` 调大。
+
 ---
 
 ## 3c. 重启 + 确认新代码生效（改过 `data/`、`core/`、`start.sh` 后必做）
@@ -930,6 +984,127 @@ print('日志去重 _LOGGED 存在   =', hasattr(vx, '_LOGGED'), '(期望 True)'
 > ⚠️ **反过来的判据同样有用**：若体素判别行仍是 `（置信 [1.0], 共 N 条序列）`
 > —— 没有 `次优`、没有 `allow_excluded` —— 那说明**跑的还是旧代码**，
 > 这时看到的一切重复/噪声都是已修过的老问题，不必再分析。
+
+---
+
+## 3d. 「`core=0` / `flair=0`」三种成因怎么分
+
+`core=0, flair=0` 意味着**该例分割直接 0 分**，但它有三种**修法完全不同**的成因：
+
+| 成因 | 判据 | 修法 |
+|---|---|---|
+| **① 通道零占位** | `missing` **非空** | 数据本身缺该模态（见 §1f）；模型要能容忍缺模态 |
+| **② 模型输出偏低** | `pmax` **低于** `thr` | 权重 / 预处理不匹配（通道顺序、归一化、权重是否真为训练产物） |
+| **③ 后处理吃掉了** | `pmax` 够高，**阈值以上 > 0** 而**终值 = 0** | 调 `min_tumor_voxels` / `keep_components` / `bridge_mm` |
+
+### 进度行已带全部判据
+
+`[runner] … 完成 Nms goal5{…}` 现在的格式：
+
+```text
+goal5{missing=[], thr=[0.42, 0.55], pmax=[0.99, 0.96], core=1480/1520, flair=3050/3100}
+       ↑ 缺通道     ↑ 阈值           ↑ 最大概率         ↑ 终值/阈值以上
+```
+
+**三种情况一眼可分**（实测格式）：
+
+```text
+① 通道缺 + 概率低   goal5{missing=['t1','t2'], thr=[0.42,0.55], pmax=[0.31,0.08], core=0/0,       flair=0/0}
+② 后处理吃掉        goal5{missing=[],          thr=[0.42,0.55], pmax=[0.97,0.93], core=0/12,      flair=0/25}
+③ 正常              goal5{missing=[],          thr=[0.42,0.55], pmax=[0.99,0.96], core=1480/1520, flair=3050/3100}
+```
+
+### 一个已经能确定的推论
+
+读 `postprocess.clean_mask` 可以确定：**归零只可能发生在「阈值以上体素 < `min_tumor_voxels`(=30)」时**。
+
+```51:57:Glioma_recognition-main/tasks/goal5_segmentation/postprocess.py
+    m = np.asarray(prob) > float(threshold)
+    if not m.any():
+        return m.astype(bool)
+    if bridge_mm > 0:
+        m = _bridge(m, bridge_mm, spacing)
+    m = _largest_components(m, max(1, int(keep_components)))
+    return m if int(m.sum()) >= int(min_voxels) else np.zeros_like(m, dtype=bool)
+```
+
+- `_bridge` 是**形态学闭运算**（先膨胀后腐蚀），数学上满足 `A ⊆ closing(A)` —— **只会增加、不会清空**；
+- `_largest_components` 只会**保留最大的几个**，不会归零；
+- 唯一能归零的是**最后那一行**：`阈值以上体素 < min_tumor_voxels(30)`。
+
+> **所以 `core=0` 几乎必然是「模型输出概率低于阈值」（成因 ②），不是后处理。**
+
+### ⚠️ `missing` **不是**空掩膜的原因 —— 先做这个交叉统计
+
+**常见误判**：看到 `goal5{missing=['t1c','t2','t1'], core=0, flair=0}` 就以为"缺模态导致空掩膜"。
+但表里的覆盖率本来就低（**T1 ≈32%、T2WI ≈31%、T1CE ≈53%**），
+所以 `missing` 里有 `t1`/`t2`/`t1c` 是**常态**。真正的判据是这个**交叉统计**：
+
+```bash
+cd /2026aicompetition/workspace/dcs/GliomaRecognition/dcs/Glioma_recognition-main
+python3 - <<'PY'
+import collections
+import re
+
+cnt, empty = collections.Counter(), collections.Counter()
+pat = re.compile(r"goal5\{missing=(\[[^\]]*\]).*?core=(\d+), flair=(\d+)\}")
+for line in open("logs/start.log", encoding="utf-8", errors="ignore"):
+    m = pat.search(line)
+    if not m:
+        continue
+    key = m.group(1)
+    cnt[key] += 1
+    if m.group(2) == "0" and m.group(3) == "0":
+        empty[key] += 1
+
+print(f"{'missing':<30}{'总数':>6}{'空掩膜':>8}{'空掩膜率':>10}")
+for k, n in cnt.most_common():
+    print(f"{k:<30}{n:>6}{empty[k]:>8}{empty[k] / n:>10.1%}")
+tot, emp = sum(cnt.values()), sum(empty.values())
+print(f"\n合计 {tot} 例，空掩膜 {emp} 例 = {emp / max(1, tot):.1%}")
+PY
+```
+
+| 结果 | 结论 |
+|---|---|
+| 各 `missing` 组合的空掩膜率**都差不多** | ✅ **`missing` 不是原因** —— 问题在模型输出（成因 ②）→ 跑下面的探针确认 `pmax` |
+| 只有"缺 `t1c`"那几组空掩膜率显著更高 | 缺模态是**部分**原因 → 回到 §1f 的模态识别线 |
+| 全组都接近 100% | 模型输出普遍偏低 → 查**权重真伪 / 预处理是否与训练一致** |
+
+**实际数据里已出现决定性反例**（10 例样本）：
+
+| # | `missing` | 实际填上的通道 | core | flair |
+|---|---|---|---|---|
+| 18 | `t1c,t2,t1` | `flair` | **2503** | 2503 ✅ |
+| 19 | `t1c,t2,t1` | `flair`（同上） | **0** | 0 ❌ |
+| **20** | `t2,t1` | **`t1c,flair` 都在** | **0** | **0** ❌ |
+| 23 | `t2,t1` | `t1c,flair` 都在 | 0 | 0 ❌ |
+
+- **#18 vs #19**：同一 `missing`，一个出结果一个不出 → 与 `missing` 无关；
+- **#20/#23**：**两个关键通道都在**却全空 → **直接排除"缺模态"**。
+
+> **反直觉现象（值得警惕）**：#18「只有 `flair` 一个通道」出了 2503 体素，
+> 而 #20/#23/#24「`t1c`+`flair` 都在」却是 0 —— **"通道越全反而越差"**不是自然现象，
+> 更像是**通道顺序 / 归一化与训练不一致**，或**权重与预处理不配套**。
+>
+> 另：#18 的 `core=2503, flair=2503` 完全相等是**设计行为** —— `t1c`/`t1` 都缺时
+> core 那一路退化成"参考序列"（恰好就是那条 FLAIR），与 flair 路撞同一 UID，
+> `task.py` 的守卫把两路统一成同一份掩膜。
+
+### 不重启服务就能诊断：`scripts/probe_goal5.py`
+
+777 例要跑 5.5 小时，重启代价太大 —— 这个探针**独立跑前几例**，不打扰正在运行的进程：
+
+```bash
+cd /2026aicompetition/workspace/dcs/GliomaRecognition/dcs/Glioma_recognition-main
+python3 scripts/probe_goal5.py                                                      # 默认取 3 例
+python3 scripts/probe_goal5.py /2026aicompetition/datasets/verification/original 5
+```
+
+它打印 `missing` / `thr` / `pmax` / `core=终值(阈值以上)` / `flair=…`，
+并**直接给出成因判定**（「概率低于阈值」还是「后处理吃掉了」）+ 每例的 `warnings`。
+
+> 会**占用 GPU**（与正在跑的推理共卡），但只跑几例、几十秒。
 
 ---
 

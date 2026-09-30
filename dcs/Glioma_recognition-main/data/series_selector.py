@@ -104,15 +104,26 @@ def select(study: Study, wanted: Iterable[str]) -> dict[str, Series]:
     # 第三条腿：**表也匹配不上时**用体素统计判模态重挑。
     # 这是唯一不依赖"表里的键与磁盘一致"的兜底 —— 序列描述认不出、序列表对不上时仍能救回通道。
     # 缺了它，Goal5 的输入通道会全零、掩膜退化写入参考序列 → 该例分割必然 0 分。
-    from data.voxel_modality import recover_study as recover_by_voxels
+    from data.voxel_modality import guess_excluded_enabled, recover_study as recover_by_voxels
 
     out = _select_picked(recover_by_voxels(study), wanted)
     if out:
         return out
     # 最后一遍：连"权威排除（表里明写 `其他`/`正常`/`平扫`）"的序列也允许猜。
-    # 实测验证集上存在**整例序列全被标成 `其他`** 的情况 —— 此时尊重"权威排除"就等于
-    # 必然 0 分（Goal5 输入通道全零、掩膜退化）。由体素判别的 0.5 置信门槛兜住乱猜，
-    # 猜错的期望也高于必得 0 分。
+    #
+    # **支持它的事实**：验证集上存在**整例序列全被标成 `其他`** 的情况 —— 此时尊重
+    # "权威排除"就等于必然 0 分（Goal5 输入通道全零、掩膜退化）。
+    #
+    # **反对它的事实（实测后已改为默认关闭）**：
+    #   ① `其他` 序列最可能是定位像 / 非脑之类的**异常序列**，体素判别对这类 OOD 输入会给出
+    #      **概率饱和**（置信 1.0 / 次优 0.0）→ `_MIN_CONF = 0.5` 形同虚设；
+    #   ② `scripts/voxel_consistency.py` 实测的一致率**低于三分类随机水平**。
+    # 把定位像当 T1CE 填进通道，**比留空通道更有害**（留空是训练时见过的"缺失"标记）。
+    #
+    # 所以改成**开关控制**：`GLIOMA_VOXEL_GUESS_EXCLUDED=0` 关闭（`start.sh` 默认关闭）。
+    # 若重训后把一致率测到 >=80%，再设回 `1` 打开。
+    if not guess_excluded_enabled():
+        return {}
     return _select_picked(recover_by_voxels(study, allow_excluded=True), wanted)
 
 

@@ -243,6 +243,29 @@ def _is_excluded(series) -> bool:
     return any(tok in text for tok in _EXCLUDED)
 
 
+def guess_excluded_enabled() -> bool:
+    """是否允许把表里**明写 ``其他``/``正常``/``平扫``**的序列也纳入猜测。
+
+    ``GLIOMA_VOXEL_GUESS_EXCLUDED=0`` 关闭。**库默认开启**（保持既有行为），
+    但 ``start.sh`` 已按实测结论**默认关闭** —— 见下。
+
+    开它的理由：实测验证集上存在**整例序列全被标成 ``其他``** 的情况，
+    此时尊重"权威排除"就等于**该例必然 0 分**（Goal5 通道全零 + 掩膜退化）。
+
+    关它的理由（**实测后改变结论**）：
+
+    1. ``其他`` 序列最可能是定位像 / 非脑之类的**异常序列**，而体素判别对这类 OOD 输入
+       会给出**概率饱和**（``置信 1.0 / 次优 0.0``）—— ``_MIN_CONF = 0.5`` 形同虚设；
+    2. ``scripts/voxel_consistency.py`` 实测的一致率**低于三分类的随机水平**。
+       把定位像当 T1CE 填进通道，比留空通道**更有害**（留空至少是训练时见过的"缺失"标记）。
+
+    判据：**一致率 <50%（≈随机）就该关**；若重训后测到 >=80%，再设回 ``1`` 打开。
+    """
+    return os.environ.get("GLIOMA_VOXEL_GUESS_EXCLUDED", "").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
 def _log_excluded(study: Study, skipped: int, allow_excluded: bool) -> None:
     """报告"因权威排除而未参与判别"的序列数（每 ``(检查号, 模式)`` 只报一次）。
 

@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import itertools
 import os
+import re
 import sys
 import traceback
 from pathlib import Path
@@ -62,6 +63,38 @@ from data.voxel_modality import describe, load_model                 # noqa: E40
 
 #: 官方训练集（含 ``SeriesType.xlsx`` 的那一层）
 DEFAULT_ROOT = "/2026aicompetition/datasets/training/annotation"
+
+#: 本模型的类别空间（与训练脚本的 ``OFFICIAL_CLASSES`` 一致，**没有 T1 类**）
+MODEL_CLASSES = ("T1CE", "T2", "FLAIR")
+
+
+def expected_class(label: str) -> str | None:
+    """表标签 → 本模型能表达的类别；**表达不了就返回 ``None``（不参与一致率）**。
+
+    官方表的 5 个取值与实际类别：
+
+    ==================  ==========  ===================================
+    表取值              期望类别     说明
+    ==================  ==========  ===================================
+    ``T1CE (增强)``     T1CE        —
+    ``T2WI``            T2          —
+    ``T2-Flair``        FLAIR       注意它也含 "T2"，但官方口径是 FLAIR
+    ``T1``              **None**    模型没有 T1 类 → 必然判错，不该计入分母
+    ``其他``            **None**    权威排除，本来就不该猜
+    ==================  ==========  ===================================
+
+    ⚠️ 早期版本的评分写成"预测标签是不是真值标签的子串"，把 ``T1``（250/1735 = 14.4%）
+    与 ``其他``（49 = 2.8%）也计入了分母 —— 等于**强加 17.2% 的必然错误**，
+    把一致率整体压低约 1/6，还会把"模型没用"这个结论提前坐实。本函数修掉这个偏差。
+    """
+    low = re.sub(r"[\s\-_（）()]+", "", str(label)).lower()
+    if low.startswith("t1ce") or low.startswith("t1c"):
+        return "T1CE"
+    if low.startswith("t2flair") or low.startswith("flair"):
+        return "FLAIR"
+    if low.startswith("t2"):
+        return "T2"
+    return None
 
 
 def main(argv: list[str]) -> int:
@@ -106,10 +139,15 @@ def main(argv: list[str]) -> int:
         print(f"[3/5] 磁盘影像数: {n_files}   索引键数: {len(index)}", flush=True)
 
         model = load_model()
-        hits = tot = miss = 0
+        hits = tot = miss = skipped_label = 0
         margins: list[float] = []
-        per_class: dict[str, list[int]] = {}          # 表标签 -> [命中数, 总数]
+        per_class: dict[str, list[int]] = {}          # 期望类别 -> [命中数, 总数]
+        cm: dict[str, dict[str, int]] = {}            # 期望类别 -> {预测类别: 次数}
         for (acc, uid), label in itertools.islice(rows.items(), 0, 8000):
+            want = expected_class(label)
+            if want is None:                          # 模型没有这个类别 → 不计入分母
+                skipped_label += 1
+                continue
             path = index.get((acc, uid))
             if path is None:
                 miss += 1
@@ -125,29 +163,44 @@ def main(argv: list[str]) -> int:
             lab, probs = model.predict(vol)
             ranked = sorted(probs.values(), reverse=True)
             margins.append(ranked[0] - ranked[1])     # top-2 间隔：判断概率是否饱和
-            hit = lab.lower().replace("ce", "c") in str(label).lower().replace("ce", "c")
+            hit = lab.upper() == want                 # 类别必须**相等**，不是子串包含
             tot += 1
             hits += hit
-            bucket = per_class.setdefault(str(label), [0, 0])
+            bucket = per_class.setdefault(want, [0, 0])
             bucket[0] += hit
             bucket[1] += 1
+            cm.setdefault(want, {})
+            cm[want][lab.upper()] = cm[want].get(lab.upper(), 0) + 1
             if tot <= 12:
-                print(f"  {uid[:22]:<24} 表={str(label):<14} 判别={lab:<6} "
+                print(f"  {uid[:22]:<24} 表={str(label):<14}->{want:<5} 判别={lab:<6} "
                       f"top={ranked[0]:.3f} 次优={ranked[1]:.3f} {'OK' if hit else 'X'}",
                       flush=True)
             if tot >= limit:
                 break
 
-        print(f"[4/5] 参与比对 {tot} 例；表里有但磁盘找不到文件而跳过 {miss} 行", flush=True)
-        print(f"      一致率: {hits}/{tot} = {hits / max(1, tot):.1%}", flush=True)
+        print(f"[4/5] 参与比对 {tot} 例；"
+              f"标签模型表不出而跳过 {skipped_label} 行（T1 / 其他）；"
+              f"磁盘找不到文件跳过 {miss} 行", flush=True)
+        print(f"      一致率: {hits}/{tot} = {hits / max(1, tot):.1%}"
+              f"（随机基线 {1 / len(MODEL_CLASSES):.0%}）", flush=True)
         if margins:
             m = np.asarray(margins)
             print(f"      top-2 间隔：中位数={np.median(m):.3f} 最小={m.min():.3f} "
                   f"饱和(<0.01)占比={float((m < 0.01).mean()):.1%}", flush=True)
         if per_class:
-            print("      按表标签分组（看是哪一类在拖后腿）：", flush=True)
+            print("      各期望类别召回（看是哪一类在拖后腿）：", flush=True)
             for label, (h, n) in sorted(per_class.items(), key=lambda kv: -kv[1][1]):
-                print(f"        {label:<16} {h}/{n} = {h / max(1, n):.1%}", flush=True)
+                print(f"        {label:<8} {h}/{n} = {h / max(1, n):.1%}", flush=True)
+        if cm:
+            print("      混淆矩阵（行=期望，列=预测）：", flush=True)
+            print("           " + "".join(f"{c:>8}" for c in MODEL_CLASSES) + "    合计", flush=True)
+            for want in MODEL_CLASSES:
+                row = cm.get(want)
+                if not row:
+                    continue
+                total_row = sum(row.values())
+                print(f"        {want:<8}" + "".join(f"{row.get(c, 0):>8}" for c in MODEL_CLASSES)
+                      + f"{total_row:>8}", flush=True)
         print("[5/5] 判据：一致率 >=80% 且 饱和占比 <20% → 可覆盖「其他」；"
               "一致率 <50%（≈随机）→ 不该覆盖", flush=True)
         return 0

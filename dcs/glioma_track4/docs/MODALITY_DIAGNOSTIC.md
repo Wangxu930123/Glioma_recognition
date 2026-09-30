@@ -641,6 +641,59 @@ GLIOMA_VOXEL_MAX=300 nohup python3 scripts/voxel_consistency.py \
 它的逻辑与本文件 §2 完全同源 —— 早期版本是内联 heredoc，现已收进脚本，
 **以后只维护脚本一处**。
 
+### 2.5 ⚠️ 先确认「用的是哪个模型」—— 否则数字没有意义
+
+`data/voxel_modality.load_model()` 的取值顺序：**`GLIOMA_MODALITY_MODEL` → 内嵌系数**。
+两者差距极大，**实测对照**：
+
+| 模型来源 | 训练数据 | 一致率 |
+|---|---|---|
+| **内嵌系数**（`voxel_modality._MEAN/_STD/_WEIGHTS/_BIAS`） | 本地**模拟集** | **≈27%**（**低于三分类随机 33%**） |
+| **重训后外部模型**（`glioma_track4/data/modality_model.json`） | 官方训练集 | **5 折 CV = 0.735** ✅ |
+
+> **"重训完还是 27%" 的典型原因是 `GLIOMA_MODALITY_MODEL` 没导出 —— 测的仍是内嵌系数。**
+
+脚本第 2 行就会告诉你用的是哪个：
+
+```text
+      体素模型: 体素判别模型=内嵌系数（默认）                    ← 27% 的那次多半是这一行
+      体素模型: 体素判别模型=/xxx/modality_model.json（外部）
+```
+
+`start.sh` 现已**自动挂载** `../glioma_track4/data/modality_model.json`，缺失时会打 `!!` 报警。
+
+**正确的对照测法**（同一批数据、同一例数，才可比）：
+
+```bash
+cd /2026aicompetition/workspace/dcs/GliomaRecognition/dcs/Glioma_recognition-main
+ROOT=/2026aicompetition/datasets/training/annotation
+MODEL=/2026aicompetition/workspace/dcs/glioma_track4/data/modality_model.json
+
+# A) 外部（重训后）—— 期望接近 0.735
+GLIOMA_MODALITY_MODEL="$MODEL" \
+  python3 scripts/voxel_consistency.py "$ROOT" 200 2>&1 | tee logs/voxel_acc_external.log
+
+# B) 内嵌（对照）—— 不设 GLIOMA_MODALITY_MODEL 就是它
+python3 scripts/voxel_consistency.py "$ROOT" 200 2>&1 | tee logs/voxel_acc_embedded.log
+
+grep -E "体素模型|一致率|top-2" logs/voxel_acc_external.log logs/voxel_acc_embedded.log
+```
+
+> **预期**：A 应显著高于 B。若 A 仍 ≈ B ≈ 27%，说明**外部模型没被加载**
+> （路径写错 / 文件不在）—— 先看 A 日志里「体素模型」那一行。
+
+**对 §3 那个开关的影响（修正此前的建议）**：
+
+先前基于 27%（低于随机）把 `GLIOMA_VOXEL_GUESS_EXCLUDED` 默认关闭是对的；
+**但 0.735 说明这个赌注的期望是正的**。所以：
+
+| 运行时实测一致率 | `GLIOMA_VOXEL_GUESS_EXCLUDED` |
+|---|---|
+| <50% | `0`（当前 `start.sh` 默认，尊重官方表的 `其他`） |
+| **>=70% 且确认加载了外部模型** | **改回 `1`**：`GLIOMA_VOXEL_GUESS_EXCLUDED=1 ./start.sh` |
+
+> 判据用**运行时实测**，不是重训脚本的自报值 —— 两者相差 27% vs 73.5% 就是例子。
+
 **判读**
 
 > ### 如果输出停在某一步（这次遇到的"只到 `表条数` 就没了"）

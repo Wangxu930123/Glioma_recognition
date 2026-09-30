@@ -23,8 +23,53 @@ from tasks._common.spatial import resample_to, spacing_of, target_grid
 #: 通道顺序固定，与训练时 in_channels 一一对应（改动即破坏权重兼容）
 CHANNEL_ORDER: tuple[str, ...] = ("t1c", "flair", "t2", "t1")
 
-#: 参考网格的模态优先级
-_REF_PRIORITY: tuple[str, ...] = ("t1c", "t1", "flair", "t2")
+#: 每个输入通道的**取用链**：优先自己，缺了按训练时的规则用替代模态顶替。
+#:
+#: ⚠️ **必须与训练侧** ``glioma_track4/configs/preprocess.yaml`` **的** ``channels``
+#: **逐字一致**（仓内训练入口 ``tasks/_common/training/helpers.build_datasets``
+#: 直接 ``load_config("preprocess.yaml")`` 并把 ``pre_cfg`` 交给
+#: ``src.data.dataset.GliomaDataset``，所以那份 yaml 就是训练事实来源）：
+#:
+#: .. code-block:: yaml
+#:
+#:     channels:
+#:       - {name: t1c,   fallback: [t1, t2]}
+#:       - {name: flair, fallback: [t2]}
+#:       - {name: t2,    fallback: []}
+#:       - {name: t1,    fallback: []}
+#:
+#: 此前本文件**没有 fallback**（缺就填零通道），而训练时是**用替代模态顶替**的。
+#: 后果：官方数据里约 47% 的检查号没有 T1 增强 ——
+#: 训练时共享骨干见到的是「``t1c`` 通道里装着 T1/T2 影像」，推理时却收到「``t1c`` 全零」，
+#: **输入分布完全不同** → Goal1/2/3/4 四个头（真实性 / 拼接 / 肿瘤概率 / 结构化字段+嵌入）
+#: 全部拿到 OOD 输入。这与 Goal5 空掩膜是**同一个成因**，只是 Goal5 还额外把结果落成了掩膜，
+#: 所以先被看见。
+#:
+#: 注意 ``t1c`` 的链尾是 ``t2``、``flair`` 的链尾也是 ``t2``，所以**同一条 t2 序列可能
+#: 同时顶替两个通道** —— 这与训练侧 ``pick_series`` 的行为一致，不要"顺手去重"。
+CHANNEL_FALLBACK: dict[str, tuple[str, ...]] = {
+    "t1c": ("t1c", "t1", "t2"),
+    "flair": ("flair", "t2"),
+    "t2": ("t2",),
+    "t1": ("t1",),
+}
+
+#: 参考网格的模态优先级。
+#:
+#: ⚠️ **必须与训练侧一致**：``glioma_track4/src/data/dataset.py::build_case_volume``
+#: 用的是 ``("t1c", "flair", "t2", "t1")``。此前本文件写的是
+#: ``("t1c", "t1", "flair", "t2")`` —— 缺 T1CE 时训练用 **FLAIR** 建网格、
+#: 推理用 **T1** 建网格，**两边建出形状与 affine 都不同的公共网格**
+#: （约 47% 的检查号受影响），而公共网格决定掩膜写回的空间。
+_REF_PRIORITY: tuple[str, ...] = ("t1c", "flair", "t2", "t1")
+
+#: 层厚超过 ``max_factor × common_spacing`` 的轴**保持原始 spacing**。
+#:
+#: ⚠️ **必须与训练侧一致**：``preprocess.yaml`` 的 ``geometry.max_spacing_factor`` 是
+#: **1.5**。此前本文件没传这个参数，于是由 ``tasks._common.spatial.target_grid`` 的
+#: 默认值 **4.0** 兜底 —— 同一条 3mm 层厚的 FLAIR：训练保持 3mm、推理被插值到 1mm，
+#: 网格形状与训练分布不一致。
+DEFAULT_MAX_SPACING_FACTOR: float = 1.5
 
 
 @dataclass(frozen=True)
@@ -105,7 +150,8 @@ def _any_series_ref(study: Study) -> "Series | None":
 
 
 def build_volume(study: Study, common_spacing: tuple[float, float, float] = (1.0, 1.0, 1.0),
-                 channels: tuple[str, ...] = CHANNEL_ORDER) -> PreparedVolume:
+                 channels: tuple[str, ...] = CHANNEL_ORDER,
+                 max_factor: float = DEFAULT_MAX_SPACING_FACTOR) -> PreparedVolume:
     """把 ``Study`` 归一化到公共网格，返回多通道体积。
 
     4 个通道**一个都填不上**时不再抛错（**全放开口径**，与算法工程
@@ -119,7 +165,22 @@ def build_volume(study: Study, common_spacing: tuple[float, float, float] = (1.0
         ValueError: 该 Study **连一路影像都没有**（规范 §9.1：不可降级输入错误）。
             注意这与"没有目标模态"是两回事：后者现在会全零通道照走。
     """
-    picked = select_series(study, channels)
+    # 先取**全部候选模态**（各通道取用链的并集），再逐通道按链顶替 ——
+    # 与训练侧 ``dataset.pick_series``（``[ch["name"]] + ch["fallback"]``）同口径。
+    wanted: list[str] = []
+    for name in channels:
+        for cand in CHANNEL_FALLBACK.get(name, (name,)):
+            if cand not in wanted:
+                wanted.append(cand)
+    available = select_series(study, tuple(wanted))
+    picked: dict[str, Series] = {}
+    picked_mod: dict[str, str] = {}
+    for name in channels:
+        for cand in CHANNEL_FALLBACK.get(name, (name,)):
+            if cand in available:
+                picked[name] = available[cand]
+                picked_mod[name] = cand
+                break
     if not picked:
         ref = _any_series_ref(study)
         if ref is None:
@@ -127,7 +188,9 @@ def build_volume(study: Study, common_spacing: tuple[float, float, float] = (1.0
     else:
         ref_key = next((k for k in _REF_PRIORITY if k in picked), next(iter(picked)))
         ref = picked[ref_key]
-    grid_shape, grid_affine = target_grid(ref.image.shape, ref.affine, tuple(common_spacing))
+    # ``max_factor`` 必须走常量（训练侧 = 1.5），不能用 target_grid 的默认值 4.0
+    grid_shape, grid_affine = target_grid(ref.image.shape, ref.affine,
+                                         tuple(common_spacing), max_factor=max_factor)
 
     chans: list[np.ndarray] = []
     sources: dict[str, dict] = {}
@@ -144,6 +207,8 @@ def build_volume(study: Study, common_spacing: tuple[float, float, float] = (1.0
         chans.append(zscore(arr))
         sources[name] = {
             "series_uid": s.series_uid,
+            # 实际顶替用的模态：``t1c`` 通道可能装着 ``t1``/``t2`` 的影像（与训练侧同规则）
+            "modality": picked_mod.get(name, name),
             "spacing": spacing_of(s.affine),
             "shape": tuple(int(x) for x in s.image.shape),
         }

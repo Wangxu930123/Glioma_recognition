@@ -287,10 +287,48 @@ def gate_preprocess(train_cfg: Path, info: dict) -> None:
         else:
             print(f"channels.{name:<26}{str(exp):>18}{str(got):>18}   OK")
 
+    # ---- 另一份推理侧预处理：Goal1/2/3/4 走的共享骨干 ----
+    # 推理侧有**两份**多通道预处理（goal5 一份、共享骨干一份），历史上正是"只修了一份"
+    # 导致四个分类/嵌入头继续吃 OOD 输入。这里一并对齐，避免再次只修一半。
+    print()
+    print("  共享预处理 tasks/_common/volume.py（Goal1/2/3/4 走它）:")
+    try:
+        from tasks._common import volume as shared
+
+        for name in shared.CHANNEL_ORDER:
+            got = tuple(shared.CHANNEL_FALLBACK[name])
+            exp = want.get(name)
+            if exp is not None and exp != got:
+                bad.append(f"shared.channels.{name}")
+                print(f"  shared.channels.{name:<19}{str(exp):>18}{str(got):>18}   !! 不一致")
+            else:
+                print(f"  shared.channels.{name:<19}{str(exp):>18}{str(got):>18}   OK")
+
+        if tuple(shared._REF_PRIORITY) != ("t1c", "flair", "t2", "t1"):
+            bad.append("shared._REF_PRIORITY")
+            print(f"  shared._REF_PRIORITY  = {shared._REF_PRIORITY}   !! 应为 "
+                  f"('t1c', 'flair', 't2', 't1')（训练 dataset.build_case_volume）")
+        else:
+            print(f"  shared._REF_PRIORITY  = {shared._REF_PRIORITY}   OK")
+
+        exp_mf = dig(train, "geometry.max_spacing_factor")
+        if exp_mf is not None and float(exp_mf) != float(shared.DEFAULT_MAX_SPACING_FACTOR):
+            bad.append("shared.DEFAULT_MAX_SPACING_FACTOR")
+            print(f"  shared.max_spacing_factor = {shared.DEFAULT_MAX_SPACING_FACTOR}   "
+                  f"!! 训练侧 {exp_mf}")
+        else:
+            print(f"  shared.max_spacing_factor = {shared.DEFAULT_MAX_SPACING_FACTOR}   OK")
+    except Exception as exc:                                      # noqa: BLE001
+        _record("G3 预处理", "FAIL",
+                f"读共享预处理 tasks/_common/volume.py 失败: {type(exc).__name__}: {exc}")
+        return
+
     if bad:
         _record("G3 预处理", "FAIL", f"{len(bad)} 处与训练不一致: {bad}")
     else:
-        _record("G3 预处理", "PASS", f"{len(sub)} 项参数 + 通道链全部与训练侧一致")
+        _record("G3 预处理", "PASS",
+                f"{len(sub)} 项参数 + **两份**推理侧预处理（goal5 / 共享骨干）的"
+                f"通道链·参考序·max_spacing_factor 全部与训练侧一致")
 
 
 # --------------------------------------------------------------------------- #

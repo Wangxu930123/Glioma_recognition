@@ -209,6 +209,46 @@ def test_bridge_matches_closing_and_stays_local():
     assert np.array_equal(_bridge(m, 0.0, (1.0, 1.0, 1.0)), m)
 
 
+def test_shared_and_goal5_preprocess_agree_with_training():
+    """两份**分开维护**的推理侧预处理必须与彼此、与训练侧一致。
+
+    推理侧有**两份**多通道预处理：
+
+    - ``tasks/_common/volume.py`` —— Goal1/2/3/4 走的共享骨干（``BackboneRunner``）；
+    - ``tasks/goal5_segmentation/preprocess.py`` —— Goal5 自己的那份。
+
+    历史上正是"**只修了一份**"：Goal5 的空掩膜修好了、通道 fallback 补上了，
+    而 ``tasks/_common/volume.py`` 仍是"缺通道填零 + 参考序 ``t1c→t1→flair→t2``
+    + ``max_spacing_factor`` 走默认 4.0" —— 于是四个分类/嵌入头继续吃 OOD 输入。
+
+    这里把三件事锁死（训练事实来源是 ``glioma_track4/configs/preprocess.yaml``，
+    仓内训练入口 ``tasks/_common/training/helpers.build_datasets`` 直接加载它）：
+    通道取用链、参考网格优先级、``max_spacing_factor``。
+    """
+    from tasks._common import volume as shared
+    from tasks.goal5_segmentation import preprocess as g5
+    from tasks.goal5_segmentation.config import Goal5Config
+
+    # 两份互相同源
+    assert shared.CHANNEL_ORDER == g5.CHANNEL_ORDER
+    assert shared.CHANNEL_FALLBACK == g5.CHANNEL_FALLBACK
+    assert shared._REF_PRIORITY == g5._REF_PRIORITY
+
+    # 与训练侧逐条对齐
+    assert shared.CHANNEL_FALLBACK == {
+        "t1c": ("t1c", "t1", "t2"),      # preprocess.yaml: fallback: [t1, t2]
+        "flair": ("flair", "t2"),        # preprocess.yaml: fallback: [t2]
+        "t2": ("t2",),
+        "t1": ("t1",),
+    }, "通道取用链与训练侧 preprocess.yaml 的 channels 不一致"
+    assert tuple(shared._REF_PRIORITY) == ("t1c", "flair", "t2", "t1"), \
+        "参考网格优先级与 dataset.build_case_volume 不一致"
+    assert shared.DEFAULT_MAX_SPACING_FACTOR == 1.5, \
+        "max_spacing_factor 与 preprocess.yaml 的 geometry 段不一致"
+    assert Goal5Config().max_spacing_factor == shared.DEFAULT_MAX_SPACING_FACTOR, \
+        "Goal5Config.max_spacing_factor 与共享预处理不一致"
+
+
 def test_study_rejects_duplicate_series_uid(tmp_path):
     """同一 Study 内 series_uid 不得重复（规范 §6.1）。"""
     s = Series(series_uid="S1", modality="t1c", image=np.ones((4, 4, 4), np.float32),

@@ -145,9 +145,12 @@ python3 scripts/pre_submit_check.py --limit 20 2>&1 | tee logs/pre_submit.log
 
 ### G3 预处理
 
-逐项对比 `Goal5Config` 与训练侧 `glioma_track4/configs/preprocess.yaml`。
+逐项对比**两份**推理侧预处理与训练侧 `glioma_track4/configs/preprocess.yaml`：
 
-**这就是本轮空掩膜的主因** —— 修前有 4 处不一致，见 §4。
+- `channels.*` —— Goal5 那份（`tasks/goal5_segmentation/preprocess.py`）
+- `shared.*` —— **共享骨干那份**（`tasks/_common/volume.py`，Goal1/2/3/4 走它）
+
+**这就是本轮空掩膜的主因** —— 修前有 4 处不一致；共享那份还额外漏了 3 处，见 §4.1、§4.9。
 
 | 输出 | 判定 |
 |---|---|
@@ -498,6 +501,87 @@ python3 -m pytest tests -p scripts.memprobe -q       # 期望 峰值 < 500 MB
 > 这也解释了 §4.7 里那句"测试套件不是元凶"为什么成立：
 > **pytest 里没有任何测试触碰真实整脑的 `_bridge`**（测试用的都是 `4³`~`8³` 的小体积），
 > 所以它从来没在 CI 里被量出来过。
+
+### 4.9 训练 ↔ 推理 预处理一致性（**本轮补上第二份实现**）
+
+#### 训练的事实来源（有代码依据，不是推测）
+
+```212:217:Glioma_recognition-main/tasks/_common/training/helpers.py
+    root = _load_track4()
+    ds_mod = __import__("src.data.dataset", fromlist=["*"])
+    utils = __import__("src.utils.config", fromlist=["*"])
+    pre = utils.load_config("preprocess.yaml")
+```
+
+即 **`glioma_track4/configs/preprocess.yaml` + `src/data/dataset.py::GliomaDataset`**。
+
+#### 推理侧有**两份**预处理 —— 这是关键
+
+| 实现 | 谁在用 |
+|---|---|
+| `tasks/_common/volume.py` | **Goal1 / Goal2-stitched / Goal3 / Goal4**（共享骨干 `BackboneRunner`） |
+| `tasks/goal5_segmentation/preprocess.py` | **Goal5**（它走滑窗，不参与共享骨干） |
+
+**问题**：上一轮只对齐了 Goal5 那一份 —— 结果 Goal5 空掩膜修好了，
+而 **Goal1/2/3/4 四个头继续吃 OOD 输入**（真实性概率、拼接概率、肿瘤概率、14 个结构化字段 + 嵌入）。
+
+#### 本轮补上的三处对齐（`tasks/_common/volume.py`）
+
+| 项 | 训练侧 | 修前 | 修后 |
+|---|---|---|---|
+| **通道取用链** | `t1c←[t1,t2]`、`flair←[t2]`、`t2←[]`、`t1←[]` | **无 fallback**（缺→零通道） | 与训练**逐字一致** |
+| **参考网格优先级** | `t1c→flair→t2→t1` | `t1c→**t1**→flair→t2` | `t1c→flair→t2→t1` |
+| **`max_spacing_factor`** | **1.5** | **4.0**（`target_grid` 默认值兜底） | **1.5** |
+
+与 Goal5 那三处（§4.1 #1/#2/#3）**完全同源** —— 因为是同一个成因。
+
+#### 验证（11/11 通过）
+
+```text
+A. 常量对账（与 preprocess.yaml / dataset.py 源码逐条比）
+  训练 yaml 取用链 : {'t1c': ('t1c','t1','t2'), 'flair': ('flair','t2'),
+                     't2': ('t2',), 't1': ('t1',)}
+  [OK] 两份推理侧 CHANNEL_FALLBACK 与训练 yaml 逐字一致
+  [OK] 两份推理侧 max_spacing_factor 与训练一致（1.5）
+  [OK] 两份推理侧参考网格优先级与训练一致（('t1c','flair','t2','t1')）
+
+B. 功能验证（只给 T2WI + T2-Flair 的检查）
+  [tasks/_common/volume.py]  missing=('t1',)
+    通道来源 = {'t1c': 't2', 'flair': 'flair', 't2': 't2'}   网格 (20,20,10)
+  [goal5/preprocess.py]      missing=('t1',)  相同的来源与网格
+  [OK] 两份实现的 volume **逐体素相同**（np.allclose）
+  [OK] 3mm 层厚轴保持原样（max_spacing_factor=1.5 生效）
+```
+
+#### 新增契约测试（防"只修一半"）
+
+`tests/contracts/test_goal5_contract.py::test_shared_and_goal5_preprocess_agree_with_training`
+锁死三件事：两份互相同源、通道链与训练 yaml 逐字一致、参考序与 `max_spacing_factor` 与训练一致。
+
+> 预检 **G3** 现在也**两份一起核对**（输出里 `channels.*` 是 goal5 那份、`shared.*` 是共享骨干那份）。
+
+#### 另一工程副本已同步
+
+`glioma_goals/shared/volume.py` 是**同一份代码**（另一工程用它），已同步这三处
+—— 审计要求两工程 `volume.py` "实现同源"。
+
+#### 一处**刻意保留**的差异（已确认是训练仓自己的设计）
+
+`global_view` 的中心点：训练用**病灶质心**（有掩码），推理用**前景包围盒中心**。
+训练仓**自己**提供了推理侧的对应实现并注明原因：
+
+```559:565:glioma_track4/src/data/dataset.py
+def brain_center(vol: np.ndarray) -> np.ndarray | None:
+    """非零体素包围盒中心（推理时无掩码可用）。"""
+    nz = np.argwhere(np.abs(vol).sum(0) > 1e-3)
+```
+
+推理侧 `global_view(center=None)` 与它**公式逐字一致**（`abs(vol).sum(0) > 1e-3` → 取包围盒中点）✓
+`size_mm=192 / out=96` 也与训练 `global_view` 一致 ✓。
+这是**无法避免的近似**（推理时确实没有掩码），不是 bug，**不要"修"** ——
+推理侧改成任何别的中心反而会加重分布偏移。
+
+> 另外：`zscore` 与训练 `zscore_volume` 是**等价实现**（§3e 已逐行对比），无需改动。
 
 ---
 

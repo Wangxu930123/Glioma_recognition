@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -55,6 +56,30 @@ CHANNEL_FALLBACK: dict[str, tuple[str, ...]] = {
 #: 此前本文件写的是 ``("t1c", "t1", "flair", "t2")`` —— 缺 T1CE 时训练用 **FLAIR** 建网格、
 #: 推理用 **T1** 建网格，**两边建出形状与 affine 都不同的公共网格**（约 47% 的检查号受影响）。
 _REF_PRIORITY: tuple[str, ...] = ("t1c", "flair", "t2", "t1")
+
+#: **公共网格体素数上限**（防爆护栏，详见 ``tasks/_common/volume.MAX_GRID_VOXELS``）。
+#: 一例峰值内存 ≈ ``(C+13)×V×4B``；真实 1mm 脑 V≈8.9M 无压力，触发护栏的几乎只有
+#: "参考序列 spacing/affine 元数据异常 → 病态巨大网格"。明确报错 + 容错跳过，
+#: 远好于"被平台 OOM-kill → 整批评测作废"。
+MAX_GRID_VOXELS: int = int(os.environ.get("GLIOMA_MAX_GRID_VOXELS", "200_000_000")
+                           .replace("_", "") or 200_000_000)
+
+
+def _check_grid_size(grid_shape: tuple, study) -> None:
+    """公共网格防爆护栏：与 ``tasks/_common/volume._check_grid_size`` 同口径。"""
+    n_vox = int(grid_shape[0]) * int(grid_shape[1]) * int(grid_shape[2])
+    if n_vox <= MAX_GRID_VOXELS:
+        return
+    est = (4 + 13) * n_vox * 4 / 1e9
+    raise ValueError(
+        f"study {getattr(study, 'accession_number', '?')!r}: 公共网格 "
+        f"{tuple(int(x) for x in grid_shape)} = {n_vox / 1e6:.0f} M 体素，"
+        f"超过上限 {MAX_GRID_VOXELS / 1e6:.0f} M（GLIOMA_MAX_GRID_VOXELS），"
+        f"预计单例峰值约 {est:.0f} GB —— 容器会被 OOM-kill。\n"
+        f"  最常见成因：参考序列的 spacing/affine 元数据异常（target_grid 原样采用了病态网格）。\n"
+        f"  容错模式（GLIOMA_LOADER_TOLERANT=1）下本例被跳过、其余照常产出；"
+        f"或确认数据确实超大后 export GLIOMA_MAX_GRID_VOXELS={n_vox} 临时放行。"
+    )
 
 
 @dataclass(frozen=True)
@@ -142,6 +167,7 @@ def build_volume(study: Study, cfg: Goal5Config) -> PreparedVolume:
     grid_shape, grid_affine = target_grid(ref.image.shape, ref.affine,
                                           tuple(cfg.common_spacing),
                                           max_factor=cfg.max_spacing_factor)
+    _check_grid_size(grid_shape, study)
 
     # 2) 逐通道重采样 + 归一化
     chans: list[np.ndarray] = []

@@ -286,6 +286,7 @@ python3 scripts/pre_submit_check.py --limit 20 2>&1 | tee logs/pre_submit.log
 | **`scripts/audit_goal5.py`** | 权重真伪 + 预处理一致性的**逐项**审计（比预检更详细） |
 | **`scripts/mem_audit.py`** | 内存审计：集成规模行为 + 单份模型常驻 + **逐阶段轨迹**（`--trace`）（§4.7） |
 | **`scripts/memprobe.py`** | pytest 内存探针（`-p scripts.memprobe`），用来证伪"测试套件是 OOM 元凶"（§4.7） |
+| **`scripts/stage_mem_trace.py`** | **逐阶段追踪器**：容器被 OOM-kill 时日志最后一行 `→` 即元凶阶段；`--goals goal5` 可二分定位（§4.10） |
 
 **两个脚本都已实跑验证**（合成权重 + 合成数据）：
 
@@ -583,6 +584,78 @@ def brain_center(vol: np.ndarray) -> np.ndarray | None:
 
 > 另外：`zscore` 与训练 `zscore_volume` 是**等价实现**（§3e 已逐行对比），无需改动。
 
+### 4.10 ⚠️ "第一例就 OOM-kill 容器"的定位与防护（32GB 容器）
+
+**先分清两类问题**（32GB 被**第一例**打爆 = 瞬时峰值，不是累积泄漏）：
+
+| 类型 | 表现 | 定位工具 |
+|---|---|---|
+| **累积泄漏** | 越跑越涨、最后几例才死 | `python -m pytest tests -p scripts.memprobe -q`（实测**无泄漏**：后半段 +0.02 MB/测试） |
+| **瞬时峰值** | **第一例就死** ← 你的情况 | `scripts/stage_mem_trace.py`（本轮新增） |
+
+#### ① 逐阶段追踪器（**容器死前最后一行日志 = 元凶阶段**）
+
+```bash
+cd /2026aicompetition/workspace/dcs/GliomaRecognition/dcs/Glioma_recognition-main
+export COMPETITION_CHECKPOINT_ROOT=/2026aicompetition/workspace/checkpoint
+python3 scripts/stage_mem_trace.py 3 2>&1 | tee logs/stage_trace.log
+# 二分定位：python3 scripts/stage_mem_trace.py 3 --goals goal5
+```
+
+每个阶段**进入时立即打印** `→`（flush）—— 容器被 OOM-kill 的那一刻，**日志最后一行 `→` 就是正在执行的阶段**：
+
+| 日志停在 | 元凶 | 下一步 |
+|---|---|---|
+| `→ load <acc>` | **该例原始 NIfTI 过大** | 用 nib 打印该例各序列的 shape/dtype/大小 |
+| `→ <acc> goal5` | 公共网格爆炸 / 滑窗 / EDT（护栏会先报，见 ②） | 看此行前 build_volume 的报错 |
+| `→ <acc> goal1/2/3/4` | `global_view` 或常驻模型数 | 跑 G6；看 `real_pipeline` 启动行 |
+| `→ build_pipeline` | **权重本身就装不下**（目录 `*.pt` 太多） | 清目录（§4.7） |
+
+**本机端到端实测输出**（真实插件 + 全部权重 + CPU）：
+
+```text
+→ build_pipeline（加载全部权重）
+← build_pipeline    rss 423 MB (+55)              ← 6 个常驻模型 = shared_weight_count 4+…
+→ load ACC0001（2 序列）
+→   ACC0001 goal1
+←   ACC0001 goal1   rss 1915 MB (+1492)  峰值 2830 MB   ←← 一次性 lazy-init（见 ③）
+→   ACC0001 goal2_stitched
+←   ACC0001 goal2_stitched  rss 1916 MB (+1)     ← 前向缓存命中：只 +1MB
+→   ACC0001 goal3
+←   ACC0001 goal3   rss 1916 MB (+0)             ← 复用同一前向：+0MB
+```
+
+#### ② 公共网格防爆护栏（**已加，3/3 验证**）
+
+`build_volume` 建完网格即检查体素数，超过 `GLIOMA_MAX_GRID_VOXELS`（默认 **2 亿**）→ **带完整成因分析的明确报错**：
+
+```text
+study 'ACCxxx': 公共网格 (812, 812, 812) = 535 M 体素，超过上限 200 M（GLIOMA_MAX_GRID_VOXELS）。
+预计这一例的峰值内存约 36 GB —— 32GB 容器会被直接 OOM-kill。
+  最常见成因：**参考序列的 spacing/affine 元数据异常**（target_grid 原样采用病态网格）。
+  …（附可粘贴的 nib 排查命令、三种处置）
+  容错模式（GLIOMA_LOADER_TOLERANT=1）下本例会被跳过、其余照常产出。
+```
+
+**为什么这是正确姿势**：一例的峰值 ≈ `(C+13)×V×4B`（RAM 的 volume/z-score 拷贝/EDT + GPU 的 `x0/acc/wacc/seg_prob`）。真实 1mm 脑 V≈8.9M 时峰值 <1GB；**要打爆 32GB，V 必须在 4~6 亿** —— 唯一现实成因就是病态元数据。被平台杀容器 = 整批作废且无日志；护栏报错 + 容错 = **只丢这一例**，日志里还有完整原因。三份预处理（goal5 / 共享骨干 / `glioma_goals`）**全部接入**。
+
+```text
+实测：812³=535M → 拦截 ✓   512³=134M → 放行 ✓   上限调 50M 后 64M → 拦截 ✓
+```
+
+#### ③ 两个已量化的"一次性"内存（**不是泄漏，不要追**）
+
+| 项 | 实测 | 说明 |
+|---|---|---|
+| `import torch/numpy` | ~320 MB | 探针基线已扣除（`scripts/memprobe.py` 打印"基线（导入完成）"） |
+| **首次前向的 lazy-init** | **+1492 MB，峰值 2830 MB** | torch CPU 的线程 workspace / oneDNN **一次性**分配。goal1 付一次，goal2/3/4 前向缓存命中后 **+1/+0 MB**。**若容器 GPU 不可见（`GLIOMA_DEVICE` 落到 cpu），这项更高且全部计入容器 RAM** —— 追踪器开头会直接打出 `CUDA 可用 : False` 警告 |
+
+#### ④ 本轮顺带修的统计漏报
+
+`goal2_duplicate` 的权重在 `DuplicateConfig.ckpt_rel`（`encoder.pt`），不是类属性 —— **G6 之前把它算成"无权重"**。已修，现在 G6 输出 `goal2_duplicate rel=goal2_duplicate/encoder.pt 解析出 1 份`，常驻模型总数 = **6**。
+
+> 已知未修（记录在案）：`DuplicateTask.load_model` 不走 `_SHARED_WEIGHTS` 共享缓存（自己 `torch.load`）。它读的是独立的 `encoder.pt`，即使接入缓存也是单独的 key —— 单份 5MB 冗余，不影响正确性，暂不动（减少提交前的改动面）。
+
 ---
 
 ## 5. 环境变量清单
@@ -606,6 +679,7 @@ def brain_center(vol: np.ndarray) -> np.ndarray | None:
 | `GLIOMA_DEVICE` | `cuda` | 强制 CPU 调试时设 `cpu` |
 | `GLIOMA_PROGRESS` | 开 | 设 `0` 关闭逐例进度日志 |
 | `GLIOMA_MAX_ENSEMBLE` | **8** | 多折集成上限。目录里 `*.pt` 超过它 → **明确报错**而不是静默全加载（OOM 防护）。确实要多折且超过 8 折时调大 |
+| `GLIOMA_MAX_GRID_VOXELS` | **200_000_000** | 公共网格体素数上限（防爆护栏）。超过 → 明确报错 + 容错跳过该例，而不是让容器被 OOM-kill（§4.10） |
 
 **一段可整段粘贴**：
 
@@ -631,6 +705,7 @@ ls -l "$COMPETITION_CHECKPOINT_ROOT/goal5_segmentation/" || echo "!! 权重不�
 | 服务起来了、日志只有一行 `⚠️ 未设置 COMPETITION_PIPELINE_FACTORY` | 跑了 Dummy 基线 | 用 `./start.sh` 启动（§1） |
 | `test_goal5_contract.py::test_task_does_not_touch_answer_dir` 报 **`DID NOT RAISE FileNotFoundError`** | **测试依赖环境**（没钉 `COMPETITION_CHECKPOINT_ROOT`），容器里有权重 → 模型真的加载了 | 已修（§4.6）；重跑 `python -m pytest tests/contracts -q` |
 | **修完空掩膜之后评测开始 OOM** | **`_bridge` 用 21³ 稠密结构元**：空掩膜时代它在 `if not m.any(): return` 就返回、从不执行；掩膜变非空后才第一次真正跑（+701 MB / 31.7 s 一次，`clean_pair` 调两次） | **已修**（§4.8）；回归测试 `test_bridge_matches_closing_and_stays_local` |
+| **第一例就 OOM-kill 容器（32GB）** | 单例**瞬时峰值**而非累积泄漏；头号嫌疑：某例 spacing/affine 元数据异常 → 病态巨大网格；其次：GPU 不可见 → 全部激活落 RAM | `python3 scripts/stage_mem_trace.py 3`（日志最后一行 `→` = 元凶，§4.10）；护栏已默认拦截病态网格 |
 | 跑 pytest 时容器 OOM 重启 | 测试套件实测峰值仅 372 MB，**不是元凶**；先证伪再看权重目录 / `_bridge` | `python -m pytest tests -p scripts.memprobe -q`，再 `python3 scripts/mem_audit.py --trace`（§4.7、§4.8） |
 | 服务一启动 / 一评测就 OOM | 常驻模型数 = 不同 `ckpt_rel` 数 × 份数；目录里混了训练快照（`epoch_*.pt`/`last.pt`/备份） | 清目录或只留 `core.pt`；`GLIOMA_MAX_ENSEMBLE` 调上限；看预检 G6 |
 | `goal5{core=0, flair=0}`，`pmax` 只有 0.2~0.3 | 预处理与训练不一致 / seg 头随机初始化 | `pre_submit_check.py` 的 G2、G3 |

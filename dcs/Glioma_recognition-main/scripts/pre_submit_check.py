@@ -473,7 +473,8 @@ def gate_memory(info: dict) -> None:
                 for name in dir(cfg_mod):
                     obj = getattr(cfg_mod, name)
                     if isinstance(obj, type) and name.endswith("Config"):
-                        rel = getattr(obj(), "core_ckpt_rel", None)
+                        rel = getattr(obj(), "core_ckpt_rel", None) \
+                            or getattr(obj(), "ckpt_rel", None)
                         if rel:
                             break
             except Exception:                                     # noqa: BLE001

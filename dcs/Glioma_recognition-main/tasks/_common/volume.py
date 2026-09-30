@@ -11,6 +11,7 @@ Goal1/2/3/4/5 都需要把检查的多个序列对齐到同一网格后再喂给
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -70,6 +71,50 @@ _REF_PRIORITY: tuple[str, ...] = ("t1c", "flair", "t2", "t1")
 #: 默认值 **4.0** 兜底 —— 同一条 3mm 层厚的 FLAIR：训练保持 3mm、推理被插值到 1mm，
 #: 网格形状与训练分布不一致。
 DEFAULT_MAX_SPACING_FACTOR: float = 1.5
+
+#: **公共网格体素数上限**（防爆护栏）。超过即抛错 —— 明确失败，而不是让容器被
+#: 平台 OOM-kill（被平台杀 = 整批评测作废；明确报错 + 容错模式 = 只丢这一例，
+#: 日志里还有完整原因）。
+#:
+#: 阈值怎么来的：一例的峰值内存 ≈ ``(C+13) × V × 4B``（RAM 里 volume/z-score 拷贝/
+#: EDT 后处理 + GPU 或 RAM 上的 x0/acc/wacc/seg_prob）。真实 1mm 脑 V≈8.9M，
+#: 峰值不到 1 GB；**要打爆 32GB 容器，V 得在 4~6 亿** —— 触发本护栏的几乎只有一种
+#: 情况：**某条序列的 spacing/affine 元数据异常**，``target_grid`` 原样采用了一个
+#: 病态巨大的网格。默认 2 亿（预计单例峰值 ~14 GB，留 2 倍安全余量）。
+MAX_GRID_VOXELS: int = int(os.environ.get("GLIOMA_MAX_GRID_VOXELS", "200_000_000")
+                           .replace("_", "") or 200_000_000)
+
+
+def _check_grid_size(grid_shape: tuple, study) -> None:
+    """公共网格防爆护栏：体素数超限 → **带完整成因分析的明确报错**。
+
+    与"被平台 OOM-kill"的区别：这里是 Python 异常，``GLIOMA_LOADER_TOLERANT=1``
+    的逐例容错会**跳过这一例、继续跑其余 700+ 例**，staging 也不会被 rmtree；
+    而容器被杀 = 整批作废且日志里没有任何原因。
+    """
+    n_vox = int(grid_shape[0]) * int(grid_shape[1]) * int(grid_shape[2])
+    if n_vox <= MAX_GRID_VOXELS:
+        return
+    est = (4 + 13) * n_vox * 4 / 1e9                     # (C+13)×V×4B，GB
+    raise ValueError(
+        f"study {getattr(study, 'accession_number', '?')!r}: 公共网格 "
+        f"{tuple(int(x) for x in grid_shape)} = {n_vox / 1e6:.0f} M 体素，"
+        f"超过上限 {MAX_GRID_VOXELS / 1e6:.0f} M（GLIOMA_MAX_GRID_VOXELS）。"
+        f"预计这一例的峰值内存约 {est:.0f} GB —— 32GB 容器会被直接 OOM-kill。\n"
+        f"  最常见成因：**参考序列的 spacing/affine 元数据异常**（如 affine 声称接近 "
+        f"1mm 但 shape 是 1024³ 级），``target_grid`` 于是原样采用病态网格。\n"
+        f"  排查：用 nib 查该例各序列的 shape 与 spacing：\n"
+        f"    python3 - <<'PY'\n"
+        f"    import nibabel as nib, glob\n"
+        f"    for p in glob.glob('<该例目录>/**/*.nii*'):\n"
+        f"        img = nib.load(p)\n"
+        f"        print(p, img.shape, [round(float(v), 3) for v in "
+        f"nib.affines.voxel_sizes(img.affine)])\n"
+        f"    PY\n"
+        f"  处置：修好该例的 NIfTI 元数据后重跑；或（确认数据真的就是超大体积时）"
+        f"export GLIOMA_MAX_GRID_VOXELS={n_vox} 临时放行。\n"
+        f"  容错模式（GLIOMA_LOADER_TOLERANT=1）下本例会被跳过、其余照常产出。"
+    )
 
 
 @dataclass(frozen=True)
@@ -191,6 +236,7 @@ def build_volume(study: Study, common_spacing: tuple[float, float, float] = (1.0
     # ``max_factor`` 必须走常量（训练侧 = 1.5），不能用 target_grid 的默认值 4.0
     grid_shape, grid_affine = target_grid(ref.image.shape, ref.affine,
                                          tuple(common_spacing), max_factor=max_factor)
+    _check_grid_size(grid_shape, study)
 
     chans: list[np.ndarray] = []
     sources: dict[str, dict] = {}

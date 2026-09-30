@@ -60,6 +60,27 @@ _REF_PRIORITY: tuple[str, ...] = ("t1c", "flair", "t2", "t1")
 #: 此前没传这个参数，由 ``shared.spatial.target_grid`` 的默认值 **4.0** 兜底。
 DEFAULT_MAX_SPACING_FACTOR: float = 1.5
 
+#: 公共网格体素数上限（防爆护栏，口径与 ``Glioma_recognition/tasks/_common/volume.py`` 相同）。
+MAX_GRID_VOXELS: int = int(__import__("os").environ.get("GLIOMA_MAX_GRID_VOXELS", "200_000_000")
+                           .replace("_", "") or 200_000_000)
+
+
+def _check_grid_size(grid_shape: tuple, study) -> None:
+    """公共网格防爆护栏：体素数超限 → 明确报错（容错模式下跳过该例，不毁整批）。"""
+    n_vox = int(grid_shape[0]) * int(grid_shape[1]) * int(grid_shape[2])
+    if n_vox <= MAX_GRID_VOXELS:
+        return
+    est = (4 + 13) * n_vox * 4 / 1e9
+    raise ValueError(
+        f"study {getattr(study, 'accession_number', '?')!r}: 公共网格 "
+        f"{tuple(int(x) for x in grid_shape)} = {n_vox / 1e6:.0f} M 体素，"
+        f"超过上限 {MAX_GRID_VOXELS / 1e6:.0f} M（GLIOMA_MAX_GRID_VOXELS），"
+        f"预计单例峰值约 {est:.0f} GB —— 容器会被 OOM-kill。\n"
+        f"  最常见成因：参考序列的 spacing/affine 元数据异常（target_grid 原样采用了病态网格）。\n"
+        f"  容错模式下本例被跳过、其余照常产出；或确认数据确实超大后 "
+        f"export GLIOMA_MAX_GRID_VOXELS={n_vox} 临时放行。"
+    )
+
 
 @dataclass(frozen=True)
 class PreparedVolume:
@@ -183,6 +204,7 @@ def build_volume(study, common_spacing: tuple[float, float, float] = (1.0, 1.0, 
     # ``max_factor`` 必须走常量（训练侧 = 1.5），不能用 target_grid 的默认值 4.0
     grid_shape, grid_affine = target_grid(ref.image.shape, ref.affine,
                                          tuple(common_spacing), max_factor=max_factor)
+    _check_grid_size(grid_shape, study)
 
     chans: list[np.ndarray] = []
     sources: dict[str, dict] = {}

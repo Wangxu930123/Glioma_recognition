@@ -201,9 +201,14 @@ def main(argv: list[str]) -> int:
     _ov = runner.validator.validate_study
     _ou = runner.pipeline.update_dataset_task
 
-    def traced_write(study, *args, **kw):                          # noqa: ANN001, ANN202
-        with trace(f"  {study.accession_number} write"):
-            return _ow(study, *args, **kw)
+    def traced_write(staging, context, *args, **kw):                 # noqa: ANN001, ANN202
+        # ⚠️ ``OutputWriter.write_study`` 的签名是 ``(staging, context)``：第一个参数
+        # 是 staging 目录（PosixPath），**不是** study —— study 在 ``context.study`` 上。
+        # 早期包装误把第一参当 study 访问 ``.accession_number``，在**写盘阶段**崩出
+        # ``'PosixPath' object has no attribute 'accession_number'``。
+        # 本地端到端当时没抓到：合成权重在更早的 goal3 就 KeyError 中断，没走到 write。
+        with trace(f"  {context.study.accession_number} write"):
+            return _ow(staging, context, *args, **kw)
 
     def traced_validate(directory, study, *args, **kw):            # noqa: ANN001, ANN202
         with trace(f"  {study.accession_number} validate"):
@@ -223,8 +228,11 @@ def main(argv: list[str]) -> int:
     print(f"开始逐例推理（前 {a.n} 例）—— 卡住/被杀时，最后一行 '→' 就是元凶阶段")
     print("=" * 96)
     t0 = time.perf_counter()
+    # evaluation_id 必须每次唯一：Writer.begin() 遇到已存在的同名目录会直接
+    # FileExistsError —— 写死 "stage-trace" 时，第二次运行必被上次残留的答案目录卡死。
+    eval_id = f"stage-trace-{uuid.uuid4().hex[:8]}"
     try:
-        runner.run(EvaluationJob(f"trace-{uuid.uuid4()}", "stage-trace", dataset),
+        runner.run(EvaluationJob(f"trace-{uuid.uuid4()}", eval_id, dataset),
                    send_callback=False)
     except Exception as exc:                                      # noqa: BLE001
         print(f"\n!! 推理中断: {type(exc).__name__}: {exc}")

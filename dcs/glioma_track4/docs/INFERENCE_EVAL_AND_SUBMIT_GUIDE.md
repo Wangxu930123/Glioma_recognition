@@ -5,6 +5,7 @@
 >
 > 关联文档：
 > - [`PLATFORM_GUIDE.md`](PLATFORM_GUIDE.md) —— 云桌面 / 训推平台零经验版（界面路径看它）
+> - [`ZERO_SCORE_TROUBLESHOOT.md`](ZERO_SCORE_TROUBLESHOOT.md) —— **测评容器操作手册（全命令版）**：容器内操作顺序、30 秒判定、十种异常对照与排查命令
 > - [`MIGRATE_AND_RESUME_GUIDE.md`](MIGRATE_AND_RESUME_GUIDE.md) —— 代码搬迁与权重真伪判定
 > - [`OOM_AND_RESUME_GUIDE.md`](OOM_AND_RESUME_GUIDE.md) —— 内存/断点续训
 >

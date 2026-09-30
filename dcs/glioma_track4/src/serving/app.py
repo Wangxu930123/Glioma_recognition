@@ -20,12 +20,16 @@ import requests
 from fastapi import BackgroundTasks, FastAPI
 from pydantic import BaseModel
 
-from ..utils.config import PROJECT_ROOT, data_source_tag, load_paths
+from ..utils.config import PROJECT_ROOT, data_source_tag, load_paths, resolve
 from ..utils.logger import run_logger
 
 app = FastAPI(title="track4-glioma-serving")
 PATHS = load_paths()
-LOGGER = run_logger(PATHS["logs_dir"], "serving")
+# 与 src/inference/pipeline.py 同口径：logs_dir 为相对路径（本地开发、WORKSPACE
+# 目录不存在时的兜底值 "logs"）时钉到工程根，而不是随进程 CWD 漂移 ——
+# 否则 serving.jsonl 与 inference.jsonl 会分家。06_platform_serve.sh 已 export
+# LOGS_DIR=<WORKSPACE>/logs，正式路径下两者本来就都在规范目录。
+LOGGER = run_logger(resolve(PATHS["logs_dir"]), "serving")
 _PIPE = None
 _LOCK = threading.Lock()
 _SEM = threading.Semaphore(int(os.environ.get("MAX_CONCURRENT_JOBS", "2")))

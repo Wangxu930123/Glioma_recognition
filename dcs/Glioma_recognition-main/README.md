@@ -2,7 +2,17 @@
 
 本仓库实现《赛道四_自建模型组_系统架构与协作规范》的 P0 基线：可以在比赛容器中启动 HTTP 服务，异步处理整个测试集，生成并校验比赛目录，然后调用平台回调。
 
-> 当前 Goal1～Goal5 均为 **Dummy 零分基线**。它用于验证比赛协议和工程链路，不是可提交得分的真实模型。真实模型通过冻结的 Task/Result 接口逐项替换。
+**本仓自包含**：算法实现内置在 `vendor/glioma_track4/`（见 [`vendor/README.md`](vendor/README.md)），
+clone 下来装好依赖即可运行，不需要另外准备独立的算法工程。
+
+真实插件位于 `tasks/goalX/`，两种接入方式（都用 `COMPETITION_PIPELINE_FACTORY` 指定）：
+
+| 工厂 | 说明 |
+|---|---|
+| `tasks.real_pipeline:build_pipeline` | 直接注册本仓 `tasks/goalX` 插件，**不经过**算法工程 —— `start.sh` 的默认值 |
+| `tasks.glioma.pipeline:build_pipeline` | 走内置的算法实现（`vendor/glioma_track4/` 的桥接层）。需要算法侧的权重与训练口径时才用 |
+
+`GLIOMA_GOALS` 控制启用哪些真实插件，未启用的用 Dummy 补位（规范 §15.1「每次只替换一个插件」）。
 
 ## 已实现
 
@@ -11,10 +21,15 @@
 - 按病例流式加载 NIfTI 数据；
 - `Series`、`Study`、`CompetitionDataset`、`PipelineContext`；
 - `StudyTask`、`DatasetTask` 和 Goal1～Goal5 Result；
-- Dummy Goal1～Goal5 及数据集级重复影像任务；
+- **真实 Goal 插件**（`tasks/goal1_authenticity` / `goal2_stitched` / `goal3_tumor` /
+  `goal5_segmentation` / `goal4_diagnosis` / `goal2_duplicate`），共享一个多任务骨干，
+  一次前向产出六路结果；
+- Dummy 插件（`tasks/dummy/`）用于未启用插件的补位；
+- **模态识别三层兜底**：关键词 → 官方 `SeriesType.xlsx` → **体素统计判别**
+  （`data/voxel_modality.py`，不依赖表里的键与磁盘一致）；
 - `prediction.json`、`duplicate_pairs.jsonl`、两个二值 NIfTI 掩膜；
 - JSON、JSONL、概率、Top-200、shape、affine 和二值掩膜校验；
-- 临时目录写入、校验通过后发布；
+- 临时目录写入、校验通过后发布；**逐例容错**（单例失败只丢该例，不作废整批）；
 - JSON Lines 推理日志；
 - 有限次数 callback 重试；
 - 本地运行、Mock Competition、Dockerfile 和自动化测试。
@@ -24,12 +39,18 @@
 ```text
 app/             HTTP 接口和 callback
 core/            配置、插件加载和 EvaluationRunner
-data/            NIfTI Loader 与统一数据结构
-tasks/           Task/Result 契约和 Dummy 插件
+data/            NIfTI Loader、体素模态判别与统一数据结构
+tasks/           Task/Result 契约
+  ├── goalX/     真实插件（真实性 / 拼接 / 肿瘤 / 分割 / 结构化 / 重复）
+  ├── dummy/     未启用插件的零分补位
+  ├── real_pipeline.py    ← 直接注册本仓 goalX 的工厂（默认）
+  └── glioma/     ← 走内置算法实现的桥接工厂
+vendor/          内置的算法实现（自包含用；见 vendor/README.md）
 pipeline/        PipelineContext、编排与聚合
 output/          Writer、schema 常量与 Validator
 observability/   比赛 JSONL 日志
-scripts/         本地评测和 Mock Competition
+configs/         插件与平台配置示例
+scripts/         本地评测、Mock Competition、提交前自检
 tests/           契约与端到端测试
 ```
 
@@ -151,6 +172,35 @@ PASS Output and NIfTI validation
 PASS Callback
 ```
 
+## 提交前自检
+
+**一条命令、退出码即结论**（`0` = GO，`1` = NO-GO）：
+
+```bash
+python3 scripts/pre_submit_check.py --limit 20     # 冒烟 20 例，约 1 分钟
+python3 scripts/pre_submit_check.py --full         # 完整跑（慢，提交前最后一遍）
+```
+
+关卡：`G1 环境` → `G2 权重`（**`seg` 头是否真的加载上**）→ `G3 预处理`
+（本仓两份预处理与训练侧逐项对齐）→ `G4 冒烟`（空掩膜率 / `pmax`）→
+`G5 端到端`（`--full`）→ `G6 内存`（常驻模型总数）→ `G7 后处理`（真实体积下的峰值）。
+
+设计上**任何一关抛异常都不中断**，只记 FAIL 继续跑 —— 一次看到全部问题，
+而不是修一个跑一次。
+
+按需使用的单项诊断脚本：
+
+| 脚本 | 用途 |
+|---|---|
+| `scripts/audit_goal5.py` | 权重真伪 + 预处理一致性（只读，不跑推理） |
+| `scripts/probe_goal5.py` | **不重启服务**，直接跑几例看 Goal5 诊断（空掩膜成因） |
+| `scripts/mem_audit.py` | 量化常驻内存的放大环节并推算峰值 |
+| `scripts/voxel_consistency.py` | 体素判别的准确率 + 概率饱和度 |
+
+启动方式提醒：**用 `./start.sh`，不要直接 `python -m uvicorn`** ——
+`start.sh` 会设好 `COMPETITION_PIPELINE_FACTORY`、容错开关、体素模型路径，
+并打印权重解析结果。
+
 ## 接入真实模型
 
 ### 1. 实现 Task
@@ -180,42 +230,43 @@ embedding、哈希等轻量特征。Task 不能直接读取比赛输出目录、
 
 ### 2. 构建真实 Pipeline
 
-例如创建 `tasks/real_pipeline.py`：
+**本仓已有** `tasks/real_pipeline.py`，直接注册 `tasks/goalX` 的真实插件：
 
 ```python
 from pipeline.inference import InferencePipeline, StudyTaskBinding
-from tasks.dummy.dataset_tasks import DummyDuplicateTask
-from tasks.dummy.study_tasks import (
-    DummyGoal1Task,
-    DummyGoal4Task,
-    DummyGoal5Task,
-    DummyStitchedTask,
-)
-from tasks.goal3.task import RealGoal3Task
+
+DEFAULT_GOALS = "goal1,goal2_stitched,goal3,goal5,goal4,goal2_duplicate"
+
+_BUILDERS = {
+    "goal1": ("tasks.goal1_authenticity.task", "Goal1Task"),
+    "goal2_stitched": ("tasks.goal2_stitched.task", "StitchedTask"),
+    # …goal3 / goal5 / goal4 / goal2_duplicate
+}
 
 
-def build_pipeline():
-    return InferencePipeline(
-        study_tasks=(
-            StudyTaskBinding("goal1", DummyGoal1Task()),
-            StudyTaskBinding("goal2_stitched", DummyStitchedTask()),
-            StudyTaskBinding("goal3", RealGoal3Task()),
-            StudyTaskBinding("goal5", DummyGoal5Task()),
-            StudyTaskBinding("goal4", DummyGoal4Task()),
-        ),
-        duplicate_task=DummyDuplicateTask(),
-    )
+def build_pipeline() -> InferencePipeline:
+    enabled = {g.strip() for g in os.environ.get("GLIOMA_GOALS", DEFAULT_GOALS).split(",") if g.strip()}
+    # 启用的用真实插件，未启用的用 tasks/dummy 补位
+    ...
 ```
 
-然后配置：
+配置：
 
 ```bash
 export COMPETITION_PIPELINE_FACTORY='tasks.real_pipeline:build_pipeline'
 ```
 
-服务启动时会调用工厂并执行每个 Task 的 `load_model()`。这样可以逐项替换 Dummy，不修改 API、Writer 或 Validator。
+服务启动时会调用工厂并执行每个 Task 的 `load_model()`。启用几个插件由 `GLIOMA_GOALS`
+决定，**未启用的自动用 Dummy 补位** —— 这就是规范 §15.1「每次只替换一个插件并运行
+完整回归」的直接支持。启动日志会打印 `真实插件 N/6` 以及补位的 Dummy 名单，
+避免"以为全开了、其实只有列出来的几个是真的"。
+
+新增或替换一个插件时，只需在 `tasks/` 下实现 Task 并在 `_BUILDERS` 注册，
+不修改 API、Writer 或 Validator。
 
 ## 环境变量
+
+平台协议相关：
 
 - `COMPETITION_WORKSPACE`：默认 `/2026aicompetition/workspace`；
 - `COMPETITION_ANSWER_ROOT`：可选，默认 `${COMPETITION_WORKSPACE}/answer`；
@@ -224,7 +275,36 @@ export COMPETITION_PIPELINE_FACTORY='tasks.real_pipeline:build_pipeline'
 - `COMPETITION_CALLBACK_TIMEOUT`：单次 callback 超时，默认 10 秒；
 - `COMPETITION_CALLBACK_ATTEMPTS`：callback 尝试次数，默认 3；
 - `COMPETITION_MAX_WORKERS`：后台队列 worker 数，默认 1；共享 Pipeline 的推理会串行执行；
-- `COMPETITION_PIPELINE_FACTORY`：可选真实插件工厂，格式为 `module:function`。
+- `COMPETITION_PIPELINE_FACTORY`：真实插件工厂，格式为 `module:function`。
+  **不设它 = 静默跑 Dummy 基线**（服务照常起、`/health` 通，但答案是占位），
+  `start.sh` 已默认设为 `tasks.real_pipeline:build_pipeline`。
+
+插件与算法实现：
+
+- `COMPETITION_CHECKPOINT_ROOT`：权重根，默认 `${COMPETITION_WORKSPACE}/checkpoint`；
+  各 Goal 权重在其子目录（如 `goal5_segmentation/`）下取 `core.pt`，
+  没有该文件时取该目录全部 `*.pt` 做多折集成；
+- `GLIOMA_GOALS`：启用哪些真实插件（逗号分隔），未列出的用 Dummy 补位；
+- `GLIOMA_TRACK4_ROOT`：**覆盖**内置算法实现的路径（默认用 `vendor/glioma_track4/`）。
+  仅当你要用独立演进的算法工程时才设；
+- `GLIOMA_DEVICE`：推理设备，默认 `cuda`；
+- `GLIOMA_CKPT`：显式指定权重路径（逗号分隔，多折集成），优先级高于
+  `COMPETITION_CHECKPOINT_ROOT`；
+- `GLIOMA_MODALITY_MODEL`：体素判别模型 JSON。`start.sh` 已默认指向
+  `vendor/glioma_track4/data/modality_model.json`，缺失时退回**内嵌系数**
+  （实测一致率 ≈27%，低于三分类随机水平）。
+
+评测健壮性（**默认值已按实测结论设好，一般不用改**）：
+
+- `GLIOMA_LOADER_TOLERANT`：逐例容错，默认 **1（开）**。评测**不可重跑**，
+  关掉它则 1 例脏数据会让整批 staging 被删 → 几百例一起 0 分；
+- `GLIOMA_VOXEL_GUESS_EXCLUDED`：是否允许体素判别**覆盖**官方表里的
+  `其他`/`正常`/`平扫`，默认 **0（不覆盖）**。实测判别器对这类 OOD 输入的
+  置信度会饱和、整体一致率低于随机，把定位像当 T1CE 填进通道比留空更有害；
+- `GLIOMA_PROGRESS`：逐例打印进度行（默认开）。一次几百例跑很久，
+  没有它「进程卡死」与「某例在跑分钟级滑窗」在日志上无法区分；
+- `GLIOMA_MAX_ENSEMBLE`：多折集成的**份数上限**，默认 8。超出即报错并列出
+  全部文件 —— 防止权重目录里混进训练快照后被静默加载成几十个常驻模型（容器 OOM）。
 
 示例见 `configs/competition.env.example`。
 

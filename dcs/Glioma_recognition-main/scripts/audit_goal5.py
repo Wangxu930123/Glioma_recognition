@@ -28,7 +28,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-TRAIN_CFG_DEFAULT = "/2026aicompetition/workspace/dcs/glioma_track4/configs/preprocess.yaml"
+#: 训练侧配置位置：**优先本仓内置副本**（``vendor/glioma_track4/configs/``），
+#: 找不到才回退到平台上的独立算法工程路径。内置副本随仓库一起走，
+#: 所以本脚本在干净 clone 下也能直接跑。
+_VENDOR_TRAIN_CFG = (Path(__file__).resolve().parents[1]
+                     / "vendor" / "glioma_track4" / "configs" / "preprocess.yaml")
+TRAIN_CFG_DEFAULT = (str(_VENDOR_TRAIN_CFG) if _VENDOR_TRAIN_CFG.is_file()
+                     else "/2026aicompetition/workspace/dcs/glioma_track4/configs/preprocess.yaml")
 
 #: 训练侧 ``preprocess.yaml`` 里要核对的项（点号路径 → 中文含义）
 _PARAM_KEYS = (

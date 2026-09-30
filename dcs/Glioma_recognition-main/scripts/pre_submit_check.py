@@ -34,7 +34,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 DATA_DEFAULT = "/2026aicompetition/datasets/verification/original"
-TRAIN_CFG_DEFAULT = "/2026aicompetition/workspace/dcs/glioma_track4/configs/preprocess.yaml"
+#: 训练侧配置位置：**优先本仓内置副本**（``vendor/glioma_track4/configs/``），
+#: 找不到才回退到平台上的独立算法工程路径。内置副本随仓库一起走，
+#: 所以本脚本在干净 clone 下也能直接跑。
+_VENDOR_TRAIN_CFG = ROOT / "vendor" / "glioma_track4" / "configs" / "preprocess.yaml"
+TRAIN_CFG_DEFAULT = (str(_VENDOR_TRAIN_CFG) if _VENDOR_TRAIN_CFG.is_file()
+                     else "/2026aicompetition/workspace/dcs/glioma_track4/configs/preprocess.yaml")
 
 #: 关卡结果：(名称, 状态, 摘要)。状态 ∈ {PASS, FAIL, WARN, SKIP}
 _GATES: list[tuple[str, str, str]] = []

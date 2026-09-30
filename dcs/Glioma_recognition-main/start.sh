@@ -38,7 +38,7 @@ export GLIOMA_LOADER_TOLERANT
 export GLIOMA_VOXEL_GUESS_EXCLUDED
 
 # --------------------------------------------------------------------------- #
-# 体素判别模型：**自动挂载重训后的外部模型**（这是一个真实踩过的坑）
+# 体素判别模型：**自动挂载**（优先本仓内置副本，其次重训后的外部模型）
 # --------------------------------------------------------------------------- #
 # 事实对照：
 #   · 仓库**内嵌**系数 = 在**本地模拟集**上拟合的，与官方数据有域差 → 实测一致率 ≈27%，
@@ -48,15 +48,29 @@ export GLIOMA_VOXEL_GUESS_EXCLUDED
 #   · 而 data/voxel_modality.load_model() **只认 GLIOMA_MODALITY_MODEL 环境变量**：
 #     漏了它就会**静默地**用内嵌系数（日志上只差一行字），重训等于白做。
 # 评测不可重跑 + 环境变量最容易漏配 → 所以在 start.sh 里显式挂上，并在缺失时**大声报警**。
-GLIOMA_MODALITY_MODEL="${GLIOMA_MODALITY_MODEL:-/2026aicompetition/workspace/dcs/glioma_track4/data/modality_model.json}"
+#
+# 查找顺序：① 环境变量显式指定；② **本仓内置** vendor/glioma_track4/data/；
+#           ③ 平台上的独立算法工程。②随仓库一起 clone，所以自包含。
+_SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+_VENDOR_MODEL="$_SCRIPT_DIR/vendor/glioma_track4/data/modality_model.json"
+if [ -f "$_VENDOR_MODEL" ]; then
+  _DEFAULT_MODEL="$_VENDOR_MODEL"
+else
+  _DEFAULT_MODEL="/2026aicompetition/workspace/dcs/glioma_track4/data/modality_model.json"
+fi
+GLIOMA_MODALITY_MODEL="${GLIOMA_MODALITY_MODEL:-$_DEFAULT_MODEL}"
 if [ -f "$GLIOMA_MODALITY_MODEL" ]; then
   export GLIOMA_MODALITY_MODEL
-  echo "[start.sh] 体素判别模型：$GLIOMA_MODALITY_MODEL（外部 / 重训后）"
+  if [ "$GLIOMA_MODALITY_MODEL" = "$_VENDOR_MODEL" ]; then
+    echo "[start.sh] 体素判别模型：$GLIOMA_MODALITY_MODEL（本仓内置）"
+  else
+    echo "[start.sh] 体素判别模型：$GLIOMA_MODALITY_MODEL（外部 / 重训后）"
+  fi
 else
   echo "[start.sh] !! 未找到 $GLIOMA_MODALITY_MODEL"
   echo "[start.sh] !! 将退回**内嵌系数**（本地模拟集训练，实测一致率约 27%，低于随机）"
   echo "[start.sh] !! 修法：cd ../glioma_track4 && python3 scripts/31_train_modality_model.py --root /2026aicompetition/datasets/training/annotation"
-  echo "[start.sh] !! 然后把输出复制到：$GLIOMA_MODALITY_MODEL"
+  echo "[start.sh] !! 然后把输出复制到：$_VENDOR_MODEL"
 fi
 
 # --------------------------------------------------------------------------- #

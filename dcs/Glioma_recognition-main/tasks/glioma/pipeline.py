@@ -19,7 +19,8 @@ def build_pipeline():
     """构建带真实插件的 ``InferencePipeline``。"""
     if TRACK4_ROOT is None:
         raise RuntimeError(
-            "未找到算法工程 glioma_track4：请设置 GLIOMA_TRACK4_ROOT，"
+            "未找到算法实现：本仓内置副本 vendor/glioma_track4/ 应随仓库一起提供；"
+            "若已被删，请设置 GLIOMA_TRACK4_ROOT 指向算法工程根，"
             "或将其放在本仓库同级目录 / /2026aicompetition/workspace/glioma_track4"
         )
     from integration.factory import build_pipeline as _build      # noqa: PLC0415

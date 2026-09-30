@@ -1108,6 +1108,216 @@ python3 scripts/probe_goal5.py /2026aicompetition/datasets/verification/original
 
 ---
 
+## 3e. 权重真伪 + 预处理一致性（**空掩膜的头号嫌疑**）
+
+### 已找到并修复的 4 处不一致
+
+逐行对比 `Goal5Config` 与训练侧 `glioma_track4/configs/preprocess.yaml`：
+
+| 项 | 训练侧 | 修前提交侧 | 后果 |
+|---|---|---|---|
+| **通道取用链** | `t1c←[t1,t2]`、`flair←[t2]`、`t2←[]`、`t1←[]` | **无 fallback**（缺→零通道） | ~47% 缺 T1CE 的检查：训练时 `t1c` 通道装着 T1/T2 影像，推理时**全零** → 输入分布完全不同 |
+| **`max_spacing_factor`** | **1.5** | **4.0**（`_common/spatial.py` 默认值兜底） | 3mm 层厚：训练保持 3mm、推理插值到 1mm → 网格形状不同 |
+| **参考网格优先级** | `t1c→flair→t2→t1` | `t1c→t1→flair→t2` | 缺 T1CE 时训练用 FLAIR 建网格、推理用 T1 → 网格与 affine 都不同 |
+| `overlap` | `0.4` | `0.5` | 次要（滑窗接缝） |
+
+**实测差异**（3mm 层厚、shape `(20,20,10)`）：
+
+```text
+旧 max_factor=4.0 -> grid (20, 20, 30)    ← 3mm 被插值到 1mm
+新 max_factor=1.5 -> grid (20, 20, 10)    ← 3mm 保持原样（与训练一致）
+
+通道填充（只有 T2WI + T2-Flair 的检查）：
+  修前: missing = ('t1c', 't1')   非零通道 2 个   ← t1c 通道全零
+  修后: missing = ('t1',)         非零通道 3 个   ← t1c ← t2 顶替（训练侧规则）
+```
+
+> **这解释了"通道越全反而越差"的倒挂**：不是通道多少的问题，而是**缺通道时"填零"还是"填替代模态"**的问题。
+> 训练时模型见到的是替代模态，推理时收到零 → 分布错位 → 输出塌陷。
+
+### 仍需你在容器里确认：**`seg` 头有没有真的加载上**
+
+`inference.load_model` 用 `strict=False`，但**缺失键只过滤 `("enc","dec","bottleneck","stem")` 前缀**：
+
+```101:106:Glioma_recognition-main/tasks/goal5_segmentation/inference.py
+        missing, _ = m.core_model.load_state_dict(state, strict=False)
+        # 训练态权重含 cls/special 头，推理只用 seg；缺失非骨干键是预期的
+        seg_missing = [k for k in missing
+                       if k.startswith(("enc", "dec", "bottleneck", "stem"))]
+        if seg_missing:
+            raise ValueError(f"{p.name}: 骨干关键层缺失 {len(seg_missing)} 个：{seg_missing[:3]}")
+```
+
+**`seg` 头的键名若对不上，会被静默随机初始化** —— 权重校验通过、服务正常启动，而分割输出永远是噪声 → 概率低于阈值 → **空掩膜**。这正是当前现象。
+
+新脚本直接把它查出来：
+
+```bash
+cd /2026aicompetition/workspace/dcs/GliomaRecognition/dcs/Glioma_recognition-main
+python3 scripts/audit_goal5.py 2>&1 | tee logs/audit_goal5.log
+```
+
+- **A 权重真伪**：顶层元数据（`arch`/`model_cfg`/`thresholds`/`epoch`/`best_metric`/`fold`）、`state_dict` 张量数、**`load_state_dict` 后按模块分组的缺失键**、**`seg` 头权重数值统计**
+- **B 预处理一致性**：16 项参数逐项对比 + 通道取用链对比
+
+| A 的输出 | 结论 |
+|---|---|
+| `!!! seg 头有 N 个键没加载上` | ❗ **权重导出问题** —— 分割头是随机的，改预处理也救不回来 |
+| `seg 头：已全部加载 ✅` | 权重没问题 → 病因在预处理（本轮已修 4 处） |
+| `state_dict: 0 个张量` / `顶层不是 dict` | ❗ 权重文件不是模型 |
+| `元数据键: []`（无 `arch`/`thresholds`） | ⚠️ 不是训练脚本产出 → 阈值也走 `(0.5,0.5)` 兜底 |
+| `seg 权重 std ≈ 0.10（≈1/√96）且均值 ≈ 0` | ⚠️ 疑似随机初始化 |
+
+```bash
+# 只跑 B（不加载 torch）
+python3 scripts/audit_goal5.py --skip-weights \
+  --train-config ../glioma_track4/configs/preprocess.yaml
+```
+
+**B 的期望输出**（本仓已对齐，实测 16/16 OK）：
+
+```text
+  参数                                                 训练侧               提交侧   判定
+  geometry.common_spacing                (1.0, 1.0, 1.0)   (1.0, 1.0, 1.0)   OK
+  geometry.max_spacing_factor                        1.5               1.5   OK
+  geometry.crop_brain                               True              True   OK
+  geometry.brain_margin_vox                            4                 4   OK
+  geometry.resample_order_img                          1                 1   OK
+  intensity.clip_percentile                  (0.5, 99.5)       (0.5, 99.5)   OK
+  intensity.foreground_only                         True              True   OK
+  inference.patch                           (96, 96, 96)      (96, 96, 96)   OK
+  inference.overlap                                  0.4               0.4   OK
+  inference.tta_flips                         ('x', 'y')        ('x', 'y')   OK
+  inference.seg_tta_flips                     ('x', 'y')        ('x', 'y')   OK
+  inference.tta_batch                                  2                 2   OK
+  inference.global_size                               96                96   OK
+  inference.min_tumor_voxels                          30                30   OK
+  inference.keep_components                            3                 3   OK
+  inference.bridge_mm                               10.0              10.0   OK
+
+  通道取用链（两侧一致）:
+    t1c    <- ['t1c', 't1', 't2']
+    flair  <- ['flair', 't2']
+    t2     <- ['t2']
+    t1     <- ['t1']
+
+  ★ 预处理与训练侧一致 ✅
+```
+
+### 一个已排除的嫌疑：**归一化是等价的**
+
+`preprocess._zscore`（提交侧）与 `dataset.zscore_volume`（训练侧）逐行对比：
+
+| 步骤 | 训练侧 | 提交侧 |
+|---|---|---|
+| 前景取值 | `sel = a[a > 0]` | `fg = vol[vol > 0]` |
+| 分位点 | `percentile(sel, (0.5, 99.5))` | `percentile(fg, (0.5, 99.5))` |
+| 均值/方差 | 在**裁剪后的前景** `sel` 上算 | 在 `clip(vol, lo, hi)[vol > 0]` 上算 —— **同一个集合** |
+| 归一化 | `(clip(a) - m) / (s + 1e-6)` | `(clip(vol) - m) / (s or 1.0)` |
+
+差异只在退化分支（前景为空时训练返回全零、提交原样返回），真实数据不触发。**所以归一化不是病因。**
+
+---
+
+## 3f. 后处理审计（已找到 1 处真 bug）+ 提交前一键预检
+
+### 3f.1 已修：`clean_pair` 没传 `spacing`，桥接半径被按 1mm 硬算
+
+`clean_mask` 的 `spacing` 参数默认 `(1,1,1)`，而 `clean_pair` **没有传**，于是：
+
+```python
+rad = [max(1, round(radius_mm / s)) for s in spacing]
+```
+
+`bridge_mm=10.0` + `spacing=(1,1,1)` → `rad=[10,10,10]` → 结构元恒为 **21×21×21**。
+
+但公共网格**不总是 1mm 各向同性** —— `build_volume` 对层厚 > 1.5mm 的轴**保持原始 spacing**（与训练一致）。
+一条 **3mm 层厚**的序列，10mm 桥接半径本该是 **3 体素**，却被当成 **10 体素** → **实际桥接 30mm**：
+
+| 层厚 | 应有半径 | 实际半径 | 放大倍数 |
+|---|---|---|---|
+| 1mm | 10 体素 | 10 体素 | 1× |
+| 3mm | **3 体素** | **10 体素** | **3.3×** |
+| 5mm | 2 体素 | 10 体素 | 5× |
+
+形态学闭运算会把**远离病灶的假阳性斑点**与病灶连成一体 → 直接拉低 Precision 与 HD95。
+
+> **这个 bug 不会让掩膜变空、不报错、不抛异常** —— 它只悄悄掉分，所以特别隐蔽。
+
+**修复**：`clean_pair(..., spacing=...)` 透传，`task.py` 调用处传 `spacing_of(prepared.affine)`。
+
+**后处理里唯一会让空掩膜变空的地方**（已逐行确认，其余无 bug）：
+
+```57:57:Glioma_recognition-main/tasks/goal5_segmentation/postprocess.py
+    return m if int(m.sum()) >= int(min_voxels) else np.zeros_like(m, dtype=bool)
+```
+
+只有 `min_tumor_voxels = 30`（= 30mm³）这一条。所以诊断里的
+`core_pre_voxels = 0` **必然**是「概率低于阈值」，不是后处理吃掉；反之 `pre > 0` 而终值 0 才是后处理。
+`_largest_components`（保留体积最大前 3 个连通域）与 `_bridge` 都是**扩张性**操作，不可能把非空掩膜变空。
+
+### 3f.2 提交前一键预检（**你要的那份脚本**）
+
+```bash
+cd /2026aicompetition/workspace/dcs/GliomaRecognition/dcs/Glioma_recognition-main
+python3 scripts/pre_submit_check.py 2>&1 | tee logs/pre_submit.log
+```
+
+**一条命令、无需参数、退出码即结论**（`0` = GO，`1` = NO-GO）。
+
+| 关卡 | 检查什么 | 不通过则 |
+|---|---|---|
+| **G1 环境** | torch / CUDA / 权重文件 / 数据目录 | NO-GO |
+| **G2 权重** | `load_state_dict` 后 **`seg` 头是否真的加载上**（最容易静默出错的一关） | NO-GO |
+| **G3 预处理** | 15 项参数 + 4 条通道取用链 vs 训练侧 yaml | NO-GO |
+| **G4 冒烟** | 直接对前 N 例推理，统计**空掩膜率**与 `pmax` | NO-GO（>60%）/ WARN（>20%） |
+| **G5 端到端** | 完整 runner（Writer+Validator）+ 离线格式校验（`--full` 才跑） | NO-GO |
+
+任一关抛异常都不会让脚本崩 —— 记成 FAIL 后继续跑下一关，**一次看到全部问题**。
+
+```bash
+python3 scripts/pre_submit_check.py                      # 默认 5 例冒烟，约 1 分钟
+python3 scripts/pre_submit_check.py --limit 20           # 多冒烟几例更可靠
+python3 scripts/pre_submit_check.py --full               # 完整跑一遭（提交前最后一道保险）
+```
+
+**判据（G4 空掩膜率）**：
+
+| 空掩膜率 | 判定 | 含义 |
+|---|---|---|
+| ≤ 20% | PASS | 可以提交 |
+| 20%~60% | WARN | 可提交但分数受损 |
+| **> 60%** | **FAIL** | **先别交** —— 基本必然低分 |
+
+**已验证**（本机构造合成权重 + 合成数据实跑）：
+
+```text
+GO 路径：G1 ✔ / G2 ✔ / G3 ✔ / G4 ✔（空掩膜率 0%）→ 结论 GO，退出码 0
+失败路径：把 seg 头的键名改坏 → G2 报
+          「缺失键 2 个 {'seg_head': 2}」「!!! seg 头没加载上 → 分割头是随机初始化的」
+          → 结论 NO-GO，退出码 1  ✓ 真的抓得到
+```
+
+### 3f.3 提交顺序（照这个来）
+
+```bash
+cd /2026aicompetition/workspace/dcs/GliomaRecognition/dcs/Glioma_recognition-main
+
+# ① 一键预检 —— 看到 GO 再往下
+export GLIOMA_LOADER_TOLERANT=1        # 逐例容错：1 例脏数据 ≠ 整批作废
+python3 scripts/pre_submit_check.py --limit 20 2>&1 | tee logs/pre_submit.log
+
+# ② 若 G4 报空掩膜率偏高，跑详细探针定位成因
+python3 scripts/probe_goal5.py /2026aicompetition/datasets/verification/original 5
+
+# ③ GO 之后，重启服务让代码生效，再正式提交
+```
+
+> ⚠️ **改了代码必须重启服务** —— `Goal5Config` 与 postprocess 都是进程启动时读取的。
+> 只 `git pull` 不重启，跑的还是旧代码。
+
+---
+
 ## 4. 三份诊断怎么组合成结论
 
 | ① 表诊断 | ② 一致率 | ③ Goal5 | 结论 | 动作 |

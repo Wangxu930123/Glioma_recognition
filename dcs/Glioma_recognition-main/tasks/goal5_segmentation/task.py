@@ -23,7 +23,7 @@ from tasks.goal5_segmentation.config import Goal5Config
 from tasks.goal5_segmentation.inference import LoadedGoal5, infer_segmentation, load_model
 from tasks.goal5_segmentation.postprocess import clean_pair
 from tasks.goal5_segmentation.preprocess import PreparedVolume, build_volume
-from tasks.goal5_segmentation.spatial import restore_binary_to_source
+from tasks.goal5_segmentation.spatial import restore_binary_to_source, spacing_of
 from tasks.results import Goal5Result
 
 #: core / flair 的来源模态优先级（第一个命中者作为掩膜的参考空间）
@@ -73,7 +73,11 @@ class Goal5Task(StudyTask[Goal5Result]):
             keep_components = cfg_pp.keep_components
             bridge_mm = cfg_pp.bridge_mm
 
-        core_bin, flair_bin = clean_pair(core_p, flair_p, _T())
+        # ⚠️ 必须把**公共网格的实际 spacing** 传进去：``bridge_mm`` 是按 mm 给定的，
+        # 而网格对层厚 > 1.5mm 的轴保留原始 spacing（不总是 1mm）。不传就会按 1mm 换算，
+        # 在 3mm 层厚的网格上把 10mm 桥接半径放大成 30mm（见 postprocess.clean_pair）。
+        core_bin, flair_bin = clean_pair(core_p, flair_p, _T(),
+                                         spacing=spacing_of(prepared.affine))
 
         # ---- 诊断：把"掩膜为空"的成因拆开（概率不够 vs 后处理吃掉了）----
         # 这两种成因的修法完全不同，而只看 ``core_voxels=0`` 无法区分：

@@ -59,4 +59,34 @@ else
   echo "[start.sh] !! 然后把输出复制到：$GLIOMA_MODALITY_MODEL"
 fi
 
+# --------------------------------------------------------------------------- #
+# 真实插件工厂：**不设它 = 静默跑 Dummy 基线**（最致命的一条）
+# --------------------------------------------------------------------------- #
+# core/registry.py 的行为：``factory_path`` 为空时**只打印一条告警**就返回
+# ``InferencePipeline()`` —— 服务照常起来、``/health`` 通、回调也正常，
+# 但答案是占位内容（几乎 0 分），而日志里只有一行字，极难定位。
+#
+# 本仓 ``tasks/goalX`` 是完整实现（自包含，不依赖外部算法工程），
+# 所以用 ``tasks.real_pipeline``；``tasks.glioma.pipeline`` 是过渡桥接（指向 glioma_track4）。
+#
+# ``GLIOMA_GOALS`` 控制启用哪些真实插件，未启用的用 Dummy 补位（规范 §15.1 逐项接入）。
+: "${COMPETITION_PIPELINE_FACTORY:=tasks.real_pipeline:build_pipeline}"
+export COMPETITION_PIPELINE_FACTORY
+echo "[start.sh] 真实插件工厂：$COMPETITION_PIPELINE_FACTORY"
+echo "[start.sh] 启用 Goal：${GLIOMA_GOALS:-（默认：除下面这条外全开）}"
+echo "[start.sh] 权重根    ：${COMPETITION_CHECKPOINT_ROOT:-<未设>→回退 \${COMPETITION_WORKSPACE:-/2026aicompetition/workspace}/checkpoint}"
+
+# 权重存在性：缺失时 registry 会抛 FileNotFoundError（响亮），
+# 但**路径写错成另一份旧权重**是静默的 —— 所以把解析结果打印出来。
+_G5DIR="${COMPETITION_CHECKPOINT_ROOT:-${COMPETITION_WORKSPACE:-/2026aicompetition/workspace}/checkpoint}/goal5_segmentation"
+if [ -e "$_G5DIR/core.pt" ]; then
+  echo "[start.sh] Goal5 权重：$_G5DIR/core.pt"
+elif [ -d "$_G5DIR" ]; then
+  echo "[start.sh] Goal5 权重：$_G5DIR/ 下无 core.pt → 取该目录下全部 *.pt 做多折集成："
+  ls -1 "$_G5DIR"/*.pt 2>/dev/null || echo "[start.sh] !! 该目录下没有 *.pt"
+else
+  echo "[start.sh] !! Goal5 权重目录不存在：$_G5DIR"
+  echo "[start.sh] !! 服务会在加载模型时抛 FileNotFoundError；请确认 COMPETITION_CHECKPOINT_ROOT"
+fi
+
 exec python -m uvicorn app.server:app --host 0.0.0.0 --port 8000 --workers 1

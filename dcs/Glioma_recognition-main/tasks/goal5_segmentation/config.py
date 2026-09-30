@@ -32,8 +32,18 @@ class Goal5Config:
 
     #: 公共网格（1mm）与滑窗
     common_spacing: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    #: 层厚超过 ``max_spacing_factor × common_spacing`` 的轴**保持原始 spacing**
+    #: （把 3~5mm 层厚强行插值到 1mm 只会产生虚假细节）。
+    #:
+    #: ⚠️ **必须与训练侧一致**：训练侧 ``configs/preprocess.yaml`` 的
+    #: ``geometry.max_spacing_factor`` 默认 **1.5**。此前本值缺失、由
+    #: ``tasks/_common/spatial.target_grid`` 的默认参数 **4.0** 兜底 ——
+    #: 于是同一条 3mm 层厚的 FLAIR：训练时保持 3mm，推理时被插值到 1mm，
+    #: **公共网格形状与训练分布不一致** → 输入 OOD → 分割输出塌陷（空掩膜）。
+    max_spacing_factor: float = 1.5
     patch: tuple[int, int, int] = (96, 96, 96)
-    overlap: float = 0.5
+    #: 滑窗重叠：训练侧 ``preprocess.yaml`` 的 ``inference.overlap`` 为 **0.4**。
+    overlap: float = 0.4
     tta_flips: tuple[str, ...] = ("x", "y")
     tta_batch: int = 2
     global_size: int = 96

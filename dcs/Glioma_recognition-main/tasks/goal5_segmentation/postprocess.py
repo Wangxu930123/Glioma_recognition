@@ -57,16 +57,30 @@ def clean_mask(prob: np.ndarray, threshold: float, min_voxels: int,
     return m if int(m.sum()) >= int(min_voxels) else np.zeros_like(m, dtype=bool)
 
 
-def clean_pair(core_prob: np.ndarray, flair_prob: np.ndarray, cfg) -> tuple[np.ndarray, np.ndarray]:
+def clean_pair(core_prob: np.ndarray, flair_prob: np.ndarray, cfg,
+               spacing: tuple[float, float, float] = (1.0, 1.0, 1.0)
+               ) -> tuple[np.ndarray, np.ndarray]:
     """双通道联合后处理。
 
     任务语义上 **core ⊆ peri**（增强核心区是周围总异常区的一部分）。
     若模型给出的 core 越出 peri，说明边界处的两通道不一致——这里用
     并集兜底，避免出现"核心区在异常区之外"这种物理上不可能的答案。
+
+    ``spacing``：**公共网格的实际体素尺寸（mm）**，必须由调用方传入。
+
+    ⚠️ 此前这里**没有传** ``spacing``，于是 ``bridge_mm=10.0`` 被按
+    ``rad = round(10 / 1.0) = 10`` 换算：结构元恒为 **21×21×21**。
+    但公共网格并不总是 1mm 各向同性 —— ``build_volume`` 对层厚 > 1.5mm 的轴
+    **保持原始 spacing**（与训练侧一致）。一条 3mm 层厚的序列，10mm 桥接半径
+    本该是 3 体素，却被当成 10 体素 → **实际桥接 30mm**：
+    形态学闭运算会把远离病灶的假阳性斑点与病灶连成一体，直接拉低 Precision 与
+    HD95（不会让掩膜变空，因此这个 bug 不报错、只悄悄掉分）。
     """
     core = clean_mask(core_prob, cfg.default_thresholds[0], cfg.min_tumor_voxels,
+                      spacing=spacing,
                       keep_components=cfg.keep_components, bridge_mm=cfg.bridge_mm)
     peri = clean_mask(flair_prob, cfg.default_thresholds[1], cfg.min_tumor_voxels,
+                      spacing=spacing,
                       keep_components=cfg.keep_components, bridge_mm=cfg.bridge_mm)
     if core.any() and peri.any():
         peri = np.logical_or(peri, core)

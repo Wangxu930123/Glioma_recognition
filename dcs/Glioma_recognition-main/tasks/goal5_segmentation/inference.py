@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -58,6 +59,22 @@ def resolve_ckpts(ckpt_root: Path, rel: str) -> list[Path]:
     ⚠️ 本函数由 ``tasks/_common/backbone_runner.py`` **懒加载复用**：所有 Goal 的
     权重都走这一套解析规则。所以报错信息里**不要写死某个 Goal 名** ——
     否则 Goal1 缺权重时会报成 "未找到 Goal5 权重"，把排障的人带偏一整天。
+
+    ⚠️⚠️ **上面的规则 2 是一个静默的内存放大点，必须设上限**：
+
+    ``BackboneRunner.load()`` 会把本函数返回的**每一份**权重都构建成一个
+    **常驻模型**（``self._members.append(...)``，推理期间不释放）。
+    而每一个 ``StudyTask`` 都各持有一个 ``BackboneRunner`` —— 于是常驻模型数 =
+
+    ``启用 Goal 数 × 本函数返回的份数``。
+
+    目录里只要混进训练快照（``epoch_10.pt`` / ``last.pt`` / 备份），
+    份数就会**成倍**上升；训练快照还带着 Adam 的优化器状态（约 2× 参数量），
+    单份体积也大得多。实测过"评测一启动容器就 OOM 重启"就是这条路径。
+
+    因此这里**限制集成规模**（``GLIOMA_MAX_ENSEMBLE``，默认 8），
+    超过就**明确报错**并列出全部文件，让人一眼看出目录里多放了什么 ——
+    而不是静默加载几十个模型把容器撑爆。
     """
     target = resolve_ckpt(ckpt_root, rel)
     if target.is_file():
@@ -66,6 +83,27 @@ def resolve_ckpts(ckpt_root: Path, rel: str) -> list[Path]:
     if parent.is_dir():
         cks = sorted(p for p in parent.glob("*.pt") if p.is_file())
         if cks:
+            limit = max(1, int(os.environ.get("GLIOMA_MAX_ENSEMBLE", "8") or 8))
+            if len(cks) > limit:
+                names = [p.name for p in cks]
+                raise ValueError(
+                    f"{parent} 下没有规范约定的 {target.name}，"
+                    f"于是按『多折集成』解析出 **{len(cks)}** 份 *.pt，"
+                    f"超过上限 {limit}（GLIOMA_MAX_ENSEMBLE）。\n"
+                    f"  每个 StudyTask 会把**每一份**都加载成一个常驻模型，"
+                    f"常驻模型数 = 启用 Goal 数 × {len(cks)} —— 这就是容器 OOM 的典型成因。\n"
+                    f"  目录内容: {names}\n"
+                    f"  三种修法（任选其一）：\n"
+                    f"    1) 只保留一份权重并命名为 {target.name}（本函数会优先取它）；\n"
+                    f"    2) 把训练快照 / 备份 / 优化器检查点移到别的目录；\n"
+                    f"    3) 确实要多折集成且超过 {limit} 折：export GLIOMA_MAX_ENSEMBLE={len(cks)}"
+                )
+            if len(cks) > 1:
+                print(
+                    f"[ckpt] {parent.name}: 没有 {target.name} → "
+                    f"按多折集成加载全部 {len(cks)} 份: {[p.name for p in cks]}",
+                    flush=True,
+                )
             return cks
     raise FileNotFoundError(
         f"未找到权重：{target}（规范 §5.2 约定 {rel}；"

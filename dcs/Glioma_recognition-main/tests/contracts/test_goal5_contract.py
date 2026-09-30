@@ -100,10 +100,22 @@ def test_entrypoint_does_not_import_training_modules():
 # 5. 插件不产生比赛目录副作用
 # --------------------------------------------------------------------------- #
 def test_task_does_not_touch_answer_dir(tmp_path, monkeypatch):
-    """实例化与 load_model 失败都不应创建任何 answer/ 目录。"""
+    """实例化与 load_model 失败都不应创建任何 answer/ 目录。
+
+    ⚠️ **必须把权重根也钉在临时目录里**（只钉 ``COMPETITION_WORKSPACE`` 不够）：
+    ``Settings.from_env()`` 会读 ``COMPETITION_CHECKPOINT_ROOT``，而正式评测容器里
+    这个变量**本来就是设好的**（指向真权重）。于是本测试会真的把模型加载起来跑完
+    推理，``predict`` 不再抛 ``FileNotFoundError`` → 断言失败：
+    ``Failed: DID NOT RAISE FileNotFoundError``。
+
+    症状很迷惑：CI 上通过（那里没有权重根），一进容器就失败。
+    根因是**测试依赖了环境**，不是被测代码有问题 —— 把它钉死即可两边都稳定。
+    """
     from tasks.goal5_segmentation.task import Goal5Task
 
     monkeypatch.setenv("COMPETITION_WORKSPACE", str(tmp_path / "ws"))
+    # 钉死权重根 → 本例内**必然**找不到权重，与外部环境无关
+    monkeypatch.setenv("COMPETITION_CHECKPOINT_ROOT", str(tmp_path / "no-such-ckpt"))
     task = Goal5Task(settings=Settings.from_env())
     assert task.name == "goal5_segmentation"
     # 未加载权重时 predict 会尝试加载并因缺权重失败，但不得写任何文件
@@ -144,6 +156,57 @@ def test_study_rejects_empty_series_at_construction():
     """
     with pytest.raises(ValueError):
         Study(accession_number="ACC_EMPTY", series=())
+
+
+def test_bridge_matches_closing_and_stays_local():
+    """``postprocess._bridge`` 必须是闭运算语义，且**不得**依赖稠密结构元。
+
+    背景（真实事故）：``_bridge`` 原先用 ``ndimage.binary_closing(structure=21³)``。
+    空掩膜时代 ``clean_mask`` 会在 ``if not m.any(): return`` 提前返回，
+    所以它**从未被执行**；等空掩膜修好、掩膜变成非空之后它才第一次真正运行 ——
+
+    ==================  ==================  ============
+    实现                 峰值内存增量        单次耗时
+    ==================  ==================  ============
+    21³ 稠密结构元       **+701 MB**         **31.7 s**
+    当前实现（EDT+包围盒）  +112 MB             0.30 s
+    ==================  ==================  ============
+
+    （实测体积 ``240x240x155``；``clean_pair`` 会调用两次。）改成稠密结构元
+    会立刻把"容器 OOM 重启"带回来，所以这里锁死两件事：
+
+    1. 输出与闭运算参考实现一致；
+    2. **距掩膜 > radius 的体素必须保持背景** —— 这条同时保证了
+       "只在包围盒外扩 radius 的窗口内计算"这个内存优化是安全的。
+    """
+    from scipy import ndimage
+
+    from tasks.goal5_segmentation.postprocess import _bridge
+
+    m = np.zeros((40, 40, 24), dtype=bool)
+    m[10:14, 10:14, 8:12] = True                     # 两块相距 6 体素
+    m[20:24, 20:24, 8:12] = True
+    m[30, 30, 5] = True                              # 一处孤立斑点
+
+    radius = 4.0
+    got = _bridge(m, radius, (1.0, 1.0, 1.0))
+    # 参考：半径 4 的稠密立方结构元闭运算（体积刻意为小，避免测试自身吃内存）
+    ref = ndimage.binary_closing(m, structure=np.ones((9, 9, 9), dtype=bool),
+                                 border_value=0)
+    inter = int((got & ref).sum())
+    union = int((got | ref).sum()) or 1
+    assert inter / union > 0.9, f"与闭运算参考实现差异过大 IoU={inter / union:.3f}"
+    assert got.dtype == np.bool_, "闭运算结果应是布尔掩膜"
+
+    # 闭运算 ⊆ 膨胀 ⇒ 距掩膜 > radius 的体素不可能被点亮
+    far = ndimage.distance_transform_edt(~m) > radius
+    assert not (got & far).any(), "闭运算影响了半径之外的体素 → 包围盒裁剪不安全"
+
+    # 空掩膜直接原样返回（不得进入距离变换）
+    empty = np.zeros((8, 8, 8), dtype=bool)
+    assert not _bridge(empty, 10.0, (1.0, 1.0, 1.0)).any()
+    # radius <= 0 时不做任何处理
+    assert np.array_equal(_bridge(m, 0.0, (1.0, 1.0, 1.0)), m)
 
 
 def test_study_rejects_duplicate_series_uid(tmp_path):

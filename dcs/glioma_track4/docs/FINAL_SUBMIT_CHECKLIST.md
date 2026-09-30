@@ -103,6 +103,8 @@ python3 scripts/pre_submit_check.py --limit 20 2>&1 | tee logs/pre_submit.log
   [✔] G2 权重              seg 头与骨干全部加载成功，权重是训练产物
   [✔] G3 预处理             15 项参数 + 通道链全部与训练侧一致
   [✔] G4 冒烟              空掩膜率 0%（0/20）
+  [✔] G6 内存              常驻模型 5 个（每 Goal 单份）
+  [✔] G7 后处理            真实体积下 _bridge 241 MB / 0.56s
 
 ========================================================================================
 结论：**GO** —— 可以提交
@@ -173,6 +175,35 @@ python3 scripts/pre_submit_check.py --limit 20 2>&1 | tee logs/pre_submit.log
 
 > 更详细的逐例诊断（含每例的序列清单与警告）：
 > `python3 scripts/probe_goal5.py /2026aicompetition/datasets/verification/original 5`
+
+### G6 内存（常驻模型总数）
+
+算出**会有多少个模型常驻** —— 这是"评测一启动容器就 OOM"的一类成因。
+
+```text
+常驻模型总数 = 不同 ckpt_rel 的个数 × 每个 ckpt_rel 解析出的 *.pt 份数
+```
+
+| 输出 | 判定 | 对策 |
+|---|---|---|
+| 每个 Goal 都是 1 份、总数 ≤ 8 | PASS | — |
+| 有目录**解析出多份**（`← 目录里没有 core.pt`） | WARN | 确认是有意的多折，而不是训练快照混在里面（§4.7） |
+| 总数 > 8 | WARN | 在容器里跑 `scripts/mem_audit.py --trace` 量峰值 |
+
+### G7 后处理（**真实体积**下的峰值内存 / 耗时）
+
+用 `240×240×155`（真实 1mm 脑尺寸）跑一次 `_bridge`，量峰值内存与耗时。
+**这一关守卫的正是本次 OOM 的真正元凶**（§4.8）：`_bridge` 曾用 21³ 稠密结构元，
+单次 `+701 MB / 31.7 s`，而 `clean_pair` 会调用它两次。
+
+| 输出 | 判定 | 说明 |
+|---|---|---|
+| `_bridge 241 MB / 0.56s` | PASS | 当前实现（EDT + 包围盒裁剪） |
+| `峰值 >550 MB` | **NO-GO** | ❗ 极可能退回了稠密结构元 → 评测必 OOM |
+| `耗时 >5 s` | **NO-GO** | 一例拖到分钟级 → 超时 |
+
+> 已验证守卫真的有效：把 `_bridge` 换回旧实现 → G7 报
+> `_bridge 单次峰值 703 MB（>550MB）→ 极可能退回了稠密结构元，评测时会把容器 OOM-kill` → **NO-GO**。
 
 ### G5 端到端（`--full`）
 
@@ -250,6 +281,8 @@ python3 scripts/pre_submit_check.py --limit 20 2>&1 | tee logs/pre_submit.log
 |---|---|
 | **`scripts/pre_submit_check.py`** | 提交前一键预检，GO / NO-GO（§2） |
 | **`scripts/audit_goal5.py`** | 权重真伪 + 预处理一致性的**逐项**审计（比预检更详细） |
+| **`scripts/mem_audit.py`** | 内存审计：集成规模行为 + 单份模型常驻 + **逐阶段轨迹**（`--trace`）（§4.7） |
+| **`scripts/memprobe.py`** | pytest 内存探针（`-p scripts.memprobe`），用来证伪"测试套件是 OOM 元凶"（§4.7） |
 
 **两个脚本都已实跑验证**（合成权重 + 合成数据）：
 
@@ -259,6 +292,212 @@ pre_submit_check  失败路径 : seg 头键名改坏 → 「缺失键 2 个 {'se
                             「!!! seg 头没加载上 → 分割头是随机初始化的」→ NO-GO，退出码 1
 pre_submit_check  工厂关卡 : 未设 → FAIL；已设 → PASS
 ```
+
+### 4.6 契约测试的环境依赖（本轮修复）
+
+| # | 文件 | 问题 | 修法 |
+|---|---|---|---|
+| **9** | `tests/contracts/test_goal5_contract.py` | `test_task_does_not_touch_answer_dir` **只钉了 `COMPETITION_WORKSPACE`，没钉 `COMPETITION_CHECKPOINT_ROOT`** → 容器里有权重时模型真的被加载，`predict` 不抛 `FileNotFoundError` → `Failed: DID NOT RAISE` | 在测试里把权重根也钉进临时目录 |
+
+**症状很迷惑**：CI 上通过（那里没有权重根），一进容器就失败。
+
+**根因是测试依赖环境，不是被测代码有问题** —— 文件头自己写着"不依赖真实训练权重，因此可在 CI 中稳定运行"，
+但这一条恰好依赖了"环境里没有权重根"。实证：
+
+```text
+场景1（只钉 WORKSPACE，修改前）
+  COMPETITION_CHECKPOINT_ROOT = .../ck_evidence（有真权重）
+  → predict 正常返回 → **没有抛 FileNotFoundError**       ← 正是你看到的失败
+  → （模型真的加载了：.../ck_evidence/goal5_segmentation/core.pt）
+
+场景2（同时钉死 CHECKPOINT_ROOT，修复后）
+  → 抛 FileNotFoundError: 未找到权重：.../no-such-ckpt/...   ✓ 与外部环境无关
+```
+
+**修法**：
+
+```python
+monkeypatch.setenv("COMPETITION_WORKSPACE", str(tmp_path / "ws"))
+# 钉死权重根 → 本例内**必然**找不到权重，与外部环境无关
+monkeypatch.setenv("COMPETITION_CHECKPOINT_ROOT", str(tmp_path / "no-such-ckpt"))
+```
+
+**验证（两种环境都跑）**：
+
+```text
+A. 环境里有真权重（复现容器场景）: python -m pytest tests/contracts -q  → 55 passed
+B. 环境里没有权重（CI 场景）    : python -m pytest tests -q            → 66 passed
+```
+
+> 同仓还有一处**相同模式**（`test_study_tasks_contract.py::test_build_task_has_no_answer_side_effect` 也只钉了
+> `WORKSPACE`），但它只调 `build_task`、**不加载模型**，实测两种环境都通过，因此未改动。
+> 若将来某个 Goal 的 `build_task` 改成"构造即加载权重"，它就会变成同一个坑。
+
+### 4.7 内存 / OOM（修 2 处放大点 + 新增 2 个诊断工具）
+
+> ⚠️ **OOM 的真正元凶在 §4.8**（`_bridge` 的稠密结构元，只有"空掩膜→非空"之后才会执行）。
+> 本节讲的是另外两处**放大点**与诊断工具 —— 它们会让问题更严重，但不是这次的根因。
+
+**先给实测结论，避免误判方向**：
+
+```text
+python -m pytest tests -p scripts.memprobe -q
+  → 66 passed，峰值 RSS = 359 MB，无任何单个测试增量 > 20 MB
+```
+
+**→ 测试套件本身不会 OOM 容器。** OOM 的成因在别处：**权重目录内容**或**推理期峰值**。
+
+#### 修的两处放大点
+
+| # | 文件 | 问题 | 修法 |
+|---|---|---|---|
+| **10** | `tasks/goal5_segmentation/inference.py` | `resolve_ckpts` 找不到规范文件名时，把目录下**全部** `*.pt` 当集成成员；而 `BackboneRunner.load()` 把**每一份**都构建成**常驻模型**。混入训练快照 → 份数翻倍，且快照带 Adam 优化器状态（单份体积是推理权重的数倍） | 加 `GLIOMA_MAX_ENSEMBLE`（默认 **8**）上限；超限**明确报错**并列出全部文件与三种修法 |
+| **11** | `tasks/_common/backbone_runner.py` | 每个 `SingleHeadStudyTask` 各建一个 `BackboneRunner`，而基类 `ckpt_rel` 的**默认值就是同一个文件** → goal1/2/3/4 把**同一份权重加载 4 遍**，全程无共享 | 新增进程级 `_SHARED_WEIGHTS`：同 `(ckpt_root, ckpt_rel, in_ch, device)` 只加载一次，多个任务共享同一批模型对象 |
+
+**常驻模型数的公式（修前 → 修后）**：
+
+```text
+修前：启用 Goal 数        × 每个 ckpt_rel 解析出的 *.pt 份数
+修后：不同 ckpt_rel 的个数 × 每个 ckpt_rel 解析出的 *.pt 份数
+```
+
+**诚实说明**：本仓骨干仅 **1.33 M 参数（5.3 MB fp32）**，所以单纯"多折"通常吃不爆内存 ——
+真正危险的是**目录里混进训练快照**（`epoch_*.pt` / `last.pt` / 备份），
+它们既让份数翻倍、单份体积又是推理权重的数倍，两个因子相乘才是 OOM 的量级。
+
+**权重复用实测**（4 个 runner，`ckpt_rel` 相同）：
+
+```text
+[ckpt] 加载权重 goal5_segmentation/core.pt：1 个成员（存入进程级共享缓存…）
+[ckpt] 复用已加载权重（…）    ← runner#1
+[ckpt] 复用已加载权重（…）    ← runner#2
+[ckpt] 复用已加载权重（…）    ← runner#3
+4 个 runner 是否共享**同一个模型对象**：True
+shared_weight_count = 1（换成不同 ckpt_rel 后 = 2）
+```
+
+**集成上限实测**（3 条分支全过）：
+
+```text
+目录里 5 个 fold*.pt（≤ 8）      → 正常集成，打印 [ckpt] …加载全部 5 份
+目录里 12 个 *.pt（> 8）         → ValueError，列出全部文件 + 三种修法
+GLIOMA_MAX_ENSEMBLE=12 后再跑     → 放行
+```
+
+#### 两个诊断工具
+
+```bash
+# ① 预检新增 G6：直接算出**常驻模型总数**
+python3 scripts/pre_submit_check.py --limit 20
+
+# ② 逐阶段内存轨迹（在容器里跑，定位峰值出现在哪一步）
+python3 scripts/mem_audit.py --trace --dataset <数据根>
+
+# ③ 证伪"测试套件是元凶"
+python3 -m pytest tests -p scripts.memprobe -q
+```
+
+**G6 的输出**（实测）：
+
+```text
+  goal5              rel=goal5_segmentation/core.pt         解析出 1 份
+  goal3              rel=goal3_tumor/model.pt               解析出 3 份  ← 目录里没有 model.pt
+不同 ckpt_rel 数 = 2 | **常驻模型总数 = 4**（已按进程级权重复用折算）
+```
+
+**`mem_audit.py --trace` 的判读表**：
+
+| 峰值出现在 | 成因 | 对策 |
+|---|---|---|
+| 1 加载 Study | 单例影像过大 | 检查原始分辨率 / 层数 |
+| 2 `build_volume` | 1mm 公共网格重采样（`D×H×W×4 通道×4B`） | 正常；不同 `ckpt_rel` 的每个 Goal 会各建一次 |
+| **3 `load_model`** | **常驻模型数 = 不同 ckpt_rel 数 × 份数** | 清掉目录里多余 `*.pt`，或只留 `core.pt` |
+| 4 `infer_segmentation` | 滑窗累加器 + TTA | 调小 `patch` / `tta_batch` |
+
+#### 容器里排查 OOM 的三步
+
+```bash
+# ① 权重目录里到底有多少份？（每一份都会变成常驻模型）
+for d in "$COMPETITION_CHECKPOINT_ROOT"/*/; do
+  echo "$(ls -1 "$d"*.pt 2>/dev/null | wc -l) 份  $d"
+done
+
+# ② 常驻模型数 + 逐阶段峰值
+python3 scripts/pre_submit_check.py --limit 0        # 看 G6 那一段
+python3 scripts/mem_audit.py --trace                 # 看峰值落在哪一步
+
+# ③ 先证伪"测试套件是元凶"
+python3 -m pytest tests -p scripts.memprobe -q       # 期望 峰值 < 500 MB
+```
+
+### 4.8 ⚠️ OOM 的**真正元凶**：`_bridge` 的稠密结构元（**已修**）
+
+> 你给的因果关系是**对的**，而且正好指向它：**空掩膜时代不 OOM，修完空掩膜就 OOM。**
+
+原因在后处理开头那两行判断：
+
+```51:57:Glioma_recognition-main/tasks/goal5_segmentation/postprocess.py
+    m = np.asarray(prob) > float(threshold)
+    if not m.any():
+        return m.astype(bool)          # ← 空掩膜在这一行就返回了
+    if bridge_mm > 0:
+        m = _bridge(m, bridge_mm, spacing)      # ← **只有非空掩膜才会走到这里**
+```
+
+**空掩膜时代 `_bridge` 从未执行过。** 而它用的是 **21³ 稠密结构元**的
+`ndimage.binary_closing` —— 掩膜一旦变成非空，这一段就第一次真正跑起来了。
+
+**实测**（`240×240×155` = 8.9 M 体素，就是真实 1mm 脑的大小）：
+
+| 场景 | 旧实现（21³ 稠密结构元） | 新实现（EDT + 包围盒） | 改善 |
+|---|---|---|---|
+| **1mm 网格（最常见）** | **+701 MB / 31.7 s** | **+112 MB / 0.30 s** | **省 589 MB、快 104×** |
+| 3mm 层厚 | +93 MB / 10.6 s | +119 MB / 0.29 s | 快 37× |
+
+输出一致性 **IoU = 0.9961 / 1.0000**（形状几乎不变）。
+
+而 `clean_pair` 会调用它**两次**（core + flair），所以**一例**的瞬时峰值：
+
+```text
+旧：~1.4 GB 峰值 / 63 s   → 真实体积下 binary_closing 的内存/耗时随体积**超线性**增长 → OOM-kill
+新：  225 MB 峰值 / 0.83 s（端到端 clean_pair 实测）
+```
+
+#### 修法（三层，缺一不可）
+
+1. **欧氏距离变换替代稠密卷积**
+   闭运算 = `edt(dilate(mask)) > r`，其中 `dilate(mask) = edt(~mask) <= r`。
+   内存 O(体积)、耗时 O(体积)（精确 EDT，不是暴力卷积）。
+2. **只在掩膜包围盒外扩 `r` 的窗口内计算**
+   闭运算 ⊆ 膨胀 ⇒ "距掩膜 > `r`"的体素恒为背景 ⇒ 窗口外结果就等于输入。
+   这一步让内存与**整脑大小基本无关**（`+701 MB → +112 MB` 主要来自它）。
+3. 附带正确性收益：距离变换按 `spacing` 取样得到**各向同性球**，而稠密立方结构元是
+   **各向异性**的（3mm 层厚轴上半径被放大 3 倍）。现在与"`bridge_mm` 按 mm 给定"的语义一致。
+
+#### 新增契约测试锁定（防回归）
+
+`tests/contracts/test_goal5_contract.py::test_bridge_matches_closing_and_stays_local`：
+
+- 输出与闭运算参考实现 **IoU > 0.9**；
+- **距掩膜 > radius 的体素必须保持背景** ← 这条同时保证"包围盒裁剪"这个内存优化是安全的；
+- 空掩膜 / `radius <= 0` 直接返回，不进距离变换。
+
+**另外加了自动守卫 G7**（`scripts/pre_submit_check.py`）：用 `240×240×155` 跑一次
+`_bridge` 并按**峰值内存/耗时**判定。之所以必须有这条，是因为**单元测试测不到它** ——
+仓里的测试都用 `4³`~`8³` 小体积，从来不会触发内存问题；只有真实尺寸才暴露。
+阈值 `>550 MB` 或 `>5 s` 判 NO-GO，实测能把两者稳稳分开：
+
+```text
+当前实现（EDT + 包围盒）: G7 = PASS   _bridge 241 MB / 0.56s
+换回旧稠密结构元（模拟回归）: G7 = FAIL   _bridge 单次峰值 703 MB（>550MB）→ 评测时会把容器 OOM-kill
+```
+
+> **为什么之前一直没暴露**：这个 bug **不报错、不变空、只吃内存和时间**，
+> 而空掩膜时代它压根不执行 —— 典型的"修好 A 才暴露 B"。
+>
+> 这也解释了 §4.7 里那句"测试套件不是元凶"为什么成立：
+> **pytest 里没有任何测试触碰真实整脑的 `_bridge`**（测试用的都是 `4³`~`8³` 的小体积），
+> 所以它从来没在 CI 里被量出来过。
 
 ---
 
@@ -282,6 +521,7 @@ pre_submit_check  工厂关卡 : 未设 → FAIL；已设 → PASS
 | `GLIOMA_GOALS` | 全开（6 个） | 只想启用部分插件时，如 `goal5` |
 | `GLIOMA_DEVICE` | `cuda` | 强制 CPU 调试时设 `cpu` |
 | `GLIOMA_PROGRESS` | 开 | 设 `0` 关闭逐例进度日志 |
+| `GLIOMA_MAX_ENSEMBLE` | **8** | 多折集成上限。目录里 `*.pt` 超过它 → **明确报错**而不是静默全加载（OOM 防护）。确实要多折且超过 8 折时调大 |
 
 **一段可整段粘贴**：
 
@@ -305,6 +545,10 @@ ls -l "$COMPETITION_CHECKPOINT_ROOT/goal5_segmentation/" || echo "!! 权重不�
 | 现象 | 最可能成因 | 命令 / 动作 |
 |---|---|---|
 | 服务起来了、日志只有一行 `⚠️ 未设置 COMPETITION_PIPELINE_FACTORY` | 跑了 Dummy 基线 | 用 `./start.sh` 启动（§1） |
+| `test_goal5_contract.py::test_task_does_not_touch_answer_dir` 报 **`DID NOT RAISE FileNotFoundError`** | **测试依赖环境**（没钉 `COMPETITION_CHECKPOINT_ROOT`），容器里有权重 → 模型真的加载了 | 已修（§4.6）；重跑 `python -m pytest tests/contracts -q` |
+| **修完空掩膜之后评测开始 OOM** | **`_bridge` 用 21³ 稠密结构元**：空掩膜时代它在 `if not m.any(): return` 就返回、从不执行；掩膜变非空后才第一次真正跑（+701 MB / 31.7 s 一次，`clean_pair` 调两次） | **已修**（§4.8）；回归测试 `test_bridge_matches_closing_and_stays_local` |
+| 跑 pytest 时容器 OOM 重启 | 测试套件实测峰值仅 372 MB，**不是元凶**；先证伪再看权重目录 / `_bridge` | `python -m pytest tests -p scripts.memprobe -q`，再 `python3 scripts/mem_audit.py --trace`（§4.7、§4.8） |
+| 服务一启动 / 一评测就 OOM | 常驻模型数 = 不同 `ckpt_rel` 数 × 份数；目录里混了训练快照（`epoch_*.pt`/`last.pt`/备份） | 清目录或只留 `core.pt`；`GLIOMA_MAX_ENSEMBLE` 调上限；看预检 G6 |
 | `goal5{core=0, flair=0}`，`pmax` 只有 0.2~0.3 | 预处理与训练不一致 / seg 头随机初始化 | `pre_submit_check.py` 的 G2、G3 |
 | `goal5{core=0, flair=0}`，但 `pmax > thr` | 后处理吃掉了 | `min_tumor_voxels` 调小（§3 G4 表） |
 | 空掩膜率高，且 `missing` 里总有 `t1c` | 缺 T1CE 的检查被零占位 | 确认已同步本轮修复（§4.1 #1） |
@@ -328,8 +572,9 @@ export COMPETITION_CHECKPOINT_ROOT=/2026aicompetition/workspace/checkpoint
 export GLIOMA_LOADER_TOLERANT=1
 export GLIOMA_VOXEL_GUESS_EXCLUDED=0
 
-# ---------- ② 一键预检（看到 GO 再往下）----------
+# ---------- ② 契约测试 + 一键预检（看到 GO 再往下）----------
 mkdir -p logs
+python3 -m pytest tests/contracts -q 2>&1 | tee logs/contracts.log    # 期望 55 passed
 python3 scripts/pre_submit_check.py --limit 20 2>&1 | tee logs/pre_submit.log
 # 退出码 0 = GO / 1 = NO-GO
 echo "退出码 = $?"

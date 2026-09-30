@@ -36,6 +36,31 @@ from tasks._common.volume import build_volume, global_view
 #: 即便各权重都有全头，也会静默换成另一个模型的预测。
 CACHE_KEY = "_backbone_out"
 
+#: 进程级**权重共享**缓存：``share_key -> (members, cls_spec, global_size, global_size_mm)``。
+#:
+#: 为什么必须有它（**这是"评测一启动容器就 OOM"的直接放大器**）：
+#: 每个 ``SingleHeadStudyTask`` 都各建一个 :class:`BackboneRunner`，而
+#: ``SingleHeadStudyTask.ckpt_rel`` 的**默认值就是同一个文件**
+#: （``goal5_segmentation/core.pt``）—— 于是 goal1 / goal2_stitched / goal3 / goal4
+#: 四条任务会把**同一份权重加载 4 遍**，各自持有一份常驻模型。
+#: 再乘上多折集成的份数，常驻模型数就是 ``任务数 × 集成份数``。
+#:
+#: 这些模型是**只读**的（``eval()`` + ``torch.inference_mode()``），共享完全安全，
+#: 与 ``context.diagnostics`` 上那个"前向结果缓存"是两件事：
+#: 那个缓存复用**计算**，本缓存复用**权重本身**。
+_SHARED_WEIGHTS: dict[tuple, tuple] = {}
+
+
+def _share_key(ckpt_root, ckpt_rel: str, in_channels: int, device: str) -> tuple:
+    from pathlib import Path
+
+    return (str(Path(ckpt_root).expanduser().resolve()), ckpt_rel, in_channels, device)
+
+
+def shared_weight_count() -> int:
+    """已缓存的权重份数（诊断用；正常应 = 不同 ``ckpt_rel`` 的个数）。"""
+    return len(_SHARED_WEIGHTS)
+
 
 class BackboneRunner:
     """按 checkpoint 加载共享骨干，并提供"逐 Study 缓存"的前向。"""
@@ -96,11 +121,25 @@ class BackboneRunner:
 
     # ------------------------------------------------------------------ #
     def load(self) -> None:
-        """加载权重（服务启动时一次）。多折时加载全部成员做集成。"""
+        """加载权重（服务启动时一次）。多折时加载全部成员做集成。
+
+        **同 ``(ckpt_root, ckpt_rel, in_channels, device)`` 的权重在整个进程内只加载一次**，
+        后续任务直接复用同一批模型对象（见 ``_SHARED_WEIGHTS``）——
+        否则 goal1/2/3/4 各持一份相同权重的副本，常驻内存直接 ×4。
+        """
         import torch
 
         from tasks._common.factory import build_shared_backbone
         from tasks.goal5_segmentation.inference import resolve_ckpts
+
+        key = _share_key(self.ckpt_root, self.ckpt_rel, self.in_channels, self.device)
+        cached = _SHARED_WEIGHTS.get(key)
+        if cached is not None:
+            self._members, self._cls_spec, self.global_size, self.global_size_mm = cached
+            self.loaded = True
+            print(f"[ckpt] 复用已加载权重（{self.ckpt_rel}，进程内共 "
+                  f"{len(self._members)} 个成员，未重复读盘）", flush=True)
+            return
 
         paths = resolve_ckpts(self.ckpt_root, self.ckpt_rel)
         self._members = []
@@ -141,6 +180,10 @@ class BackboneRunner:
             dev = self.device if (self.device == "cuda" and torch.cuda.is_available()) else "cpu"
             self._members.append(m.eval().to(dev))
             del ck
+        _SHARED_WEIGHTS[key] = (self._members, self._cls_spec,
+                                self.global_size, self.global_size_mm)
+        print(f"[ckpt] 加载权重 {self.ckpt_rel}：{len(self._members)} 个成员"
+              f"（存入进程级共享缓存，后续同权重任务直接复用）", flush=True)
         self.loaded = True
 
     # ------------------------------------------------------------------ #

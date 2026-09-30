@@ -378,6 +378,178 @@ def gate_smoke(dataset: Path, limit: int, info: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# G6 内存：常驻模型数（OOM 的直接成因）
+# --------------------------------------------------------------------------- #
+@_guard("G6 内存")
+def gate_memory(info: dict) -> None:
+    """算清楚**会有多少个模型常驻** —— 这是"评测一启动容器就 OOM 重启"的直接成因。
+
+    常驻模型数 = ``不同 ckpt_rel 的个数 × 每个 ckpt_rel 解析出的份数``。
+
+    - 份数 > 1 只有当该目录下**没有**规范约定的文件名时才会发生
+      （``resolve_ckpts`` 退化成"目录下全部 ``*.pt`` 做集成"）；
+    - 目录里混进训练快照（``epoch_*.pt`` / ``last.pt`` / 备份）份数就会翻上去，
+      而这些快照还带 Adam 优化器状态，单份体积是推理权重的数倍。
+    """
+    import importlib
+    import os
+
+    from tasks.real_pipeline import DEFAULT_GOALS, _BUILDERS
+    from tasks.goal5_segmentation.inference import resolve_ckpt, resolve_ckpts
+
+    settings = info["settings"]
+    root = Path(settings.ckpt_root)
+    print(f"checkpoint 根 : {root}  存在={root.is_dir()}")
+    if not root.is_dir():
+        _record("G6 内存", "FAIL", f"checkpoint 根不存在: {root}")
+        return
+
+    goals = [g.strip() for g in
+             (os.environ.get("GLIOMA_GOALS") or DEFAULT_GOALS).split(",") if g.strip()]
+    total = 0
+    distinct: dict[tuple, int] = {}
+    rows: list[tuple[str, str, int]] = []
+    for g in goals:
+        mod, cls_name = _BUILDERS.get(g, (None, None))
+        if mod is None:
+            continue
+        try:
+            cls = getattr(__import__(f"{mod}", fromlist=[cls_name]), cls_name)
+        except Exception as exc:                                  # noqa: BLE001
+            print(f"  {g:<18} 导入失败: {type(exc).__name__}: {exc}")
+            continue
+        rel = getattr(cls, "ckpt_rel", None)
+        if not rel:
+            # 部分 Goal（如 Goal5）不把权重路径放在 Task 类上，而在自己的 Config 里
+            # （``Goal5Config.core_ckpt_rel``）。不查这里会**漏报** Goal5 的常驻模型。
+            try:
+                # ``_BUILDERS`` 给的是 ``tasks.<goal>.task``（含 ``.task``），
+                # 直接拼 ``.config`` 会变成 ``...task.config`` 而导入失败。
+                pkg = mod[:-5] if mod.endswith(".task") else mod
+                cfg_mod = importlib.import_module(f"{pkg}.config")
+                for name in dir(cfg_mod):
+                    obj = getattr(cfg_mod, name)
+                    if isinstance(obj, type) and name.endswith("Config"):
+                        rel = getattr(obj(), "core_ckpt_rel", None)
+                        if rel:
+                            break
+            except Exception:                                     # noqa: BLE001
+                rel = None
+        if not rel:
+            # DatasetTask（如 goal2_duplicate）通常不持有骨干
+            print(f"  {g:<18} 无 ckpt_rel（不占常驻模型）")
+            continue
+        target = resolve_ckpt(root, rel)
+        try:
+            paths = resolve_ckpts(root, rel)
+        except Exception as exc:                                  # noqa: BLE001
+            print(f"  {g:<18} rel={rel}  !! 解析失败: {str(exc)[:70]}")
+            _record("G6 内存", "FAIL", f"{g}: {type(exc).__name__}（见上）")
+            return
+        n = len(paths)
+        print(f"  {g:<18} rel={rel:<34} 解析出 {n} 份"
+              f"{'  ← 目录里没有 ' + target.name if n > 1 else ''}")
+        rows.append((g, rel, n))
+        key = (str(root.resolve()), rel)
+        distinct[key] = n                     # 同 ckpt_rel 已被进程级缓存共享 → 只算一份
+
+    total = sum(distinct.values())
+    print()
+    print(f"不同 ckpt_rel 数 = {len(distinct)} | **常驻模型总数 = {total}**"
+          f"（已按进程级权重复用折算）")
+    if total > 8:
+        _record("G6 内存", "WARN",
+                f"常驻模型 {total} 个 → 建议在容器里跑 scripts/mem_audit.py --trace 量峰值")
+    elif any(n > 1 for _, _, n in rows):
+        _record("G6 内存", "WARN",
+                f"有目录走了多折集成（总 {total} 个模型）；"
+                f"确认那是有意的，而不是训练快照混在里面")
+    else:
+        _record("G6 内存", "PASS", f"常驻模型 {total} 个（每 Goal 单份）")
+
+
+# --------------------------------------------------------------------------- #
+# G7 后处理：真实体积下的 _bridge 峰值内存 / 耗时
+# --------------------------------------------------------------------------- #
+@_guard("G7 后处理")
+def gate_postprocess(info: dict) -> None:
+    """对**真实体积**跑一次 ``_bridge``，量峰值内存与耗时。
+
+    **这条守卫的是一次真实事故**：``_bridge`` 曾用 ``21³ 稠密结构元`` 做
+    ``binary_closing``，实测 ``240x240x155`` 下单次 **+701 MB / 31.7 s**
+    （``clean_pair`` 调用两次 ⇒ 一例约 1.4 GB 峰值），直接把容器 OOM-kill。
+
+    而这个问题**只在"掩膜从空变成非空"之后才出现** —— 空掩膜会在
+    ``clean_mask`` 的 ``if not m.any(): return`` 提前返回，永远走不到 ``_bridge``。
+    同时它也**测不出来**：仓里所有单元测试用的都是 ``4³``~``8³`` 的小体积。
+
+    所以这里刻意用真实尺寸 + 按峰值判定，把"只吃内存、不报错"的回归挡在提交之前。
+    """
+    import threading
+    import time
+
+    import numpy as np
+
+    from tasks.goal5_segmentation.config import Goal5Config
+    from tasks.goal5_segmentation.postprocess import _bridge
+
+    cfg = Goal5Config()
+    shape = (240, 240, 155)                                # 真实 1mm 脑尺寸
+    m = np.zeros(shape, dtype=bool)
+    m[100:132, 110:146, 58:96] = True                      # 瘤体大小的实心块
+    m[30, 30, 20] = m[210, 200, 130] = True                # 两处孤立假阳性斑点
+    print(f"体积 {shape} = {np.prod(shape) / 1e6:.1f} M 体素 | "
+          f"bridge_mm={cfg.bridge_mm} | 前景 {int(m.sum())} 体素")
+
+    try:
+        import psutil
+        proc = psutil.Process()
+        peak = [proc.memory_info().rss]
+        base = peak[0]
+        stop = threading.Event()
+
+        def sampler() -> None:
+            while not stop.is_set():
+                peak[0] = max(peak[0], proc.memory_info().rss)
+                time.sleep(0.005)
+
+        th = threading.Thread(target=sampler, daemon=True)
+        th.start()
+    except Exception:                                          # noqa: BLE001
+        proc = None
+        peak, base, stop, th = [0], 0, None, None
+
+    t0 = time.perf_counter()
+    out = _bridge(m, float(cfg.bridge_mm), tuple(cfg.common_spacing))
+    dt = time.perf_counter() - t0
+    if stop is not None:
+        stop.set()
+        th.join(timeout=0.5)
+        mem = (peak[0] - base) / 1e6
+        print(f"单次 _bridge: 峰值增量 {mem:.0f} MB  耗时 {dt:.2f} s  "
+              f"（clean_pair 会调用两次 → 一例约 {mem * 2:.0f} MB）")
+    else:
+        mem = float("nan")
+        print(f"单次 _bridge: 耗时 {dt:.2f} s（无 psutil，未量内存）")
+    print(f"输出前景 {int(out.sum())} 体素")
+
+    # 阈值刻意留大余量：当前实现实测 ~250 MB / 0.55s，旧的稠密结构元实测 ~700 MB / 32s。
+    # 卡在 550 MB / 5s 就能把两者稳稳分开，机器抖动不会误报。
+    if mem == mem and mem > 550:                               # NaN 检查
+        _record("G7 后处理", "FAIL",
+                f"_bridge 单次峰值 {mem:.0f} MB（>550MB）→ 极可能退回了稠密结构元，"
+                f"评测时会把容器 OOM-kill")
+    elif dt > 5.0:
+        _record("G7 后处理", "FAIL", f"_bridge 单次 {dt:.1f}s（>5s）→ 一例会拖到分钟级")
+    elif (mem == mem and mem > 400) or dt > 2.5:
+        _record("G7 后处理", "WARN",
+                f"_bridge 峰值 {mem:.0f} MB / {dt:.2f}s 偏高（期望 ~250MB / ~0.5s）")
+    else:
+        suffix = f"{mem:.0f} MB / {dt:.2f}s" if mem == mem else f"{dt:.2f}s"
+        _record("G7 后处理", "PASS", f"真实体积下 _bridge {suffix}")
+
+
+# --------------------------------------------------------------------------- #
 # G5 端到端（完整 runner + 离线校验）
 # --------------------------------------------------------------------------- #
 @_guard("G5 端到端")
@@ -433,6 +605,8 @@ def main(argv: list[str]) -> int:
     if info:
         gate_weights(info)
         gate_preprocess(Path(a.train_config).expanduser(), info)
+        gate_memory(info)
+        gate_postprocess(info)
         if dataset.is_dir():
             gate_smoke(dataset, a.limit, info)
         if a.full and dataset.is_dir():

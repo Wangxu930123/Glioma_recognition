@@ -1,0 +1,56 @@
+# ============================================================================
+# dcs 全工程依赖总表（Glioma_recognition-main + glioma_track4 + glioma_goals 并集）
+# ----------------------------------------------------------------------------
+# 本文件是**三处依赖声明的唯一汇总**，供新容器/新机器一次性装齐：
+#
+#   pip install -r requirements.txt --break-system-packages
+#   #（或按工程自带入口：bash glioma_track4/scripts/00_setup_env.sh --mode system）
+#
+# 各子工程仍有自己的 requirements.txt（作用不同，保留不动）：
+#   · Glioma_recognition-main/requirements.txt —— 提交工程**最小**运行集
+#     （刻意不列 torch 与下方"诊断/开发"段：见该文件头注释）
+#   · glioma_track4/requirements.txt —— 算法工程训练+推理全集
+# 本表 = 两者并集 + 全仓扫描补齐的缺口（psutil / pytest / python-docx）。
+# 口径：以"全仓实际 import"对账得出（AST 扫描 vs 两份 requirements 并集），
+#       未声明的仅 psutil / pytest / python-docx 三项，均已补入下方对应分组。
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# ⚠️ torch —— **刻意不在此声明版本**（与提交工程 requirements 的口径一致）
+#
+# 平台基础镜像（pytorch:*-cuda*-runtime）自带 CUDA 版 torch。若在此文件里写
+# `torch>=x`，在非 CUDA 环境 `pip install -r` 会拉一份 **CPU 版 torch（2GB+）**
+# 覆盖镜像里的 CUDA 版 —— 服务照常起、推理慢几十倍，且毫无报错。
+# 平台容器：**不要装**（镜像自带，`00_setup_env.sh --mode system` 也不会碰它）。
+# 本地/自建环境需要时：
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# 代码兼容性口径：全仓显式传 `weights_only=False`，兼容 torch>=2.4（含 2.6+ 默认收紧）。
+# ----------------------------------------------------------------------------
+
+# ---- 数值与影像（训练 + 推理核心）----
+numpy>=1.26,<3
+scipy>=1.10                # 重采样 / EDT 后处理 / 距离变换
+nibabel>=5.1,<6            # NIfTI 读写（掩膜必须原样保留 affine）
+SimpleITK>=2.3             # DICOM→NIfTI / 世界坐标桥接重采样
+scikit-image>=0.21         # 连通域 / 形态学辅助（track4 数据与评估侧）
+
+# ---- 表格读取（官方 SeriesType 与金标准）----
+pandas>=2.0
+openpyxl>=3.1,<4           # .xlsx（SeriesType.xlsx / ROI 统计表）
+xlrd>=2.0                  # .xls（Excel 97-2003）；表是 .xls 时 openpyxl 读不了
+
+# ---- 推理服务（平台硬性要求：8000 端口 + /health + /call 5s 内 200 + 回调）----
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.5,<3
+requests>=2.31             # 结果回调平台（缺它 = 推理完成但不闭环 = 不计分）
+pyyaml>=6.0                # configs/*.yaml（preprocess/train/paths/labels）
+
+# ---- 诊断与排障（scripts/mem_audit / memprobe / stage_mem_trace / study_leak_probe）----
+# 内存探针与逐阶段追踪器依赖 psutil 读 RSS/cgroup —— 缺它时这些工具会明确拒绝运行，
+# 而不是给出误导性的 0 值。属于"排障刚需"，随主依赖一起装。
+psutil>=5.9
+
+# ---- 开发与测试（只跑测试/开发时需要；正式推理容器可省）----
+pytest>=7                  # tests/ 契约与回归测试（含 tests/contracts/）
+python-docx>=1.1            # scripts/27_extract_platform_docs.py 提取平台文档（离线工具）

@@ -287,6 +287,8 @@ python3 scripts/pre_submit_check.py --limit 20 2>&1 | tee logs/pre_submit.log
 | **`scripts/mem_audit.py`** | 内存审计：集成规模行为 + 单份模型常驻 + **逐阶段轨迹**（`--trace`）（§4.7） |
 | **`scripts/memprobe.py`** | pytest 内存探针（`-p scripts.memprobe`），用来证伪"测试套件是 OOM 元凶"（§4.7） |
 | **`scripts/stage_mem_trace.py`** | **逐阶段追踪器**：容器被 OOM-kill 时日志最后一行 `→` 即元凶阶段；`--goals goal5` 可二分定位（§4.10） |
+| **`scripts/36_oneclick_local_eval.sh`**（track4 侧） | **一键彩排**：权重快照 → 起服务 → 真实权重×真实数据推理 → 拿回结果 + 回调闭环验收（§7.5） |
+| **`scripts/mock_callback.py`**（track4 侧） | 本地 mock 平台回调接收器（`POST`=收回调，`GET /received`=查看），配 36 号脚本使用 |
 
 **两个脚本都已实跑验证**（合成权重 + 合成数据）：
 
@@ -767,6 +769,36 @@ python3 scripts/pre_submit_check.py --limit 20 --full 2>&1 | tee -a logs/pre_sub
 
 > ⚠️ 看到 `真实插件 N/6` 里 **N < 6** 或 `⚠️ Dummy 补位: ...` —— 那几项还是假的，
 > 用 `GLIOMA_GOALS` 确认你想启用哪些。
+
+### 7.5 track4 侧一键彩排（`36_oneclick_local_eval.sh`，§2 的姊妹版）
+
+上面 §7 ② 预检的是**提交工程**（Glioma_recognition-main）；track4 侧的推理服务
+（`06_platform_serve.sh` + `/call` + 回调）有自己的彩排入口，**一条命令**完成
+「权重快照 → 起服务 → 真实权重×真实数据推理 → 拿回结果 → 回调闭环验收」：
+
+```bash
+cd /2026aicompetition/workspace/dcs/glioma_track4
+bash scripts/36_oneclick_local_eval.sh              # 前 3 例冒烟（约 2~3 分钟）
+bash scripts/36_oneclick_local_eval.sh --mini 10    # 前 10 例
+bash scripts/36_oneclick_local_eval.sh --full       # 全量 777 例（约 90 分钟）
+bash scripts/36_oneclick_local_eval.sh --keep       # 跑完不杀服务，便于继续手工调试
+```
+
+它自动做了 8 件事：① 权重快照（训练写 best.pth 时不受污染）→ ② 组小数据集
+（`--full` 则用 verification 全量）→ ③ 起 mock 回调接收器 → ④ 用 06 号脚本 +
+快照权重起服务 → ⑤ **等到「启动预检通过」**（不是 `/health`——那只查环境变量
+非空，是假信号）→ ⑥ `POST /call` 触发真实推理并轮询到 done → ⑦ 验收答案
+（`prediction.json` 数量、`duplicate_pairs.jsonl`、答案样例、掩膜数）→
+⑧ 验收回调（`GET /received` 里必须有 `predPath`）。Ctrl-C / 失败 / 成功都会
+**自动清理**后台进程（`--keep` 除外）。
+
+退出码 `0` = 推理 done + 答案齐 + 校验 ok + 回调已收，此时再按 §7 ①~⑤ 走提交工程的
+预检，两边全绿才按 PLATFORM_GUIDE 的界面路径做平台提交（平台侧点评即真实计分，
+**先彩排后提交**，别直接烧评测机会）。
+
+> 已验证：`bash -n` 语法通过、参数解析分支正常、mock 回调接收器端到端实测收发一致。
+> 与 `08_mock_competition.sh` 的分工：08 验**协议闭环**（合成数据），36 验**真实权重×真实数据**
+> 的完整彩排 —— 两个都绿，平台提交基本不会出意外。
 
 ---
 
